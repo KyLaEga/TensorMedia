@@ -63,7 +63,10 @@ jobs:
     - name: Build macOS Image (.dmg)
       if: matrix.os == 'macos-latest'
       run: |
-        hdiutil create -volname "TensorMedia" -srcfolder dist/TensorMedia -ov -format UDZO dist/TensorMedia-macOS.dmg
+        mkdir -p dist/dmg_root
+        mv dist/TensorMedia.app dist/dmg_root/
+        ln -s /Applications dist/dmg_root/Applications
+        hdiutil create -volname "TensorMedia" -srcfolder dist/dmg_root -ov -format UDZO dist/TensorMedia-macOS.dmg
 
     - name: Extract Windows Artifact
       if: matrix.os == 'windows-latest'
