@@ -1,2 +1,32 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Mac OS files
+.DS_Store
+
+# Virtual environments
+venv/
+env/
+
+# IDE files
+.vscode/
+.idea/
+
+# PyInstaller build folders
+build/
+dist/
+*.spec
+
+# Models and Heavy Weights (CRITICAL)
+models/
+*.pt
+*.pth
+*.bin
+*.onnx
+
+# Local DBs and Logs
+db/
+*.db
+*.log
