@@ -1,7 +1,9 @@
 name: Tensor Media Build Matrix
 
 on:
-  workflow_dispatch:  # Активация ручного триггера из интерфейса GitHub
+  push:
+    branches: [ "main" ]  # Запуск при каждой загрузке кода в main
+  workflow_dispatch:      # Сохранение кнопки ручного запуска
 
 jobs:
   build:
