@@ -2,8 +2,8 @@ name: Tensor Media Build Matrix
 
 on:
   push:
-    branches: [ "main" ]  # Запуск при каждой загрузке кода в main
-  workflow_dispatch:      # Сохранение кнопки ручного запуска
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -30,7 +30,16 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y libgl1-mesa-glx libegl1-mesa libxrandr2 libxss1 libxcursor1 libxcomposite1 libasound2 libxi6 libxtst6
 
-    - name: Install ML Core & Modules
+    - name: Install ML Core & Modules (Linux CPU-only)
+      if: matrix.os == 'ubuntu-22.04'
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+        pip install -r requirements.txt
+        pip install pyinstaller
+
+    - name: Install ML Core & Modules (macOS / Windows)
+      if: matrix.os != 'ubuntu-22.04'
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
