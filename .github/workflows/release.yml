@@ -55,9 +55,36 @@ jobs:
       run: |
         pyinstaller --noconfirm --onedir --windowed --name "TensorMedia" --add-data "assets;assets" --add-data "models;models" main.py
 
-    - name: Extract Artifacts
+    - name: Build Windows Installer (.exe)
+      if: matrix.os == 'windows-latest'
+      run: |
+        iscc setup.iss
+
+    - name: Build macOS Image (.dmg)
+      if: matrix.os == 'macos-latest'
+      run: |
+        hdiutil create -volname "TensorMedia" -srcfolder dist/TensorMedia -ov -format UDZO dist/TensorMedia-macOS.dmg
+
+    - name: Extract Windows Artifact
+      if: matrix.os == 'windows-latest'
       uses: actions/upload-artifact@v4
       with:
-        name: TensorMedia-${{ matrix.os }}
+        name: TensorMedia-Windows-Installer
+        path: dist/TensorMedia_Setup.exe
+        retention-days: 5
+
+    - name: Extract macOS Artifact
+      if: matrix.os == 'macos-latest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: TensorMedia-macOS-DMG
+        path: dist/TensorMedia-macOS.dmg
+        retention-days: 5
+
+    - name: Extract Linux Artifact
+      if: matrix.os == 'ubuntu-22.04'
+      uses: actions/upload-artifact@v4
+      with:
+        name: TensorMedia-Linux-CPU
         path: dist/TensorMedia
         retention-days: 5
