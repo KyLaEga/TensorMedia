@@ -1,0 +1,36 @@
+# Environments
+venv/
+.venv/
+env/
+
+# Caches & Databases
+__pycache__/
+*.pyc
+app_data/
+faiss_cache/
+cache/
+*.db
+*.db-wal
+*.db-shm
+
+# Build Artifacts
+build/
+dist/
+*.spec
+
+# OS Generated
+.DS_Store
+Thumbs.db
+
+# Models and Heavy Weights
+models/
+*.pt
+*.pth
+*.bin
+*.onnx
+*.safetensors
+venv/
+models/
+*.pt
+*.safetensors
+*.bin

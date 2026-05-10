@@ -1,0 +1,71 @@
+# ============================================================
+# MODULE: .github/workflows/release.yml
+# ============================================================
+name: Build and Release TensorMedia
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install System Dependencies (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libgl1-mesa-glx libegl1 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0 xdg-utils
+
+    - name: Install Python Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller
+        pip install -r requirements.txt
+
+    - name: Compile Binary (Cross-Platform)
+      run: |
+        pyinstaller --noconfirm TensorMedia.spec
+
+    - name: Build Windows Installer (.exe)
+      if: matrix.os == 'windows-latest'
+      run: |
+        iscc setup.iss
+
+    - name: Build macOS Image (.dmg)
+      if: matrix.os == 'macos-latest'
+      run: |
+        mkdir -p dist/dmg_root
+        cp -R dist/TensorMedia.app dist/dmg_root/
+        ln -s /Applications dist/dmg_root/Applications
+        hdiutil create -volname "TensorMedia" -srcfolder dist/dmg_root -ov -format UDZO dist/TensorMedia-macOS.dmg
+
+    - name: Build Linux Archive (.tar.gz)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        cd dist
+        tar -czvf TensorMedia-Linux-x86_64.tar.gz TensorMedia/
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: TensorMedia-${{ matrix.os }}
+        path: |
+          dist/TensorMedia_Setup.exe
+          dist/TensorMedia-macOS.dmg
+          dist/TensorMedia-Linux-x86_64.tar.gz
+        retention-days: 5
