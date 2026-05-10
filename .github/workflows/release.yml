@@ -13,7 +13,7 @@ jobs:
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false # ИЗОЛЯЦИЯ СБОЕВ: падение одной ОС не убьет остальные
+      fail-fast: false
       matrix:
         os: [macos-latest, windows-latest, ubuntu-latest]
 
@@ -28,7 +28,6 @@ jobs:
 
     - name: Install System Dependencies (Linux)
       if: matrix.os == 'ubuntu-latest'
-      # ИСПРАВЛЕНИЕ: libgl1-mesa-glx заменен на libgl1
       run: |
         sudo apt-get update
         sudo apt-get install -y libgl1 libegl1 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0 xdg-utils
@@ -51,6 +50,13 @@ jobs:
     - name: Build macOS Image (.dmg)
       if: matrix.os == 'macos-latest'
       run: |
+        # Восстановление UNIX-флагов исполнения
+        chmod -R 755 dist/TensorMedia.app
+        
+        # Локальная Ad-Hoc подпись для обхода Gatekeeper
+        codesign --force --deep --sign - dist/TensorMedia.app
+        
+        # Сборка образа диска
         mkdir -p dist/dmg_root
         cp -R dist/TensorMedia.app dist/dmg_root/
         ln -s /Applications dist/dmg_root/Applications
