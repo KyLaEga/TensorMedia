@@ -4,17 +4,41 @@
 import sys
 import os
 
-# Изоляция потоков: предотвращает I/O Crash при запуске .app бандла или .exe без консоли
+# --- PRE-FLIGHT BOOTSTRAPPER ---
+# 1. Изоляция I/O: предотвращает падение без консоли
 if sys.stdout is None:
     sys.stdout = open(os.devnull, 'w')
 if sys.stderr is None:
     sys.stderr = open(os.devnull, 'w')
 
+# 2. Вычисление абсолютного пути ядра в скомпилированной среде
+if getattr(sys, 'frozen', False):
+    # PyInstaller onedir/bundle mode
+    app_dir = os.path.dirname(sys.executable)
+else:
+    # Source execution mode
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+
+# 3. macOS Fix: Принудительный захват рабочей директории
+os.chdir(app_dir)
+sys.path.insert(0, app_dir)
+
+# 4. Windows Fix: Насильственная инъекция DLL-путей (Python 3.8+)
+if sys.platform == 'win32':
+    try:
+        os.add_dll_directory(app_dir)
+        pyside_dir = os.path.join(app_dir, 'PySide6')
+        if os.path.exists(pyside_dir):
+            os.add_dll_directory(pyside_dir)
+    except AttributeError:
+        pass
+    os.environ['PATH'] = app_dir + os.pathsep + os.environ.get('PATH', '')
+# -------------------------------
+
+# ТОЛЬКО ТЕПЕРЬ импортируем графику, когда пути ОС взломаны
 import traceback
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtCore import QMetaObject, Qt
-
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from utils.logger import auditor
 from ui.views.main_window import MainWindow

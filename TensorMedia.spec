@@ -1,11 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_submodules, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
 
-# Принудительное извлечение всех скрытых зависимостей и C++ библиотек PySide6
+# Собираем только логику PySide6, бинарники PyInstaller подтянет своими хуками
 pyside_hidden = collect_submodules('PySide6')
-pyside_binaries = collect_dynamic_libs('PySide6')
 
 EXCLUDES = ['matplotlib', 'scipy', 'tensorboard', 'tkinter', 'PyQt5', 'PyQt6', 'wx', 'jupyter']
 
@@ -19,7 +18,7 @@ HIDDEN_IMPORTS = [
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=pyside_binaries, # Инъекция DLL/dylib файлов Qt
+    binaries=[], # Очищено, предотвращает дублирование и порчу qt.conf
     datas=[],
     hiddenimports=HIDDEN_IMPORTS,
     hookspath=[],
