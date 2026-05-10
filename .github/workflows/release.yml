@@ -71,9 +71,13 @@ jobs:
     - name: Build macOS Image (.dmg)
       if: matrix.os == 'macos-latest'
       run: |
-        # Восстановление флагов исполнения и локальная подпись для обхода Gatekeeper
         chmod -R 755 dist/TensorMedia.app
         codesign --force --deep --sign - dist/TensorMedia.app
+        
+        # Блокировка состояния гонки: сброс I/O кэша и ожидание завершения системного сканирования Apple
+        sync
+        sleep 10
+        
         mkdir -p dist/dmg_root
         cp -R dist/TensorMedia.app dist/dmg_root/
         ln -s /Applications dist/dmg_root/Applications

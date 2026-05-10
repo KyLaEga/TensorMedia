@@ -9,7 +9,7 @@ EXCLUDES = [
     'jupyter', 'notebook', 'IPython', 'pandas.tests', 'numpy.random._examples'
 ]
 
-# HOTFIX: Явное указание динамически загружаемых микросервисов (Фаза 3)
+# HOTFIX: Явное указание динамически загружаемых микросервисов и графики Windows (Фаза 4)
 HIDDEN_IMPORTS = [
     'torchvision', 
     'facenet_pytorch', 
@@ -21,6 +21,10 @@ HIDDEN_IMPORTS = [
     'core.profiler',
     'PySide6.QtMultimedia',
     'PySide6.QtMultimediaWidgets',
+    'PySide6.QtWidgets',
+    'PySide6.QtGui',
+    'PySide6.QtCore',
+    'shiboken6',
     'fitz',
     'cv2'
 ]
