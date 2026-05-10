@@ -3,6 +3,13 @@
 # ============================================================
 import sys
 import os
+
+# Блокировка падения I/O потоков при запуске графического бандла
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w')
+
 import traceback
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtCore import QMetaObject, Qt
