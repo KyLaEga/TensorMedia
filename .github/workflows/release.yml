@@ -14,7 +14,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      # Расширенная матрица для изоляции сборок
       matrix:
         include:
           - os: macos-latest
@@ -52,10 +51,12 @@ jobs:
 
     - name: Inject CPU-Only PyTorch (Linux CPU Version)
       if: matrix.type == 'cpu'
+      # ИСПРАВЛЕНИЕ: Загрузка только системных библиотек ML с сервера PyTorch
       run: |
-        pip install torch torchvision facenet-pytorch --index-url https://download.pytorch.org/whl/cpu
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
     - name: Install Project Dependencies
+      # facenet-pytorch будет штатно загружен отсюда через стандартный PyPI
       run: |
         pip install -r requirements.txt
 
@@ -73,11 +74,8 @@ jobs:
       run: |
         chmod -R 755 dist/TensorMedia.app
         codesign --force --deep --sign - dist/TensorMedia.app
-        
-        # Блокировка состояния гонки: сброс I/O кэша и ожидание завершения системного сканирования Apple
         sync
         sleep 10
-        
         mkdir -p dist/dmg_root
         cp -R dist/TensorMedia.app dist/dmg_root/
         ln -s /Applications dist/dmg_root/Applications
