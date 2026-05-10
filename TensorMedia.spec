@@ -29,7 +29,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[], # ИСПРАВЛЕНО: Локальные веса исключены, загрузка делегирована setup_models.py
+    datas=[],
     hiddenimports=HIDDEN_IMPORTS,
     hookspath=[],
     hooksconfig={},
@@ -58,7 +58,7 @@ exe = EXE(
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
-    entitlements_file='entitlements.plist', # ИСПРАВЛЕНО: Интеграция прав доступа для macOS
+    entitlements_file='entitlements.plist',
     icon='resources/icon.ico' 
 )
 
@@ -71,4 +71,12 @@ coll = COLLECT(
     upx=True,
     upx_exclude=[],
     name='TensorMedia' 
+)
+
+# MAC OS BUNDLE INSTRUCTION
+app = BUNDLE(
+    coll,
+    name='TensorMedia.app',
+    icon=None,
+    bundle_identifier='com.tensormedia.app',
 )
