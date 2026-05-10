@@ -10,12 +10,25 @@ on:
 
 jobs:
   build:
-    name: Build on ${{ matrix.os }}
+    name: Build ${{ matrix.artifact_name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # Расширенная матрица для изоляции сборок
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-latest]
+        include:
+          - os: macos-latest
+            artifact_name: macOS
+            type: default
+          - os: windows-latest
+            artifact_name: Windows
+            type: default
+          - os: ubuntu-latest
+            artifact_name: Linux-CPU
+            type: cpu
+          - os: ubuntu-latest
+            artifact_name: Linux-CUDA
+            type: cuda
 
     steps:
     - name: Checkout Code
@@ -27,15 +40,23 @@ jobs:
         python-version: '3.11'
 
     - name: Install System Dependencies (Linux)
-      if: matrix.os == 'ubuntu-latest'
+      if: startsWith(matrix.os, 'ubuntu')
       run: |
         sudo apt-get update
         sudo apt-get install -y libgl1 libegl1 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0 xdg-utils
 
-    - name: Install Python Dependencies
+    - name: Install Base Python Dependencies
       run: |
         python -m pip install --upgrade pip
         pip install pyinstaller
+
+    - name: Inject CPU-Only PyTorch (Linux CPU Version)
+      if: matrix.type == 'cpu'
+      run: |
+        pip install torch torchvision facenet-pytorch --index-url https://download.pytorch.org/whl/cpu
+
+    - name: Install Project Dependencies
+      run: |
         pip install -r requirements.txt
 
     - name: Compile Binary (Cross-Platform)
@@ -50,30 +71,26 @@ jobs:
     - name: Build macOS Image (.dmg)
       if: matrix.os == 'macos-latest'
       run: |
-        # Восстановление UNIX-флагов исполнения
+        # Восстановление флагов исполнения и локальная подпись для обхода Gatekeeper
         chmod -R 755 dist/TensorMedia.app
-        
-        # Локальная Ad-Hoc подпись для обхода Gatekeeper
         codesign --force --deep --sign - dist/TensorMedia.app
-        
-        # Сборка образа диска
         mkdir -p dist/dmg_root
         cp -R dist/TensorMedia.app dist/dmg_root/
         ln -s /Applications dist/dmg_root/Applications
         hdiutil create -volname "TensorMedia" -srcfolder dist/dmg_root -ov -format UDZO dist/TensorMedia-macOS.dmg
 
     - name: Build Linux Archive (.tar.gz)
-      if: matrix.os == 'ubuntu-latest'
+      if: startsWith(matrix.os, 'ubuntu')
       run: |
         cd dist
-        tar -czvf TensorMedia-Linux-x86_64.tar.gz TensorMedia/
+        tar -czvf TensorMedia-${{ matrix.artifact_name }}-x86_64.tar.gz TensorMedia/
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: TensorMedia-${{ matrix.os }}
+        name: TensorMedia-${{ matrix.artifact_name }}
         path: |
           dist/TensorMedia_Setup.exe
           dist/TensorMedia-macOS.dmg
-          dist/TensorMedia-Linux-x86_64.tar.gz
+          dist/TensorMedia-Linux-*-x86_64.tar.gz
         retention-days: 5
