@@ -59,7 +59,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file='entitlements.plist',
-    icon='resources/icon.ico' 
+    icon=None 
 )
 
 coll = COLLECT(
