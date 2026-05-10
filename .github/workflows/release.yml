@@ -51,12 +51,10 @@ jobs:
 
     - name: Inject CPU-Only PyTorch (Linux CPU Version)
       if: matrix.type == 'cpu'
-      # ИСПРАВЛЕНИЕ: Загрузка только системных библиотек ML с сервера PyTorch
       run: |
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
     - name: Install Project Dependencies
-      # facenet-pytorch будет штатно загружен отсюда через стандартный PyPI
       run: |
         pip install -r requirements.txt
 
