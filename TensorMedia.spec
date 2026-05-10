@@ -1,23 +1,25 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_submodules, collect_dynamic_libs
+
 block_cipher = None
 
-# Tree Shaking
+# Принудительное извлечение всех скрытых зависимостей и C++ библиотек PySide6
+pyside_hidden = collect_submodules('PySide6')
+pyside_binaries = collect_dynamic_libs('PySide6')
+
 EXCLUDES = ['matplotlib', 'scipy', 'tensorboard', 'tkinter', 'PyQt5', 'PyQt6', 'wx', 'jupyter']
 
-# CRITICAL: Явное включение всех графических модулей для Windows и macOS
 HIDDEN_IMPORTS = [
     'torchvision', 'facenet_pytorch', 'faiss', 'safetensors',
     'core.services.fs_service', 'core.services.auto_selector',
     'core.ml.cluster_engine', 'core.profiler',
-    'PySide6.QtMultimedia', 'PySide6.QtMultimediaWidgets',
-    'PySide6.QtWidgets', 'PySide6.QtGui', 'PySide6.QtCore',
     'shiboken6', 'fitz', 'cv2'
-]
+] + pyside_hidden
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
+    binaries=pyside_binaries, # Инъекция DLL/dylib файлов Qt
     datas=[],
     hiddenimports=HIDDEN_IMPORTS,
     hookspath=[],

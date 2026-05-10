@@ -14,7 +14,7 @@ PrivilegesRequired=lowest
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [Files]
-; ИСПРАВЛЕНИЕ: Рекурсивный захват всех файлов и папок (включая models, utils и корень)
+; Жесткий захват абсолютно всех подпапок и библиотек, сгенерированных компилятором
 Source: "dist\TensorMedia\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]

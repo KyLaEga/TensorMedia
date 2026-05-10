@@ -4,7 +4,7 @@
 import sys
 import os
 
-# Блокировка падения I/O потоков при запуске графического бандла
+# Изоляция потоков: предотвращает I/O Crash при запуске .app бандла или .exe без консоли
 if sys.stdout is None:
     sys.stdout = open(os.devnull, 'w')
 if sys.stderr is None:
