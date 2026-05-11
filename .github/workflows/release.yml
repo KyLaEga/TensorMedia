@@ -1,9 +1,7 @@
 name: Build and Release TensorMedia
-
 on:
   push:
-    branches:
-      - main
+    branches: [main]
 
 jobs:
   build:
@@ -15,10 +13,8 @@ jobs:
         include:
           - os: macos-latest
             artifact_name: macOS
-            type: default
           - os: windows-latest
             artifact_name: Windows
-            type: default
           - os: ubuntu-latest
             artifact_name: Linux-CPU
             type: cpu
@@ -27,14 +23,12 @@ jobs:
             type: cuda
 
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
-
-    - name: Setup Python
-      uses: actions/setup-python@v5
+    - uses: actions/checkout@v4
+    
+    - uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-
+    
     - name: Install System Dependencies (Linux)
       if: startsWith(matrix.os, 'ubuntu')
       run: |
@@ -48,32 +42,29 @@ jobs:
 
     - name: Install PyTorch (Linux CPU Version)
       if: matrix.type == 'cpu'
-      run: |
-        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+      run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
     - name: Install Project Dependencies
-      run: |
-        pip install -r requirements.txt
+      run: pip install -r requirements.txt
 
     - name: Fetch ML Models into CI
-      run: |
-        python setup_models.py
+      # ФИКС: Жестко заставляем Windows-терминал понимать UTF-8 и эмодзи
+      env:
+        PYTHONIOENCODING: "utf8"
+      run: python setup_models.py
 
     - name: Compile Binary (Cross-Platform)
-      run: |
-        pyinstaller --noconfirm TensorMedia.spec
+      run: pyinstaller --noconfirm TensorMedia.spec
 
     - name: Build Windows Installer (.exe)
       if: matrix.os == 'windows-latest'
-      run: |
-        iscc setup.iss
+      run: iscc setup.iss
 
     - name: Build macOS Image (.dmg)
       if: matrix.os == 'macos-latest'
       run: |
         mkdir -p dist/dmg_root
         cp -R dist/TensorMedia.app dist/dmg_root/
-        # Симлинк для папки Программы
         ln -s /Applications dist/dmg_root/Applications
         hdiutil create -volname "TensorMedia" -srcfolder dist/dmg_root -ov -format UDZO dist/TensorMedia-macOS.dmg
 
@@ -91,4 +82,3 @@ jobs:
           dist/TensorMedia_Setup.exe
           dist/TensorMedia-macOS.dmg
           dist/TensorMedia-Linux-*.tar.gz
-        retention-days: 5

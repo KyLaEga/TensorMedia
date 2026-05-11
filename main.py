@@ -1,17 +1,38 @@
 import sys
 import os
 
-# ИЗОЛЯЦИЯ I/O (Защита от вылета macOS при клике по иконке)
+# 1. Изоляция I/O: предотвращает падение без консоли на macOS/Windows
 if sys.stdout is None:
     sys.stdout = open(os.devnull, 'w')
 if sys.stderr is None:
     sys.stderr = open(os.devnull, 'w')
 
+# 2. Чистая маршрутизация
+if getattr(sys, 'frozen', False):
+    app_dir = os.path.dirname(sys.executable)
+    if sys.platform == 'darwin':
+        app_dir = os.path.dirname(os.path.dirname(os.path.abspath(sys.executable)))
+else:
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+
+os.chdir(app_dir)
+sys.path.insert(0, app_dir)
+
+models_path = os.path.join(app_dir, "models")
+os.environ["TORCH_HOME"] = os.path.join(models_path, "torch")
+os.environ["HF_HOME"] = os.path.join(models_path, "huggingface")
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+if sys.platform == 'win32':
+    try:
+        os.add_dll_directory(app_dir)
+        pyside_path = os.path.join(app_dir, "PySide6")
+        if os.path.exists(pyside_path):
+            os.add_dll_directory(pyside_path)
+    except AttributeError: pass
+
 import multiprocessing
 import traceback
-import threading
-from datetime import datetime
-
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 from PySide6.QtCore import Qt, QMetaObject
 
@@ -32,8 +53,7 @@ class ApplicationBootstrap:
             msg_box.setText(f"Произошла фатальная ошибка:\n\n{exc_value}")
             msg_box.setDetailedText(error_msg)
             msg_box.exec()
-        except Exception as gui_exc:
-            auditor.error(f"FAILED TO RENDER CRITICAL UI: {gui_exc}")
+        except Exception: pass
 
     @staticmethod
     def global_exception_handler(exc_type, exc_value, exc_traceback):
@@ -42,8 +62,6 @@ class ApplicationBootstrap:
             return
 
         error_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
-        auditor.critical(f"CRITICAL RUNTIME ERROR:\n{error_msg}")
-        
         app = QApplication.instance()
         if app and not app.closingDown():
             QMetaObject.invokeMethod(
@@ -54,15 +72,11 @@ class ApplicationBootstrap:
 
     @classmethod
     def execute(cls):
-        # КРИТИЧЕСКИ ВАЖНО ДЛЯ MACOS/WINDOWS: Защита от fork-бомбы
+        # ЗАЩИТА ОТ ФОРК-БОМБЫ (Критично для macOS)
         multiprocessing.freeze_support()
         sys.excepthook = cls.global_exception_handler
         
-        auditor.info("TensorMedia Application Bootstrapping Started.")
-        
         setup_offline_env()
-        
-        auditor.debug("Executing I/O transaction recovery check...")
         BatchOperations.check_and_recover_pending_transactions()
         
         QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
@@ -77,17 +91,13 @@ class ApplicationBootstrap:
             from ui.controllers.main_controller import MainController
             
             cls.orchestrator = MLOrchestrator()
-            
             window = MainWindow()
             controller = MainController(window) 
-            
             window.window_closed.connect(cls.orchestrator.stop_all)
             
-            auditor.info("UI and NPU Orchestrator initialized successfully.")
             window.show()
             sys.exit(app.exec())
         else:
-            auditor.warning("NPU Weight Validation Failed. Terminating process.")
             sys.exit(1)
 
 if __name__ == "__main__":
