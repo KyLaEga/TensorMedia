@@ -1,42 +1,44 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
+import facenet_pytorch
 from PyInstaller.utils.hooks import collect_submodules, collect_dynamic_libs, collect_data_files
 
 block_cipher = None
 
-# 1. Жесткий захват DLL для Windows
+# 1. Находим физический путь к библиотеке facenet_pytorch для извлечения весов (.pt)
+facenet_path = os.path.dirname(facenet_pytorch.__file__)
+
+# 2. Собираем все необходимые данные
 pyside_hidden = collect_submodules('PySide6')
 pyside_binaries = collect_dynamic_libs('PySide6')
 
-# 2. Извлечение скрытых весов нейросетей (pnet.pt, rnet.pt)
-facenet_datas = collect_data_files('facenet_pytorch')
+# Формируем список данных для упаковки
+project_datas = [
+    # Копируем веса facenet строго туда, где библиотека ожидает их увидеть
+    (os.path.join(facenet_path, 'data'), 'facenet_pytorch/data'),
+]
 
-# 3. Инъекция пользовательских моделей
-# Компилятор сам найдет папку models и запакует ее внутрь релиза
-project_datas = facenet_datas
+# Автоматический захват ваших моделей и ассетов
 for folder in ['models', 'assets', 'resources', 'core/ml/models']:
     if os.path.exists(folder):
+        # В бандле папки должны лежать в корне рядом с exe/бинарником
         project_datas.append((folder, folder))
-
-EXCLUDES = ['matplotlib', 'scipy', 'tensorboard', 'tkinter', 'PyQt5', 'PyQt6', 'wx', 'jupyter']
 
 HIDDEN_IMPORTS = [
     'torchvision', 'facenet_pytorch', 'faiss', 'safetensors',
-    'core.services.fs_service', 'core.services.auto_selector',
-    'core.ml.cluster_engine', 'core.profiler',
-    'shiboken6', 'fitz', 'cv2', 'transformers'
+    'shiboken6', 'fitz', 'cv2', 'transformers', 'tokenizers'
 ] + pyside_hidden
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=pyside_binaries, # ФИКС ДЛЯ WINDOWS: возвращаем графические библиотеки
-    datas=project_datas,      # ФИКС ДЛЯ MACOS NPU: пакуем папки с моделями
+    binaries=pyside_binaries,
+    datas=project_datas,
     hiddenimports=HIDDEN_IMPORTS,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=EXCLUDES,
+    excludes=['matplotlib', 'scipy', 'tkinter'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
