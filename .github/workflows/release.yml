@@ -1,3 +1,6 @@
+# ============================================================
+# MODULE: .github/workflows/release.yml
+# ============================================================
 name: Build and Release TensorMedia
 on:
   push:
@@ -21,16 +24,22 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    
     - uses: actions/setup-python@v5
       with:
         python-version: '3.11'
     
-    - name: Install Dependencies
+    - name: Install Base Python Dependencies
       run: |
         python -m pip install --upgrade pip
         pip install pyinstaller
-        if [[ "${{ matrix.type }}" == "cpu" ]]; then pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu; fi
-        pip install -r requirements.txt
+
+    - name: Install PyTorch (CPU Mode)
+      if: matrix.type == 'cpu'
+      run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+    - name: Install Project Dependencies
+      run: pip install -r requirements.txt
 
     - name: Fetch ML Models
       run: python setup_models.py
@@ -48,7 +57,7 @@ jobs:
         codesign --force --deep --sign - dist/TensorMedia.app
         hdiutil create -volname "TensorMedia" -srcfolder dist/TensorMedia.app -ov -format UDZO dist/TensorMedia-macOS.dmg
 
-    - name: Upload
+    - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
         name: TensorMedia-${{ matrix.artifact_name }}
