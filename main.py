@@ -1,87 +1,94 @@
-# ============================================================
-# MODULE: main.py
-# ============================================================
 import sys
 import os
 
-# --- PRE-FLIGHT BOOTSTRAPPER ---
+# ИЗОЛЯЦИЯ I/O (Защита от вылета macOS при клике по иконке)
 if sys.stdout is None:
     sys.stdout = open(os.devnull, 'w')
 if sys.stderr is None:
     sys.stderr = open(os.devnull, 'w')
 
-if getattr(sys, 'frozen', False):
-    app_dir = os.path.dirname(sys.executable)
-    # В macOS внутри .app исполняемый файл лежит в Contents/MacOS/
-    # Нам нужно подняться выше или использовать ресурсы
-    if sys.platform == 'darwin':
-        app_dir = os.path.dirname(os.path.dirname(os.path.abspath(sys.executable)))
-else:
-    app_dir = os.path.dirname(os.path.abspath(__file__))
-
-os.chdir(app_dir)
-sys.path.insert(0, app_dir)
-
-# Настройка путей для ML-библиотек (Offline Mode)
-models_path = os.path.join(app_dir, "models")
-os.environ["TORCH_HOME"] = os.path.join(models_path, "torch")
-os.environ["HF_HOME"] = os.path.join(models_path, "huggingface")
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-
-if sys.platform == 'win32':
-    try:
-        os.add_dll_directory(app_dir)
-        # Добавляем путь к подпапке PySide6 для Windows
-        pyside_path = os.path.join(app_dir, "PySide6")
-        if os.path.exists(pyside_path):
-            os.add_dll_directory(pyside_path)
-    except AttributeError:
-        pass
-# -------------------------------
-
+import multiprocessing
 import traceback
-from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt
+import threading
+from datetime import datetime
 
-from utils.logger import auditor
-from ui.views.main_window import MainWindow
-from ui.controllers.main_controller import MainController
-from core.services.ml_orchestrator import MLOrchestrator
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
+from PySide6.QtCore import Qt, QMetaObject
+
 from utils.env_config import setup_offline_env
+from utils.batch_operations import BatchOperations
+from core.ml.weight_manager import LocalWeightValidator
+from utils.logger import auditor
 
 class ApplicationBootstrap:
+    orchestrator = None
+    
     @staticmethod
-    def execute():
-        sys.excepthook = ApplicationBootstrap._global_exception_handler
-        auditor.info("Initializing TensorMedia core architecture...")
+    def _render_critical_ui(exc_value, error_msg):
+        try:
+            msg_box = QMessageBox()
+            msg_box.setIcon(QMessageBox.Icon.Critical)
+            msg_box.setWindowTitle("Критический сбой")
+            msg_box.setText(f"Произошла фатальная ошибка:\n\n{exc_value}")
+            msg_box.setDetailedText(error_msg)
+            msg_box.exec()
+        except Exception as gui_exc:
+            auditor.error(f"FAILED TO RENDER CRITICAL UI: {gui_exc}")
+
+    @staticmethod
+    def global_exception_handler(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+
+        error_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        auditor.critical(f"CRITICAL RUNTIME ERROR:\n{error_msg}")
+        
+        app = QApplication.instance()
+        if app and not app.closingDown():
+            QMetaObject.invokeMethod(
+                app, 
+                lambda: ApplicationBootstrap._render_critical_ui(exc_value, error_msg), 
+                Qt.ConnectionType.QueuedConnection
+            )
+
+    @classmethod
+    def execute(cls):
+        # КРИТИЧЕСКИ ВАЖНО ДЛЯ MACOS/WINDOWS: Защита от fork-бомбы
+        multiprocessing.freeze_support()
+        sys.excepthook = cls.global_exception_handler
+        
+        auditor.info("TensorMedia Application Bootstrapping Started.")
         
         setup_offline_env()
         
-        app = QApplication(sys.argv)
-        app.setApplicationName("TensorMedia")
+        auditor.debug("Executing I/O transaction recovery check...")
+        BatchOperations.check_and_recover_pending_transactions()
         
-        try:
-            ml_orchestrator = MLOrchestrator()
+        QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+        app = QApplication(sys.argv)
+        
+        validator = LocalWeightValidator()
+        validator.start()
+        
+        if validator.exec() == QDialog.Accepted:
+            from core.services.ml_orchestrator import MLOrchestrator
+            from ui.views.main_window import MainWindow
+            from ui.controllers.main_controller import MainController
+            
+            cls.orchestrator = MLOrchestrator()
+            
             window = MainWindow()
-            controller = MainController(window)
+            controller = MainController(window) 
             
-            app._ml_orchestrator = ml_orchestrator
-            app._controller = controller
+            window.window_closed.connect(cls.orchestrator.stop_all)
             
+            auditor.info("UI and NPU Orchestrator initialized successfully.")
             window.show()
-            auditor.info("Application successfully bootstrapped. Entering event loop.")
             sys.exit(app.exec())
-            
-        except Exception as e:
-            ApplicationBootstrap._global_exception_handler(type(e), e, e.__traceback__)
-
-    @staticmethod
-    def _global_exception_handler(exc_type, exc_value, exc_traceback):
-        error_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
-        try:
-            auditor.critical(f"Unhandled exception:\n{error_msg}")
-        except: pass
-        sys.exit(1)
+        else:
+            auditor.warning("NPU Weight Validation Failed. Terminating process.")
+            sys.exit(1)
 
 if __name__ == "__main__":
     ApplicationBootstrap.execute()

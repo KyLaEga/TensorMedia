@@ -1,10 +1,9 @@
-# ============================================================
-# MODULE: .github/workflows/release.yml
-# ============================================================
 name: Build and Release TensorMedia
+
 on:
   push:
-    branches: [main]
+    branches:
+      - main
 
 jobs:
   build:
@@ -16,46 +15,73 @@ jobs:
         include:
           - os: macos-latest
             artifact_name: macOS
+            type: default
           - os: windows-latest
             artifact_name: Windows
+            type: default
           - os: ubuntu-latest
             artifact_name: Linux-CPU
             type: cpu
+          - os: ubuntu-latest
+            artifact_name: Linux-CUDA
+            type: cuda
 
     steps:
-    - uses: actions/checkout@v4
-    
-    - uses: actions/setup-python@v5
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-    
+
+    - name: Install System Dependencies (Linux)
+      if: startsWith(matrix.os, 'ubuntu')
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libgl1 libegl1 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0 xdg-utils
+
     - name: Install Base Python Dependencies
       run: |
         python -m pip install --upgrade pip
         pip install pyinstaller
 
-    - name: Install PyTorch (CPU Mode)
+    - name: Install PyTorch (Linux CPU Version)
       if: matrix.type == 'cpu'
-      run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+      run: |
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
     - name: Install Project Dependencies
-      run: pip install -r requirements.txt
+      run: |
+        pip install -r requirements.txt
 
-    - name: Fetch ML Models
-      run: python setup_models.py
+    - name: Fetch ML Models into CI
+      run: |
+        python setup_models.py
 
-    - name: Build
-      run: pyinstaller --noconfirm TensorMedia.spec
+    - name: Compile Binary (Cross-Platform)
+      run: |
+        pyinstaller --noconfirm TensorMedia.spec
 
-    - name: Package Windows
+    - name: Build Windows Installer (.exe)
       if: matrix.os == 'windows-latest'
-      run: iscc setup.iss
+      run: |
+        iscc setup.iss
 
-    - name: Package macOS
+    - name: Build macOS Image (.dmg)
       if: matrix.os == 'macos-latest'
       run: |
-        codesign --force --deep --sign - dist/TensorMedia.app
-        hdiutil create -volname "TensorMedia" -srcfolder dist/TensorMedia.app -ov -format UDZO dist/TensorMedia-macOS.dmg
+        mkdir -p dist/dmg_root
+        cp -R dist/TensorMedia.app dist/dmg_root/
+        # Симлинк для папки Программы
+        ln -s /Applications dist/dmg_root/Applications
+        hdiutil create -volname "TensorMedia" -srcfolder dist/dmg_root -ov -format UDZO dist/TensorMedia-macOS.dmg
+
+    - name: Build Linux Archive (.tar.gz)
+      if: startsWith(matrix.os, 'ubuntu')
+      run: |
+        cd dist
+        tar -czvf TensorMedia-${{ matrix.artifact_name }}-x86_64.tar.gz TensorMedia/
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
@@ -64,3 +90,5 @@ jobs:
         path: |
           dist/TensorMedia_Setup.exe
           dist/TensorMedia-macOS.dmg
+          dist/TensorMedia-Linux-*.tar.gz
+        retention-days: 5
