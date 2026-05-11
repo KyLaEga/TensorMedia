@@ -5,40 +5,43 @@ import sys
 import os
 
 # --- PRE-FLIGHT BOOTSTRAPPER ---
-# 1. Изоляция I/O: предотвращает падение без консоли
 if sys.stdout is None:
     sys.stdout = open(os.devnull, 'w')
 if sys.stderr is None:
     sys.stderr = open(os.devnull, 'w')
 
-# 2. Вычисление абсолютного пути ядра в скомпилированной среде
 if getattr(sys, 'frozen', False):
-    # PyInstaller onedir/bundle mode
     app_dir = os.path.dirname(sys.executable)
+    # В macOS внутри .app исполняемый файл лежит в Contents/MacOS/
+    # Нам нужно подняться выше или использовать ресурсы
+    if sys.platform == 'darwin':
+        app_dir = os.path.dirname(os.path.dirname(os.path.abspath(sys.executable)))
 else:
-    # Source execution mode
     app_dir = os.path.dirname(os.path.abspath(__file__))
 
-# 3. macOS Fix: Принудительный захват рабочей директории
 os.chdir(app_dir)
 sys.path.insert(0, app_dir)
 
-# 4. Windows Fix: Насильственная инъекция DLL-путей (Python 3.8+)
+# Настройка путей для ML-библиотек (Offline Mode)
+models_path = os.path.join(app_dir, "models")
+os.environ["TORCH_HOME"] = os.path.join(models_path, "torch")
+os.environ["HF_HOME"] = os.path.join(models_path, "huggingface")
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 if sys.platform == 'win32':
     try:
         os.add_dll_directory(app_dir)
-        pyside_dir = os.path.join(app_dir, 'PySide6')
-        if os.path.exists(pyside_dir):
-            os.add_dll_directory(pyside_dir)
+        # Добавляем путь к подпапке PySide6 для Windows
+        pyside_path = os.path.join(app_dir, "PySide6")
+        if os.path.exists(pyside_path):
+            os.add_dll_directory(pyside_path)
     except AttributeError:
         pass
-    os.environ['PATH'] = app_dir + os.pathsep + os.environ.get('PATH', '')
 # -------------------------------
 
-# ТОЛЬКО ТЕПЕРЬ импортируем графику, когда пути ОС взломаны
 import traceback
-from PySide6.QtWidgets import QApplication, QMessageBox
-from PySide6.QtCore import QMetaObject, Qt
+from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
 
 from utils.logger import auditor
 from ui.views.main_window import MainWindow
@@ -50,14 +53,12 @@ class ApplicationBootstrap:
     @staticmethod
     def execute():
         sys.excepthook = ApplicationBootstrap._global_exception_handler
-        
         auditor.info("Initializing TensorMedia core architecture...")
         
         setup_offline_env()
         
         app = QApplication(sys.argv)
         app.setApplicationName("TensorMedia")
-        app.setApplicationVersion("1.0.0")
         
         try:
             ml_orchestrator = MLOrchestrator()
@@ -76,26 +77,11 @@ class ApplicationBootstrap:
 
     @staticmethod
     def _global_exception_handler(exc_type, exc_value, exc_traceback):
-        if issubclass(exc_type, KeyboardInterrupt):
-            sys.__excepthook__(exc_type, exc_value, exc_traceback)
-            return
-            
         error_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
-        
         try:
-            auditor.critical(f"Unhandled GUI/Core exception:\n{error_msg}")
-        except Exception:
-            pass
-            
-        try:
-            print(f"CRITICAL RUNTIME ERROR:\n{error_msg}", file=sys.stderr)
-        except Exception:
-            import os
-            os.write(2, f"CRITICAL RUNTIME ERROR:\n{error_msg}".encode('utf-8'))
+            auditor.critical(f"Unhandled exception:\n{error_msg}")
+        except: pass
         sys.exit(1)
 
 if __name__ == "__main__":
-    os.environ["QT_API"] = "pyside6"
-    os.environ["OMP_NUM_THREADS"] = "1" 
-    
     ApplicationBootstrap.execute()
