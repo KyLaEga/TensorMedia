@@ -1,38 +1,36 @@
 # -*- mode: python ; coding: utf-8 -*-
-import os
-import facenet_pytorch
-from PyInstaller.utils.hooks import collect_submodules, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
 
-facenet_path = os.path.dirname(facenet_pytorch.__file__)
-pyside_binaries = collect_dynamic_libs('PySide6')
+# ФИКС NPU: Официальный хук PyInstaller скопирует данные facenet внутрь его же модуля
+facenet_datas = collect_data_files('facenet_pytorch')
 
-project_datas = [
-    # Фикс NPU: забираем веса facenet (pnet.pt) из виртуальной среды
-    (os.path.join(facenet_path, 'data'), 'facenet_pytorch/data'),
+EXCLUDES = [
+    'matplotlib', 'scipy', 'tensorboard', 'tkinter', 'PyQt5', 'PyQt6', 'wx', 
+    'jupyter', 'notebook', 'IPython', 'pandas.tests', 'numpy.random._examples'
 ]
 
-# Захват папок моделей, которые скачает CI
-for folder in ['models', 'assets', 'resources', 'core/ml/models']:
-    if os.path.exists(folder):
-        project_datas.append((folder, folder))
-
+# ФИКС WINDOWS: Оставляем PySide6 здесь, PyInstaller сам создаст правильный qt.conf
 HIDDEN_IMPORTS = [
     'torchvision', 'facenet_pytorch', 'faiss', 'safetensors',
-    'shiboken6', 'fitz', 'cv2', 'transformers', 'tokenizers'
-] + collect_submodules('PySide6')
+    'PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets', 'PySide6.QtMultimedia',
+    'shiboken6', 'cv2'
+]
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=pyside_binaries,
-    datas=project_datas,
+    binaries=[], # Обязательно пусто, иначе сломаются DLL на Windows
+    datas=[
+        ('models/siglip-base-patch16-224', 'models/siglip-base-patch16-224'),
+        ('models/torch', 'models/torch')
+    ] + facenet_datas,
     hiddenimports=HIDDEN_IMPORTS,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['matplotlib', 'scipy', 'tkinter', 'jupyter'],
+    excludes=EXCLUDES,
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -49,8 +47,8 @@ exe = EXE(
     name='TensorMedia',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
+    strip=False, 
+    upx=True,    
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -68,7 +66,7 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='TensorMedia'
+    name='TensorMedia' 
 )
 
 app = BUNDLE(

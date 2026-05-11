@@ -31,7 +31,6 @@ class BatchOperations:
 
     @staticmethod
     def check_and_recover_pending_transactions():
-        """Инициализация ядра: аудит и откат прерванных операций."""
         if not BatchOperations.JOURNAL_FILE.exists():
             return
             
@@ -41,8 +40,6 @@ class BatchOperations:
             
             if tx.get("status") == "pending":
                 auditor.warning(f"Detected pending transaction [{tx.get('op')}]. Executing state reconciliation.")
-                # Логика восстановления: система просто очищает журнал, так как
-                # атомарность обеспечивается на уровне последующего кэша.
             
             BatchOperations.JOURNAL_FILE.unlink()
             auditor.info("FS transaction journal reconciled and cleared.")
@@ -53,7 +50,6 @@ class BatchOperations:
 
     @staticmethod
     def _log_transaction(op_type: str, payload: dict):
-        """Захват состояния (Snapshot) перед физическим I/O."""
         try:
             with open(BatchOperations.JOURNAL_FILE, "w", encoding="utf-8") as f:
                 json.dump({"op": op_type, "payload": payload, "status": "pending"}, f)
@@ -62,7 +58,6 @@ class BatchOperations:
 
     @staticmethod
     def _commit_transaction():
-        """Очистка журнала после успешного выполнения."""
         if BatchOperations.JOURNAL_FILE.exists():
             try:
                 BatchOperations.JOURNAL_FILE.unlink()
@@ -85,7 +80,7 @@ class BatchOperations:
                     cursor = cache.conn.cursor()
                     cursor.executemany(
                         "DELETE FROM vectors WHERE file_path = ?", 
-                        [(str(p),) for p in file_paths]
+                        [(str(Path(p).resolve()),) for p in file_paths]
                     )
                 auditor.info(f"Cache invalidated for {len(file_paths)} paths in {db_name}.")
             except Exception as e:
@@ -99,7 +94,8 @@ class BatchOperations:
         
         for path in file_paths:
             try:
-                p = Path(path)
+                # ФИКС КОРЗИНЫ: Обязательное получение абсолютного системного пути
+                p = Path(path).resolve()
                 if p.exists() or p.is_symlink():
                     send2trash(str(p))
                     results["success"].append(path)
@@ -116,16 +112,16 @@ class BatchOperations:
     @staticmethod
     def move_files(file_paths: list, target_dir: str, scan_mode: str = None) -> dict:
         results = {"success": [], "failed": []}
-        target = Path(target_dir)
+        target = Path(target_dir).resolve()
         
-        BatchOperations._log_transaction("move", {"targets": file_paths, "destination": target_dir})
+        BatchOperations._log_transaction("move", {"targets": file_paths, "destination": str(target)})
         
         if not target.exists():
             target.mkdir(parents=True, exist_ok=True)
 
         for path in file_paths:
             try:
-                src = Path(path)
+                src = Path(path).resolve()
                 if src.exists():
                     dst = target / src.name
                     if dst.exists():
@@ -147,7 +143,7 @@ class BatchOperations:
                         cursor = cache.conn.cursor()
                         cursor.executemany(
                             "UPDATE vectors SET file_path = ? WHERE file_path = ?",
-                            [(dst, src) for src, dst in results["success"]]
+                            [(str(Path(dst).resolve()), str(Path(src).resolve())) for src, dst in results["success"]]
                         )
                 except Exception as e:
                     auditor.error(f"Cache path update transaction failed: {e}")
@@ -157,5 +153,4 @@ class BatchOperations:
 
     @staticmethod
     def terminate_pool():
-        """Принудительное закрытие всех файловых дескрипторов баз данных."""
         DBConnectionPool.close_all()
