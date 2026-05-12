@@ -1,32 +1,31 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
+import os
 
 block_cipher = None
 
-# ФИКС NPU: Официальный хук PyInstaller скопирует данные facenet внутрь его же модуля
+pyside_binaries = collect_dynamic_libs('PySide6')
+pyside_hidden = collect_submodules('PySide6')
 facenet_datas = collect_data_files('facenet_pytorch')
+
+project_datas = [
+    ('models/siglip-base-patch16-224', 'models/siglip-base-patch16-224'),
+    ('models/torch', 'models/torch')
+] + facenet_datas
 
 EXCLUDES = [
     'matplotlib', 'scipy', 'tensorboard', 'tkinter', 'PyQt5', 'PyQt6', 'wx', 
     'jupyter', 'notebook', 'IPython', 'pandas.tests', 'numpy.random._examples'
 ]
 
-# ФИКС WINDOWS: Оставляем PySide6 здесь, PyInstaller сам создаст правильный qt.conf
-HIDDEN_IMPORTS = [
-    'torchvision', 'facenet_pytorch', 'faiss', 'safetensors',
-    'PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets', 'PySide6.QtMultimedia',
-    'shiboken6', 'cv2'
-]
-
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[], # Обязательно пусто, иначе сломаются DLL на Windows
-    datas=[
-        ('models/siglip-base-patch16-224', 'models/siglip-base-patch16-224'),
-        ('models/torch', 'models/torch')
-    ] + facenet_datas,
-    hiddenimports=HIDDEN_IMPORTS,
+    binaries=pyside_binaries,
+    datas=project_datas,
+    hiddenimports=[
+        'torchvision', 'faiss', 'safetensors', 'shiboken6'
+    ] + pyside_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -47,7 +46,7 @@ exe = EXE(
     name='TensorMedia',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=False, 
+    strip=False,
     upx=True,    
     console=False,
     disable_windowed_traceback=False,

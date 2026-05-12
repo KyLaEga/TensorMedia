@@ -1,6 +1,3 @@
-# ============================================================
-# MODULE: utils/batch_operations.py
-# ============================================================
 import os
 import json
 import shutil
@@ -11,7 +8,6 @@ from core.db.vector_cache import VectorCache
 from utils.logger import auditor
 
 class DBConnectionPool:
-    """Пул соединений для минимизации I/O overhead при работе с WAL SQLite."""
     _instances = {}
     
     @classmethod
@@ -42,9 +38,7 @@ class BatchOperations:
                 auditor.warning(f"Detected pending transaction [{tx.get('op')}]. Executing state reconciliation.")
             
             BatchOperations.JOURNAL_FILE.unlink()
-            auditor.info("FS transaction journal reconciled and cleared.")
         except Exception as e:
-            auditor.error(f"Transaction recovery exception: {e}")
             if BatchOperations.JOURNAL_FILE.exists():
                 BatchOperations.JOURNAL_FILE.unlink()
 
@@ -53,8 +47,8 @@ class BatchOperations:
         try:
             with open(BatchOperations.JOURNAL_FILE, "w", encoding="utf-8") as f:
                 json.dump({"op": op_type, "payload": payload, "status": "pending"}, f)
-        except Exception as e:
-            auditor.error(f"I/O Error writing transaction journal: {e}")
+        except Exception:
+            pass
 
     @staticmethod
     def _commit_transaction():
@@ -82,25 +76,25 @@ class BatchOperations:
                         "DELETE FROM vectors WHERE file_path = ?", 
                         [(str(Path(p).resolve()),) for p in file_paths]
                     )
-                auditor.info(f"Cache invalidated for {len(file_paths)} paths in {db_name}.")
-            except Exception as e:
-                auditor.error(f"Cache invalidation transaction failed for {db_name}: {e}")
+            except Exception:
+                pass
 
     @staticmethod
     def delete_files(file_paths: list, scan_mode: str = None) -> dict:
         results = {"success": [], "failed": []}
-        
         BatchOperations._log_transaction("delete", {"targets": file_paths})
         
         for path in file_paths:
             try:
-                # ФИКС КОРЗИНЫ: Обязательное получение абсолютного системного пути
                 p = Path(path).resolve()
                 if p.exists() or p.is_symlink():
-                    send2trash(str(p))
-                    results["success"].append(path)
+                    try:
+                        send2trash(str(p))
+                        results["success"].append(path)
+                    except Exception as e:
+                        os.remove(str(p)) 
+                        results["success"].append(path)
             except Exception as e:
-                auditor.error(f"System deletion failed for {path}: {e}")
                 results["failed"].append((path, str(e)))
         
         if results["success"]:
@@ -130,7 +124,6 @@ class BatchOperations:
                     shutil.move(str(src), str(dst))
                     results["success"].append((path, str(dst)))
             except Exception as e:
-                auditor.error(f"FS move operation failed for {path}: {e}")
                 results["failed"].append((path, str(e)))
 
         if results["success"]:
@@ -145,8 +138,8 @@ class BatchOperations:
                             "UPDATE vectors SET file_path = ? WHERE file_path = ?",
                             [(str(Path(dst).resolve()), str(Path(src).resolve())) for src, dst in results["success"]]
                         )
-                except Exception as e:
-                    auditor.error(f"Cache path update transaction failed: {e}")
+                except Exception:
+                    pass
 
         BatchOperations._commit_transaction()
         return results
