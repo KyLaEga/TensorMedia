@@ -19,84 +19,11 @@ from ui.components.dialogs import VisualDeleteDialog
 from ui.components.image_label import ScalableImageLabel
 from utils.logger import auditor
 
-from core.services.fs_service import FileSystemService
+from core.services.fs_service import FileSystemService, SafeFSExecutor, BatchOpWorker, reveal_in_os
 from core.services.auto_selector import AutoSelectWorker
 
-# Глобальный реестр для защиты потоков от C++ абстракций Qt при экстренном закрытии
-_global_thread_orphans = []
-
-# ============================================================
-# ВНУТРЕННИЙ FS-АДАПТЕР (Изоляция от внешних зависимостей)
-# ============================================================
-class SafeFSExecutor:
-    @staticmethod
-    def move_files(paths, dest_dir):
-        success = 0
-        for p in paths:
-            try:
-                shutil.move(p, os.path.join(dest_dir, os.path.basename(p)))
-                success += 1
-            except Exception as e:
-                auditor.error(f"Move failed for {p}: {e}")
-        return {"deleted": 0, "moved": success, "failed": len(paths) - success}
-
-    @staticmethod
-    def hard_delete(paths):
-        success = 0
-        for p in paths:
-            try:
-                if os.path.isfile(p) or os.path.islink(p): os.remove(p)
-                elif os.path.isdir(p): shutil.rmtree(p)
-                success += 1
-            except Exception as e:
-                auditor.error(f"Hard delete failed for {p}: {e}")
-        return {"deleted": success, "moved": 0, "failed": len(paths) - success}
-        
-    @staticmethod
-    def safe_delete(paths):
-        success = 0
-        try:
-            from send2trash import send2trash
-            for p in paths:
-                try:
-                    send2trash(os.path.abspath(p))
-                    success += 1
-                except Exception as e:
-                    auditor.error(f"Send2Trash failed for {p}: {e}")
-        except ImportError:
-            auditor.warning("send2trash module not found. Falling back to hard delete.")
-            return SafeFSExecutor.hard_delete(paths)
-        return {"deleted": success, "moved": 0, "failed": len(paths) - success}
-
-def reveal_in_os(path: str):
-    sys_name = platform.system()
-    clean_path = str(Path(path).resolve().absolute())
-    try:
-        if sys_name == "Windows":
-            subprocess.run(['explorer', '/select,', clean_path], shell=False)
-        elif sys_name == "Darwin":
-            subprocess.run(['open', '-R', clean_path], shell=False)
-        else:
-            subprocess.run(['xdg-open', os.path.dirname(clean_path)], shell=False)
-    except Exception as e:
-        auditor.error(f"OS Explorer reveal failed: {e}")
-
-class BatchOpWorker(QThread):
-    finished = Signal(object)
-    
-    def __init__(self, func, *args, **kwargs):
-        super().__init__()
-        self.func = func
-        self.args = args
-        self.kwargs = kwargs
-        
-    def run(self):
-        try:
-            res = self.func(*self.args, **self.kwargs)
-            self.finished.emit(res)
-        except Exception as e:
-            auditor.error(f"Batch operation failed: {e}")
-            self.finished.emit({"deleted": 0, "moved": 0, "failed": len(self.args[0])})
+from ui.controllers.selection_controller import SelectionController
+from ui.controllers.preview_controller import PreviewController
 
 class MainController(QObject):
     def __init__(self, view):
@@ -117,12 +44,15 @@ class MainController(QObject):
         self.fs_service = FileSystemService(self.view.model, self)
         self.fs_service.integrity_violation_detected.connect(self._prune_dead_nodes)
         
+        self.selection_controller = SelectionController(self)
+        self.preview_controller = PreviewController(self)
+        
         self.video_worker = MultiVideoWorker()
         self.video_worker.frame_ready.connect(self._on_worker_frame_ready)
         
         self.selection_timer = QTimer(self)
         self.selection_timer.setSingleShot(True)
-        self.selection_timer.timeout.connect(self._process_selection)
+        self.selection_timer.timeout.connect(self.preview_controller.process_selection)
         
         self.scan_seconds = 0
         self.scan_timer = QTimer(self)
@@ -134,6 +64,7 @@ class MainController(QObject):
         
         translator.language_changed.connect(self._retranslate_controller)
         
+        self._toggle_scan_mode()
         bus.cmd_warmup_engine.emit()
 
     def _bind_event_bus(self):
@@ -157,8 +88,8 @@ class MainController(QObject):
         v.slider_threshold.sliderReleased.connect(self._trigger_recluster)
         v.search_input.textChanged.connect(self._apply_view_filter)
         v.combo_view_filter.currentIndexChanged.connect(self._apply_view_filter)
-        v.btn_auto_select.clicked.connect(self._apply_auto_selection)
-        v.btn_clear_select.clicked.connect(self._clear_selection)
+        v.btn_auto_select.clicked.connect(self.selection_controller.apply_auto_selection)
+        v.btn_clear_select.clicked.connect(self.selection_controller.clear_selection)
         v.btn_scan.clicked.connect(self._start_scan)
         v.btn_pause.clicked.connect(self._toggle_pause)
         v.btn_stop.clicked.connect(self._stop_scan)
@@ -171,11 +102,11 @@ class MainController(QObject):
         v.tree.customContextMenuRequested.connect(self._on_context_menu)
         
         v.btn_grid.clicked.connect(self._trigger_grid_compare)
-        v.btn_move.clicked.connect(self._move_trigger)
-        v.btn_delete.clicked.connect(self._soft_delete_trigger)
+        v.btn_move.clicked.connect(self.selection_controller.move_trigger)
+        v.btn_delete.clicked.connect(lambda: self.selection_controller.process_delete(False))
         v.multi_sync_slider.sliderReleased.connect(self._execute_multi_video_frames)
         
-        v.model.itemChanged.connect(self._on_item_changed)
+        v.model.itemChanged.connect(self.selection_controller.on_item_changed)
 
         v.btn_tab_scan.clicked.connect(lambda: v._switch_tab(0))
         v.btn_tab_analytics.clicked.connect(lambda: v._switch_tab(1))
@@ -188,31 +119,31 @@ class MainController(QObject):
         self.sc_f1.activated.connect(self._show_help_dialog)
         
         self.sc_space = QShortcut(QKeySequence(Qt.Key.Key_Space), self.view, context=Qt.ShortcutContext.ApplicationShortcut)
-        self.sc_space.activated.connect(self._manual_check_selected)
+        self.sc_space.activated.connect(self.selection_controller.manual_check_selected)
         
         self.sc_return = QShortcut(QKeySequence(Qt.Key.Key_Return), self.view, context=Qt.ShortcutContext.ApplicationShortcut)
-        self.sc_return.activated.connect(self._manual_check_selected)
+        self.sc_return.activated.connect(self.selection_controller.manual_check_selected)
         
         self.sc_backspace = QShortcut(QKeySequence(Qt.Key.Key_Backspace), self.view, context=Qt.ShortcutContext.ApplicationShortcut)
-        self.sc_backspace.activated.connect(self._soft_delete_trigger)
+        self.sc_backspace.activated.connect(lambda: self.selection_controller.process_delete(False))
         
         self.sc_delete = QShortcut(QKeySequence(Qt.Key.Key_Delete), self.view, context=Qt.ShortcutContext.ApplicationShortcut)
-        self.sc_delete.activated.connect(self._soft_delete_trigger)
+        self.sc_delete.activated.connect(lambda: self.selection_controller.process_delete(False))
         
         self.sc_shift_backspace = QShortcut(QKeySequence("Shift+Backspace"), self.view, context=Qt.ShortcutContext.ApplicationShortcut)
-        self.sc_shift_backspace.activated.connect(self._hard_delete_trigger)
+        self.sc_shift_backspace.activated.connect(lambda: self.selection_controller.process_delete(True))
         
         self.sc_shift_delete = QShortcut(QKeySequence("Shift+Delete"), self.view, context=Qt.ShortcutContext.ApplicationShortcut)
-        self.sc_shift_delete.activated.connect(self._hard_delete_trigger)
+        self.sc_shift_delete.activated.connect(lambda: self.selection_controller.process_delete(True))
         
         self.sc_select_all = QShortcut(QKeySequence.StandardKey.SelectAll, self.view, context=Qt.ShortcutContext.ApplicationShortcut)
-        self.sc_select_all.activated.connect(self._apply_auto_selection)
+        self.sc_select_all.activated.connect(self.selection_controller.apply_auto_selection)
         
         self.sc_clear_d = QShortcut(QKeySequence("Ctrl+D"), self.view, context=Qt.ShortcutContext.ApplicationShortcut)
-        self.sc_clear_d.activated.connect(self._clear_selection)
+        self.sc_clear_d.activated.connect(self.selection_controller.clear_selection)
         
         self.sc_clear_meta = QShortcut(QKeySequence("Meta+D"), self.view, context=Qt.ShortcutContext.ApplicationShortcut)
-        self.sc_clear_meta.activated.connect(self._clear_selection)
+        self.sc_clear_meta.activated.connect(self.selection_controller.clear_selection)
 
     def _set_status(self, key, *args):
         self.current_status_key = key
@@ -267,6 +198,7 @@ class MainController(QObject):
 
     def _on_directory_dropped(self, path):
         if os.path.isdir(path):
+            path = os.path.normpath(os.path.abspath(path))
             self.target_dir_a = path
             self.view.lbl_path_a.setText(str(path))
             self._check_ready()
@@ -274,33 +206,18 @@ class MainController(QObject):
                 self._start_scan()
 
     def _on_window_closed(self):
-        """Паттерн 'Глобальный Якорь' для предотвращения краша QThread при закрытии."""
+        """Паттерн корректного завершения потоков при закрытии окна."""
         bus.cmd_stop_scan.emit() # Сигнализируем ядру об остановке
 
-        # 1. Снимаем Condition-блокировки VideoWorker и сиротим его
-        if self.video_worker.isRunning():
-            self.video_worker.setParent(None)
-            _global_thread_orphans.append(self.video_worker)
+        # 1. Снимаем Condition-блокировки VideoWorker и ждем завершения
+        if hasattr(self, 'video_worker') and self.video_worker.isRunning():
             self.video_worker.stop()
+            self.video_worker.requestInterruption()
+            self.video_worker.quit()
+            self.video_worker.wait(2000)
 
-        # 2. Сиротим локальные задачи UI
-        for attr in ['auto_worker', 'del_worker', 'move_worker']:
-            if hasattr(self, attr):
-                worker = getattr(self, attr)
-                if worker and worker.isRunning():
-                    worker.setParent(None)
-                    _global_thread_orphans.append(worker)
-
-        # 3. Инъекция в скрытый MLOrchestrator. Спасаем потоки кластеризации (FAISS)
-        app = QApplication.instance()
-        if hasattr(app, '_ml_orchestrator'):
-            orch = app._ml_orchestrator
-            for attr_name in dir(orch):
-                worker = getattr(orch, attr_name)
-                # Если свойство является активным потоком — отвязываем от C++ дерева
-                if isinstance(worker, QThread) and worker.isRunning():
-                    worker.setParent(None)
-                    _global_thread_orphans.append(worker)
+        # 2. Корректно завершаем локальные задачи UI
+        self.selection_controller.cleanup_workers()
 
     def _expand_all_safely(self):
         if self.view.model.rowCount() > 0: self.view.tree.expandAll()
@@ -324,6 +241,7 @@ class MainController(QObject):
     def _select_directory(self, mode):
         folder = QFileDialog.getExistingDirectory(self.view, translator.tr("dialog_select_dir"))
         if folder: 
+            folder = os.path.normpath(os.path.abspath(folder))
             if mode == 'a':
                 self.target_dir_a = folder
                 self.view.lbl_path_a.setText(str(folder))
@@ -513,6 +431,9 @@ class MainController(QObject):
                 group.itemData[0] = f"{translator.tr('cluster_prefix')} #{cluster_id} ({visible_children} {translator.tr('cluster_files')})"
                 self.view.model.dataChanged.emit(src_group_idx, src_group_idx, [Qt.ItemDataRole.DisplayRole])
                 
+        if s_text or f_idx > 0:
+            self.view.tree.expandAll()
+            
         self._update_statistics_panel()
 
     def _manual_check_selected(self):
@@ -647,12 +568,14 @@ class MainController(QObject):
         if is_dual: 
             dirs_to_scan.append(self.target_dir_b)
 
-        exts = set()
-        if self.view.chk_img.isChecked(): exts.update({'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.heic', '.JPG', '.JPEG', '.PNG', '.WEBP', '.BMP', '.HEIC'})
-        if self.view.chk_vid.isChecked(): exts.update({'.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v', '.MP4', '.MOV', '.MKV', '.WEBM', '.AVI', '.M4V'})
-        if self.view.chk_doc.isChecked(): exts.update({'.pdf', '.cbz', '.gif', '.PDF', '.CBZ', '.GIF'})
+        exts = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.heic', '.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v', '.pdf', '.cbz', '.gif'}
+        # Фильтруем по чекбоксам, но сохраняем регистр
+        final_exts = set()
+        if self.view.chk_img.isChecked(): final_exts.update({'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.heic', '.JPG', '.JPEG', '.PNG', '.WEBP', '.BMP', '.HEIC'})
+        if self.view.chk_vid.isChecked(): final_exts.update({'.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v', '.MP4', '.MOV', '.MKV', '.WEBM', '.AVI', '.M4V'})
+        if self.view.chk_doc.isChecked(): final_exts.update({'.pdf', '.cbz', '.gif', '.PDF', '.CBZ', '.GIF'})
         
-        if not exts:
+        if not final_exts:
             title = "Ошибка параметров" if translator.current_lang == "ru" else "Parameter Error"
             msg = "Не выбран ни один формат файлов (Фото, Видео или Документы)." if translator.current_lang == "ru" else "No file formats selected (Images, Videos, or Documents)."
             QMessageBox.warning(self.view, title, msg)
@@ -660,7 +583,7 @@ class MainController(QObject):
             
         selected_mode = "visual" if self.view.combo_engine.currentIndex() == 0 else "faces"
         
-        auditor.info(f"UI Triggered Scan Pipeline: Dirs={dirs_to_scan}, Extensions={len(exts)}")
+        auditor.info(f"UI Triggered Scan Pipeline: Dirs={dirs_to_scan}, Extensions={len(final_exts)}")
         
         self.view.btn_scan.hide()
         self.view.btn_pause.show()
@@ -674,7 +597,7 @@ class MainController(QObject):
         
         self.is_paused = False
         self.is_stopped_requested = False
-        bus.cmd_start_scan.emit(dirs_to_scan, exts, selected_mode)
+        bus.cmd_start_scan.emit(dirs_to_scan, final_exts, selected_mode)
 
     def _on_scan_progress(self, current, total, msg):
         pct = int(current / total * 100) if total > 0 else 0
@@ -688,9 +611,14 @@ class MainController(QObject):
         
         if self.is_paused:
             self._set_status("status_wait")
+            self.view.btn_pause.setText(translator.tr("btn_resume") if translator.tr("btn_resume") else "Продолжить")
+            # Если есть иконка, можно также сменить её:
+            # self.view.btn_pause.setIcon(QIcon("assets/play.png"))
         else:
             self.current_status_key = None
             self.view.lbl_status.setText("Scanning..." if translator.current_lang == "en" else "Сканирование...")
+            self.view.btn_pause.setText(translator.tr("btn_pause") if translator.tr("btn_pause") else "Пауза")
+            # self.view.btn_pause.setIcon(QIcon("assets/pause.png"))
 
     def _stop_scan(self):
         self.is_stopped_requested = True
@@ -720,6 +648,9 @@ class MainController(QObject):
         self.view.btn_stop.hide()
         self.view.btn_scan.show()
         
+        # Сброс текста кнопки паузы при завершении
+        self.view.btn_pause.setText(translator.tr("btn_pause") if translator.tr("btn_pause") else "Пауза")
+        
         if self.is_stopped_requested:
             self.view.btn_scan.setEnabled(True)
             self._set_status("status_aborted")
@@ -732,17 +663,42 @@ class MainController(QObject):
         valid_clusters = []
         dirs_to_watch = set()
         
+        # В режиме двух папок (dual mode) нам нужно убедиться, что в кластере есть файлы из ОБЕИХ папок.
+        # Используем абсолютные нормализованные пути для надежного сравнения.
+        ref_path = os.path.normpath(os.path.abspath(self.target_dir_a)) if self.target_dir_a else None
+        
+        if self.view.rb_dual.isChecked():
+            auditor.info(f"Dual Mode Filtering: Reference Dir = {ref_path}")
+            auditor.info(f"Total clusters before filtering: {len(clusters)}")
+
         for cluster in clusters:
-            if self.view.rb_dual.isChecked() and self.target_dir_a:
-                has_inbox = any(not os.path.abspath(it['path']).startswith(os.path.abspath(self.target_dir_a)) for it in cluster)
-                if not has_inbox: continue 
-            valid_clusters.append(cluster)
+            if self.view.rb_dual.isChecked() and ref_path:
+                has_a = False
+                has_b = False
+                for it in cluster:
+                    try:
+                        item_path = os.path.normpath(os.path.abspath(it['path']))
+                        # Проверяем, находится ли файл внутри ref_path
+                        if os.path.commonpath([ref_path, item_path]) == ref_path:
+                            has_a = True
+                        else:
+                            has_b = True
+                    except Exception as e:
+                        auditor.warning(f"Path comparison failed for {it['path']}: {e}")
+                        has_b = True 
+                
+                if not (has_a and has_b):
+                    continue 
             
+            valid_clusters.append(cluster)
             for it in cluster:
                 dirs_to_watch.add(str(Path(it['path']).parent))
 
+        if self.view.rb_dual.isChecked():
+            auditor.info(f"Total clusters after filtering: {len(valid_clusters)}")
+
         self.fs_service.update_watch_paths(dirs_to_watch)
-        self.view.model.itemChanged.disconnect(self._on_item_changed)
+        self.view.model.itemChanged.disconnect(self.selection_controller.on_item_changed)
         
         context_dir = self.target_dir_a if self.view.rb_dual.isChecked() else None
         self.view.model.set_context(context_dir)
@@ -753,7 +709,7 @@ class MainController(QObject):
         
         self.view.model.set_clusters(valid_clusters)
         
-        self.view.model.itemChanged.connect(self._on_item_changed)
+        self.view.model.itemChanged.connect(self.selection_controller.on_item_changed)
         self.view.btn_scan.setEnabled(True)
         
         if self.view.model.rowCount() <= 50: 
@@ -774,54 +730,6 @@ class MainController(QObject):
         self._apply_view_filter()
         self._update_statistics_panel()
 
-    def _process_selection(self):
-        proxy_indexes = [idx for idx in self.view.tree.selectionModel().selectedRows(0) if idx.isValid()]
-        indexes = [self.view.proxy_model.mapToSource(idx) for idx in proxy_indexes]
-        
-        if not indexes:
-            self.view.preview_stack.setCurrentIndex(0)
-            self.view.single_preview_label.clear_view()
-            return
-
-        if len(indexes) == 1 and not indexes[0].parent().isValid():
-            proxy_group_idx = proxy_indexes[0]
-            paths = []
-            
-            for i in range(self.view.proxy_model.rowCount(proxy_group_idx)):
-                proxy_child_idx = self.view.proxy_model.index(i, 0, proxy_group_idx)
-                src_child_idx = self.view.proxy_model.mapToSource(proxy_child_idx)
-                
-                child = self.view.model.itemFromIndex(src_child_idx)
-                if child:
-                    data = child.data(Qt.ItemDataRole.UserRole)
-                    if data and isinstance(data, dict):
-                        paths.append(data['path'])
-                        
-            if len(paths) > 1 or (len(paths) == 1 and Path(paths[0]).suffix.lower() in {'.cbz', '.pdf'}):
-                self._render_multi_preview(paths)
-            elif len(paths) == 1:
-                self._render_preview(paths[0])
-            return
-
-        sel = [idx for idx in indexes if idx.parent().isValid()]
-        
-        if len(sel) > 1:
-            paths = []
-            for idx in sel:
-                data = self.view.model.itemFromIndex(idx.siblingAtColumn(0)).data(Qt.ItemDataRole.UserRole)
-                if data and isinstance(data, dict):
-                    paths.append(data['path'])
-            self._render_multi_preview(paths) 
-        elif len(sel) == 1: 
-            data = self.view.model.itemFromIndex(sel[0].siblingAtColumn(0)).data(Qt.ItemDataRole.UserRole)
-            if data and isinstance(data, dict):
-                p = data['path']
-                if Path(p).suffix.lower() in {'.cbz', '.pdf'}: self._render_multi_preview([p])
-                else: self._render_preview(p)
-        else: 
-            self.view.preview_stack.setCurrentIndex(0)
-            self.view.single_preview_label.clear_view()
-
     def _on_context_menu(self, pos):
         proxy_index = self.view.tree.indexAt(pos)
         if not proxy_index.isValid(): return
@@ -830,90 +738,21 @@ class MainController(QObject):
         item = self.view.model.itemFromIndex(index.siblingAtColumn(0))
         menu = QMenu(self.view)
         if not index.parent().isValid():
-            menu.addAction(translator.tr("ctx_select_inbox"), lambda i=item, idx=index: self._set_group_check_state(i, idx, Qt.CheckState.Checked))
+            menu.addAction(translator.tr("ctx_select_inbox"), lambda i=item, idx=index: self.selection_controller.set_group_check_state(i, idx, Qt.CheckState.Checked))
             menu.addAction(translator.tr("btn_compare"), self._trigger_grid_compare)
         else:
             if not item.raw_dict.get('is_ref', False):
-                menu.addAction(translator.tr("ctx_toggle"), self._manual_check_selected)
+                menu.addAction(translator.tr("ctx_toggle"), self.selection_controller.manual_check_selected)
             menu.addAction(translator.tr("btn_compare"), self._trigger_grid_compare)
             
             data = item.data(Qt.ItemDataRole.UserRole)
             if data and isinstance(data, dict):
                 path = data['path']
+                from core.services.fs_service import reveal_in_os
                 menu.addAction(translator.tr("ctx_reveal"), lambda p=path: reveal_in_os(p))
             
         menu.setStyleSheet("QMenu { background-color: #2B2D31; color: white; border: 1px solid #4E5058; } QMenu::item:selected { background-color: #5865F2; }")
         menu.exec(self.view.tree.viewport().mapToGlobal(pos))
-
-    def _set_group_check_state(self, item, group_idx, state):
-        for i in range(item.childCount()):
-            child = item.child(i)
-            if not child.raw_dict.get('is_ref', False):
-                child.check_state = state
-                
-        self.view.model.dataChanged.emit(
-            self.view.model.index(0, 0, group_idx),
-            self.view.model.index(item.childCount()-1, 5, group_idx),
-            [Qt.ItemDataRole.CheckStateRole, Qt.ItemDataRole.DisplayRole]
-        )
-        self.view.tree.viewport().update()
-        self._update_savings()
-
-    def _render_multi_preview(self, paths):
-        self.view.video_player.stop()
-        self.view.preview_stack.setCurrentIndex(2)
-        
-        for r in reversed(range(self.view.multi_grid.count())):
-            item_at = self.view.multi_grid.itemAt(r)
-            if item_at:
-                w = item_at.widget()
-                if w:
-                    w.deleteLater()
-                self.view.multi_grid.removeItem(item_at)
-            
-        for r in range(50): self.view.multi_grid.setRowStretch(r, 0)
-            
-        count = len(paths)
-        if count == 0: return
-        
-        if count <= 2: cols = 1
-        elif count <= 4: cols = 2
-        elif count <= 9: cols = 3
-        elif count <= 16: cols = 4
-        else: cols = 5
-            
-        self.multi_preview_lbls.clear() 
-        video_paths = []
-        has_v = False
-        
-        for i, p in enumerate(paths):
-            lbl = ScalableImageLabel() 
-            
-            ext = Path(p).suffix.lower()
-            if ext in {'.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v', '.gif', '.cbz', '.pdf'}:
-                has_v = True
-                video_paths.append(p)
-                self.multi_preview_lbls[p] = lbl
-            else:
-                reader = QImageReader(p)
-                reader.setAutoTransform(True)
-                size = reader.size()
-                if size.isValid() and (size.width() > 1920 or size.height() > 1920):
-                    size.scale(1920, 1920, Qt.AspectRatioMode.KeepAspectRatio)
-                    reader.setScaledSize(size)
-                img = reader.read()
-                if not img.isNull():
-                    lbl.setPixmap(QPixmap.fromImage(img))
-                else:
-                    if hasattr(lbl, 'clear_view'): lbl.clear_view()
-            
-            self.view.multi_grid.addWidget(lbl, i // cols, i % cols)
-            
-        if has_v: 
-            self.view.multi_slider_panel.show()
-            self._execute_multi_video_frames()
-        else: 
-            self.view.multi_slider_panel.hide()
 
     def _execute_multi_video_frames(self):
         if self.multi_preview_lbls:
@@ -925,38 +764,6 @@ class MainController(QObject):
                 self.multi_preview_lbls[path].setPixmap(QPixmap.fromImage(qimg))
             else:
                 self.multi_preview_lbls[path].clear_view()
-
-    def _render_preview(self, p):
-        self.view.video_player.stop()
-        if not os.path.exists(p): 
-            self.view.preview_stack.setCurrentIndex(0)
-            self.view.single_preview_label.clear_view()
-            return
-        ext = Path(p).suffix.lower()
-        if ext in {'.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v'}:
-            self.view.preview_stack.setCurrentIndex(1)
-            self.view.video_player.load_video(p)
-        else:
-            self.view.preview_stack.setCurrentIndex(0)
-            if ext == '.gif':
-                from PySide6.QtGui import QMovie
-                movie = QMovie(p)
-                movie.setCacheMode(QMovie.CacheMode.CacheAll)
-                self.view.single_preview_label.setMovie(movie)
-            elif ext in {'.pdf', '.cbz'}:
-                self.view.single_preview_label.load_document(p)
-            else:
-                reader = QImageReader(p)
-                reader.setAutoTransform(True)
-                size = reader.size()
-                if size.isValid() and (size.width() > 1920 or size.height() > 1920):
-                    size.scale(1920, 1920, Qt.AspectRatioMode.KeepAspectRatio)
-                    reader.setScaledSize(size)
-                img = reader.read()
-                if not img.isNull():
-                    self.view.single_preview_label.setPixmap(QPixmap.fromImage(img))
-                else:
-                    self.view.single_preview_label.clear_view()
 
     def _trigger_grid_compare(self):
         proxy_indexes = [idx for idx in self.view.tree.selectionModel().selectedRows(0) if idx.isValid()]
@@ -985,144 +792,17 @@ class MainController(QObject):
         dlg = MultiCompareDialog(pts, self.view)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             if dlg.files_to_delete:
-                if dlg.delete_hard: SafeFSExecutor.hard_delete(dlg.files_to_delete)
-                else: SafeFSExecutor.safe_delete(dlg.files_to_delete)
+                res = None
+                if dlg.delete_hard: 
+                    res = SafeFSExecutor.hard_delete(dlg.files_to_delete)
+                else: 
+                    res = SafeFSExecutor.safe_delete(dlg.files_to_delete)
+                
+                if res and res.get("error") == "send2trash_missing":
+                    QMessageBox.critical(
+                        self.view, 
+                        translator.tr("dialog_del_report_title"),
+                        "Ошибка: Модуль 'send2trash' не найден. Удаление в корзину невозможно."
+                    )
+                
                 self._prune_dead_nodes(dlg.files_to_delete)
-
-    def _move_trigger(self):
-        to_act = []
-        proxy = self.view.proxy_model
-        for i in range(proxy.rowCount()):
-            group_idx = proxy.index(i, 0)
-            for j in range(proxy.rowCount(group_idx)):
-                child_idx = proxy.index(j, 0, group_idx)
-                src_idx = proxy.mapToSource(child_idx)
-                child = self.view.model.itemFromIndex(src_idx)
-                
-                if child and child.checkState() == Qt.CheckState.Checked:
-                    data = child.data(Qt.ItemDataRole.UserRole)
-                    if data and isinstance(data, dict):
-                        to_act.append(data['path'])
-                    
-        if not to_act: return
-        dest = QFileDialog.getExistingDirectory(self.view, translator.tr("dialog_move_title"))
-        if dest:
-            self.view.btn_move.setEnabled(False)
-            self._set_status("status_computing")
-            
-            self.move_worker = BatchOpWorker(SafeFSExecutor.move_files, to_act, dest)
-            def _on_move_done(res):
-                self._prune_dead_nodes(to_act)
-                report = translator.tr("dialog_move_report").format(moved=res['moved'], failed=res['failed'])
-                QMessageBox.information(self.view, translator.tr("dialog_move_done"), report)
-                self.view.btn_move.setEnabled(True)
-                self._set_status("status_done")
-                
-            self.move_worker.finished.connect(_on_move_done)
-            self.move_worker.start()
-
-    def _apply_auto_selection(self):
-        s_idx = self.view.combo_strategy.currentIndex()
-        self.view.btn_auto_select.setEnabled(False)
-        self._set_status("status_computing")
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-
-        clusters_data = []
-        proxy = self.view.proxy_model
-        
-        for i in range(proxy.rowCount()):
-            cluster = []
-            group_idx = proxy.index(i, 0)
-            for j in range(proxy.rowCount(group_idx)):
-                child_idx = proxy.index(j, 0, group_idx)
-                src_idx = proxy.mapToSource(child_idx)
-                child = self.view.model.itemFromIndex(src_idx)
-                if child:
-                    data = child.data(Qt.ItemDataRole.UserRole)
-                    if data: cluster.append(data)
-            if len(cluster) > 1:
-                clusters_data.append(cluster)
-
-        self.auto_worker = AutoSelectWorker(clusters_data, s_idx, self)
-        self.auto_worker.finished.connect(self._apply_computed_selection)
-        self.auto_worker.start()
-
-    def _apply_computed_selection(self, paths_to_check):
-        check_set = set(paths_to_check)
-        
-        self.view.model.blockSignals(True) 
-        self.view.tree.setUpdatesEnabled(False)
-        
-        proxy = self.view.proxy_model
-        for i in range(proxy.rowCount()):
-            group_idx = proxy.index(i, 0)
-            for j in range(proxy.rowCount(group_idx)):
-                child_idx = proxy.index(j, 0, group_idx)
-                src_idx = proxy.mapToSource(child_idx)
-                child = self.view.model.itemFromIndex(src_idx)
-                if child and not child.raw_dict.get('is_ref', False):
-                    data = child.data(Qt.ItemDataRole.UserRole)
-                    if data and data['path'] in check_set:
-                        child.check_state = Qt.CheckState.Checked
-                    else:
-                        child.check_state = Qt.CheckState.Unchecked
-
-        self.view.model.blockSignals(False)
-        self.view.tree.setUpdatesEnabled(True)
-        self.view.model.dataChanged.emit(
-            self.view.model.index(0, 0, QModelIndex()),
-            self.view.model.index(self.view.model.rowCount()-1, 5, QModelIndex()),
-            [Qt.ItemDataRole.CheckStateRole, Qt.ItemDataRole.DisplayRole]
-        )    
-        self.view.tree.viewport().update()        
-        self._update_savings()
-        
-        QApplication.restoreOverrideCursor()
-        self.view.btn_auto_select.setEnabled(True)
-        self._set_status("status_done")
-
-    def _soft_delete_trigger(self):
-        self._process_delete(False)
-        
-    def _hard_delete_trigger(self):
-        self._process_delete(True)
-
-    def _process_delete(self, default_hard=False):
-        to_del = []
-        proxy = self.view.proxy_model
-        
-        for i in range(proxy.rowCount()):
-            group_idx = proxy.index(i, 0)
-            for j in range(proxy.rowCount(group_idx)):
-                child_idx = proxy.index(j, 0, group_idx)
-                src_idx = proxy.mapToSource(child_idx)
-                child = self.view.model.itemFromIndex(src_idx)
-                
-                if child and child.checkState() == Qt.CheckState.Checked:
-                    data = child.data(Qt.ItemDataRole.UserRole)
-                    if data and isinstance(data, dict):
-                        to_del.append(data['path'])
-                   
-        if not to_del:
-            QMessageBox.information(self.view, translator.tr("dialog_del_empty_title"), translator.tr("dialog_del_empty_msg"))
-            return
-            
-        dlg = VisualDeleteDialog(to_del, self.view)
-        if default_hard: dlg.rb_hard.setChecked(True) if hasattr(dlg, 'rb_hard') else None
-        
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self.view.btn_delete.setEnabled(False)
-            self._set_status("status_computing")
-            
-            func = SafeFSExecutor.hard_delete if dlg.delete_hard else SafeFSExecutor.safe_delete
-            
-            self.del_worker = BatchOpWorker(func, to_del)
-            def _on_del_done(res):
-                self._prune_dead_nodes(to_del)
-                report = translator.tr("dialog_del_report_msg").format(deleted=res['deleted'], failed=res['failed'])
-                QMessageBox.information(self.view, translator.tr("dialog_del_report_title"), report)
-                self.view.btn_delete.setEnabled(True)
-                self._set_status("status_done")
-                
-            self.del_worker.finished.connect(_on_del_done)
-            self.del_worker.start()

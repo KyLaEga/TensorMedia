@@ -5,6 +5,7 @@ from pathlib import Path
 from send2trash import send2trash
 
 from core.db.vector_cache import VectorCache
+from utils.env_config import get_data_dir
 from utils.logger import auditor
 
 class DBConnectionPool:
@@ -22,40 +23,59 @@ class DBConnectionPool:
             db.close()
         cls._instances.clear()
 
+    @classmethod
+    def run_maintenance_all(cls):
+        """Запускает GC и Vacuum для всех баз данных в пуле."""
+        # Убеждаемся, что основные базы инициализированы
+        for mode in ["visual", "faces"]:
+            cls.get_connection(f"meta_v2_{mode}.db")
+            
+        for db_name, db in cls._instances.items():
+            try:
+                db.run_maintenance()
+            except Exception as e:
+                auditor.error(f"Maintenance failed for {db_name}: {e}")
+
 class BatchOperations:
-    JOURNAL_FILE = Path("fs_transactions.journal")
+    @staticmethod
+    def _journal_path() -> Path:
+        return get_data_dir() / "fs_transactions.journal"
 
     @staticmethod
     def check_and_recover_pending_transactions():
-        if not BatchOperations.JOURNAL_FILE.exists():
+        journal = BatchOperations._journal_path()
+        if not journal.exists():
             return
             
         try:
-            with open(BatchOperations.JOURNAL_FILE, "r", encoding="utf-8") as f:
+            with open(journal, "r", encoding="utf-8") as f:
                 tx = json.load(f)
             
             if tx.get("status") == "pending":
                 auditor.warning(f"Detected pending transaction [{tx.get('op')}]. Executing state reconciliation.")
             
-            BatchOperations.JOURNAL_FILE.unlink()
+            journal.unlink()
         except Exception as e:
-            if BatchOperations.JOURNAL_FILE.exists():
-                BatchOperations.JOURNAL_FILE.unlink()
+            if journal.exists():
+                journal.unlink()
 
     @staticmethod
     def _log_transaction(op_type: str, payload: dict):
         try:
-            with open(BatchOperations.JOURNAL_FILE, "w", encoding="utf-8") as f:
+            with open(BatchOperations._journal_path(), "w", encoding="utf-8") as f:
                 json.dump({"op": op_type, "payload": payload, "status": "pending"}, f)
         except Exception:
+            # осознанное глушение: игнорируем ошибку записи журнала, чтобы не прерывать пакетную операцию
             pass
 
     @staticmethod
     def _commit_transaction():
-        if BatchOperations.JOURNAL_FILE.exists():
+        journal = BatchOperations._journal_path()
+        if journal.exists():
             try:
-                BatchOperations.JOURNAL_FILE.unlink()
+                journal.unlink()
             except Exception:
+                # осознанное глушение: файл журнала мог быть уже удален
                 pass
 
     @staticmethod
@@ -65,19 +85,15 @@ class BatchOperations:
         
         modes = [scan_mode] if scan_mode else ["visual", "faces"]
         
+        norm_paths = [str(Path(p).resolve()) for p in file_paths]
         for mode in modes:
             db_name = f"meta_v2_{mode}.db"
             cache = DBConnectionPool.get_connection(db_name)
             
             try:
-                with cache.conn:
-                    cursor = cache.conn.cursor()
-                    cursor.executemany(
-                        "DELETE FROM vectors WHERE file_path = ?", 
-                        [(str(Path(p).resolve()),) for p in file_paths]
-                    )
-            except Exception:
-                pass
+                cache.delete_paths(norm_paths)
+            except Exception as e:
+                auditor.warning(f"Failed to invalidate cache for paths: {e}")
 
     @staticmethod
     def delete_files(file_paths: list, scan_mode: str = None) -> dict:
@@ -132,14 +148,11 @@ class BatchOperations:
                 db_name = f"meta_v2_{mode}.db"
                 cache = DBConnectionPool.get_connection(db_name)
                 try:
-                    with cache.conn:
-                        cursor = cache.conn.cursor()
-                        cursor.executemany(
-                            "UPDATE vectors SET file_path = ? WHERE file_path = ?",
-                            [(str(Path(dst).resolve()), str(Path(src).resolve())) for src, dst in results["success"]]
-                        )
-                except Exception:
-                    pass
+                    cache.move_paths(
+                        [(str(Path(src).resolve()), str(Path(dst).resolve())) for src, dst in results["success"]]
+                    )
+                except Exception as e:
+                    auditor.warning(f"Failed to move cache paths: {e}")
 
         BatchOperations._commit_transaction()
         return results

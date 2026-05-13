@@ -16,6 +16,9 @@ cache/
 # Build Artifacts
 build/
 dist/
+.pyinstaller_cache/
+*.log
+logs/
 *.spec
 
 # OS Generated

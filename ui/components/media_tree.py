@@ -126,7 +126,8 @@ class LazyClusterModel(QAbstractItemModel):
         self.beginResetModel()
         self.rootItem.childItems.clear()
         
-        for cluster_idx, cluster in enumerate(clusters, 1):
+        valid_cluster_idx = 1
+        for cluster in clusters:
             total_size = sum(it.get('size', 0) for it in cluster)
             sz_str = f"{total_size/(1024*1024):.1f} MB"
             formats = set(Path(it['path']).suffix.upper().replace('.', '') for it in cluster)
@@ -136,13 +137,19 @@ class LazyClusterModel(QAbstractItemModel):
             avg_sim = sum(sims) / len(sims) if sims else 1.0
             avg_sim_str = f"~{avg_sim*100:.1f}%"
             
-            parent_name = f"{translator.tr('cluster_prefix')} #{cluster_idx} ({len(cluster)} {translator.tr('cluster_files')})"
+            parent_name = f"{translator.tr('cluster_prefix')} #{valid_cluster_idx} ({len(cluster)} {translator.tr('cluster_files')})"
             
             parent_data = [parent_name, fmt_str, avg_sim_str, sz_str, "", ""]
-            parent_item = TreeItem(parent_data, parent=self.rootItem, is_cluster=True, raw_dict={'cluster_id': cluster_idx})
+            parent_item = TreeItem(parent_data, parent=self.rootItem, is_cluster=True, raw_dict={'cluster_id': valid_cluster_idx})
             
+            ref_path = os.path.normpath(os.path.abspath(self.target_dir_a)) if self.target_dir_a else None
             for it in cluster:
                 p = it['path']
+                try:
+                    item_path = os.path.normpath(os.path.abspath(p))
+                except Exception:
+                    item_path = p
+
                 ext = Path(p).suffix.upper()
                 sim_str = f"{it.get('similarity', 1.0)*100:.1f}%" if 'similarity' in it else "Base"
                 i_sz_str = f"{it.get('size', 0)/(1024*1024):.1f} MB"
@@ -150,10 +157,16 @@ class LazyClusterModel(QAbstractItemModel):
                 dur = f"{int(it.get('duration', 0))//60:02d}:{int(it.get('duration', 0))%60:02d}" if it.get('duration') else ""
                 
                 is_ref = False
-                if self.target_dir_a and os.path.abspath(p).startswith(os.path.abspath(self.target_dir_a)): 
-                    is_ref = True
-
-                display_name = f"{translator.tr('ref_prefix')} {Path(p).name}" if is_ref else Path(p).name
+                if ref_path:
+                    try:
+                        if os.path.commonpath([ref_path, item_path]) == ref_path:
+                            is_ref = True
+                    except Exception:
+                        is_ref = False
+                    display_name = f"[REF] {Path(p).name}" if is_ref else f"[INBOX] {Path(p).name}"
+                else:
+                    display_name = Path(p).name
+                
                 it['is_ref'] = is_ref
                 
                 child_data = [display_name, ext, sim_str, i_sz_str, res, dur]
@@ -161,6 +174,7 @@ class LazyClusterModel(QAbstractItemModel):
                 parent_item.appendChild(child_item)
                 
             self.rootItem.appendChild(parent_item)
+            valid_cluster_idx += 1
             
         self.endResetModel()
 
@@ -180,7 +194,7 @@ class LazyClusterModel(QAbstractItemModel):
             
         elif role == Qt.UserRole:
             return item.raw_dict
-            
+
         elif role == Qt.CheckStateRole and index.column() == 0:
             if item.is_cluster or not item.raw_dict.get('is_ref', False):
                 return item.check_state
@@ -192,6 +206,8 @@ class LazyClusterModel(QAbstractItemModel):
             return None
             
         elif role == Qt.ForegroundRole:
+            # В светлой теме синий текст эталона может быть плохо виден, 
+            # но мы оставляем его для акцента, если он не мешает.
             if not item.is_cluster and item.raw_dict.get('is_ref', False):
                 return QColor("#5865F2")
             return None

@@ -46,16 +46,12 @@ class ApplicationBootstrap:
         
         app = QApplication.instance()
         if app and not app.closingDown():
-            QMetaObject.invokeMethod(
-                app, 
-                lambda: ApplicationBootstrap._render_critical_ui(exc_value, error_msg), 
-                Qt.ConnectionType.QueuedConnection
-            )
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, lambda: ApplicationBootstrap._render_critical_ui(exc_value, error_msg))
 
     @classmethod
     def execute(cls):
         os.environ["QT_API"] = "pyside6"
-        multiprocessing.freeze_support()
         sys.excepthook = cls.global_exception_handler
         
         auditor.info("TensorMedia Application Bootstrapping Started.")
@@ -79,7 +75,10 @@ class ApplicationBootstrap:
             window = MainWindow()
             controller = MainController(window) 
             
-            window.window_closed.connect(cls.orchestrator.stop_all)
+            # Guarantee teardown is invoked on ANY app shutdown path
+            if cls.orchestrator:
+                window.window_closed.connect(cls.orchestrator.stop_all)
+                app.aboutToQuit.connect(cls.orchestrator.stop_all)
             
             auditor.info("UI and NPU Orchestrator initialized successfully.")
             window.show()
@@ -89,4 +88,6 @@ class ApplicationBootstrap:
             sys.exit(1)
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     ApplicationBootstrap.execute()

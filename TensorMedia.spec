@@ -1,35 +1,64 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
+import sys
 import os
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
 
-pyside_binaries = collect_dynamic_libs('PySide6')
-pyside_hidden = collect_submodules('PySide6')
-facenet_datas = collect_data_files('facenet_pytorch')
+# Определяем базовый путь
+base_path = os.path.abspath('.')
 
-project_datas = [
-    ('models/siglip-base-patch16-224', 'models/siglip-base-patch16-224'),
-    ('models/torch', 'models/torch')
-] + facenet_datas
+# Собираем данные
+datas = [
+    ('assets', 'assets'),
+    ('models', 'models'),
+]
 
-EXCLUDES = [
-    'matplotlib', 'scipy', 'tensorboard', 'tkinter', 'PyQt5', 'PyQt6', 'wx', 
-    'jupyter', 'notebook', 'IPython', 'pandas.tests', 'numpy.random._examples'
+# Добавляем специфичные для библиотек данные
+datas += collect_data_files('torch')
+datas += collect_data_files('transformers')
+datas += collect_data_files('facenet_pytorch')
+
+# Скрытые импорты
+hiddenimports = [
+    'PySide6.QtCore',
+    'PySide6.QtGui',
+    'PySide6.QtWidgets',
+    'PySide6.QtMultimedia',
+    'PySide6.QtMultimediaWidgets',
+    'torch',
+    'numpy',
+    'cv2',
+    'PIL.Image',
+    'fitz', # PyMuPDF
+    'pymupdf',
+    'blake3',
+    'send2trash',
+    'psutil',
+    'transformers.models.siglip',
+    'facenet_pytorch',
+]
+
+# Исключаем ненужные модули для уменьшения размера
+excludes = [
+    'tkinter',
+    'unittest',
+    'pytest',
+    'matplotlib',
+    'notebook',
+    'jupyter',
 ]
 
 a = Analysis(
     ['main.py'],
-    pathex=[],
-    binaries=pyside_binaries,
-    datas=project_datas,
-    hiddenimports=[
-        'torchvision', 'faiss', 'safetensors', 'shiboken6'
-    ] + pyside_hidden,
+    pathex=[base_path],
+    binaries=[],
+    datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=EXCLUDES,
+    excludes=excludes,
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -47,14 +76,14 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,    
-    console=False,
+    upx=True,
+    console=False, # Скрываем консоль для GUI приложения
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
-    entitlements_file=None,
-    icon=None
+    entitlements_file='entitlements.plist' if sys.platform == 'darwin' else None,
+    icon='assets/icons/app.ico' if os.path.exists('assets/icons/app.ico') else None,
 )
 
 coll = COLLECT(
@@ -65,12 +94,19 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='TensorMedia' 
+    name='TensorMedia',
 )
 
-app = BUNDLE(
-    coll,
-    name='TensorMedia.app',
-    icon=None,
-    bundle_identifier='com.tensormedia.app',
-)
+if sys.platform == 'darwin':
+    app = BUNDLE(
+        coll,
+        name='TensorMedia.app',
+        icon='assets/icons/app.icns' if os.path.exists('assets/icons/app.icns') else None,
+        bundle_identifier='com.tensormedia.arbitrage',
+        info_plist={
+            'NSHighResolutionCapable': 'True',
+            'LSBackgroundOnly': 'False',
+            'NSRequiresAquaSystemAppearance': 'False',
+            'CFBundleShortVersionString': '1.0.0',
+        },
+    )

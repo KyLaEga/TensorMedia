@@ -15,9 +15,10 @@ from PySide6.QtGui import QStandardItemModel
 
 from utils.theme_manager import ThemeManager
 from utils.i18n import translator
-from utils.env_config import get_app_data_dir, get_cache_dir
+from utils.env_config import get_data_dir
 from utils.logger import auditor
 from core.db.vector_cache import VectorCache
+from core.ml.faiss_manager import FaissManager
 
 from ui.components.video_player import BuiltInVideoPlayer, JumpSlider
 from ui.components.media_tree import MediaTreeView, LazyClusterModel
@@ -98,12 +99,16 @@ class ArbitrageSortFilterProxyModel(QSortFilterProxyModel):
                 return int(left_data.get('size', 0)) < int(right_data.get('size', 0))
             elif col == 4: 
                 def get_area(r):
-                    try: w, h = map(int, str(r).split('x')); return w * h
-                    except: return 0
+                    try: 
+                        w, h = map(int, str(r).split('x'))
+                        return w * h
+                    except (ValueError, TypeError): 
+                        return 0
                 return get_area(left_data.get('res', '')) < get_area(right_data.get('res', ''))
             elif col == 5: 
                 return float(left_data.get('mtime', 0.0)) < float(right_data.get('mtime', 0.0))
         except Exception:
+            # осознанное глушение: если сортировка не удалась, оставляем порядок по умолчанию
             pass
 
         return super().lessThan(left, right)
@@ -132,6 +137,20 @@ class MainWindow(QMainWindow):
             event.accept()
         else:
             event.ignore()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'tree'):
+            self.tree._trigger_stretch()
+        
+        # Установка динамического марджина и отступов 1% от ширины окна
+        margin = max(4, int(self.width() * 0.01))
+        if hasattr(self, 'single_prev_layout'):
+            self.single_prev_layout.setContentsMargins(margin, margin, margin, margin)
+            self.single_prev_layout.setSpacing(margin)
+        if hasattr(self, 'multi_grid'):
+            self.multi_grid.setContentsMargins(margin, margin, margin, margin)
+            self.multi_grid.setSpacing(margin)
 
     def dropEvent(self, event):
         urls = event.mimeData().urls()
@@ -678,10 +697,10 @@ class MainWindow(QMainWindow):
         self.preview_stack = QStackedWidget()
         
         single_prev_card = QWidget()
-        single_prev_prev = QVBoxLayout(single_prev_card)
-        single_prev_prev.setContentsMargins(5, 5, 5, 5)
+        self.single_prev_layout = QVBoxLayout(single_prev_card)
+        # Динамический марджин будет установлен в resizeEvent
         self.single_preview_label = ScalableImageLabel()
-        single_prev_prev.addWidget(self.single_preview_label)
+        self.single_prev_layout.addWidget(self.single_preview_label)
         self.preview_stack.addWidget(single_prev_card)
         
         self.video_player = BuiltInVideoPlayer()
@@ -699,8 +718,8 @@ class MainWindow(QMainWindow):
         
         self.multi_grid_container = QWidget()
         self.multi_grid = QGridLayout(self.multi_grid_container)
-        self.multi_grid.setContentsMargins(0, 0, 0, 0)
-        self.multi_grid.setSpacing(8)
+        self.multi_grid.setContentsMargins(0, 1, 0, 1)
+        self.multi_grid.setSpacing(1)
         
         scroll_multi.setWidget(self.multi_grid_container)
         multi_layout.addWidget(scroll_multi, stretch=1)
@@ -910,12 +929,10 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText(translator.tr("status_npu_ready"))
 
     def _purge_faiss(self):
-        path = get_app_data_dir() / "faiss_cache"
-        if path.exists():
-            shutil.rmtree(path, ignore_errors=True)
-            msg = "Матрицы FAISS успешно очищены" if translator.current_lang == "ru" else "FAISS matrices successfully cleared"
-            self.lbl_status.setText(msg)
-            auditor.info("UI: FAISS cache manually purged")
+        FaissManager.purge_disk_cache()
+        msg = "Матрицы FAISS успешно очищены" if translator.current_lang == "ru" else "FAISS matrices successfully cleared"
+        self.lbl_status.setText(msg)
+        auditor.info("UI: FAISS cache manually purged")
 
     def _purge_all_data(self):
         lang = getattr(translator, 'current_lang', 'en')
@@ -932,7 +949,7 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.StandardButton.Yes:
             self._purge_faiss() 
             try:
-                cache_dir = get_cache_dir()
+                cache_dir = get_data_dir()
                 for mode in ["visual", "faces"]:
                     base_name = f"meta_v2_{mode}.db"
                     for ext in ["", "-wal", "-shm"]:

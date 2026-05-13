@@ -1,9 +1,10 @@
 import time
 import psutil
+import multiprocessing
 from PySide6.QtCore import QObject, QTimer
 from core.events import bus
 from core.ml.cluster_engine import SmartClusterEngine
-from ui.workers import ScannerBridge, ClusterWorker, EngineWarmupWorker
+from ui.workers import ScannerBridge, ClusterWorker, EngineWarmupWorker, MaintenanceWorker
 from utils.logger import auditor
 
 class MLOrchestrator(QObject):
@@ -14,6 +15,7 @@ class MLOrchestrator(QObject):
         self.scanner = None
         self.cluster_worker = None
         self.warmup_worker = None
+        self.maintenance_worker = None
         self.t_start = 0.0
 
         self.idle_timer = QTimer(self)
@@ -21,6 +23,7 @@ class MLOrchestrator(QObject):
         self.idle_timer.setSingleShot(True)
         self.idle_timer.timeout.connect(self._on_idle_timeout)
 
+        self._stop_all_called = False
         self._bind_bus()
 
     def _bind_bus(self):
@@ -63,13 +66,20 @@ class MLOrchestrator(QObject):
         self._reset_idle_timer()
         auditor.info("NPU Engine Warmup complete. Bus event emitted.")
         bus.evt_engine_ready.emit(engine)
+        
+        # Запуск фонового обслуживания БД после прогрева движка
+        self.maintenance_worker = MaintenanceWorker()
+        self.maintenance_worker.start()
 
     def _on_engine_error(self, err_msg):
         auditor.error(f"Warmup failed: {err_msg}")
         bus.evt_engine_ready.emit(None)
 
     def _handle_scan(self, dirs, exts, mode):
-        self._reset_idle_timer()
+        # Строгая блокировка выгрузки модели во время I/O
+        if self.idle_timer.isActive():
+            self.idle_timer.stop()
+            
         self.t_start = time.time()
         
         if self.engine is None or (self.scanner and self.scanner.isRunning()):
@@ -91,29 +101,40 @@ class MLOrchestrator(QObject):
         self.scanner.start()
 
     def _handle_scan_error(self, err_msg):
+        self._reset_idle_timer()
         auditor.error(f"Scan Matrix pipeline crashed: {err_msg}")
         bus.evt_scan_error.emit(err_msg)
 
     def _handle_pause(self):
-        self._reset_idle_timer()
         if self.engine:
             self.engine.is_paused = not self.engine.is_paused
             auditor.info(f"Engine execution paused: {self.engine.is_paused}")
 
     def _handle_stop(self):
         self._reset_idle_timer()
+        if self.scanner and self.scanner.isRunning():
+            auditor.warning("Stopping active scanner thread...")
+            self.scanner.stop()
+            self.scanner.wait(2000) # Даем 2 секунды на мягкую остановку
+            if self.scanner.isRunning():
+                self.scanner.terminate() # Принудительно убиваем, если завис
+                self.scanner.wait()
+        
         if self.engine:
-            self.engine.is_stopped = True
+            self.engine.request_scan_abort()
             auditor.warning("Engine execution explicitly stopped by user.")
 
     def _handle_recluster(self, threshold):
-        self._reset_idle_timer()
+        if self.idle_timer.isActive():
+            self.idle_timer.stop()
+            
         self.t_start = time.time()
         
         if self.cluster_worker and self.cluster_worker.isRunning(): 
             return
         if not self.engine or not getattr(self.engine, 'current_file_data', []): 
             bus.evt_clustering_completed.emit([])
+            self._reset_idle_timer()
             return
             
         auditor.info(f"Initiating FAISS Re-clustering at threshold: {threshold}")
@@ -128,9 +149,67 @@ class MLOrchestrator(QObject):
         self.cluster_worker.start()
 
     def stop_all(self):
+        if self._stop_all_called:
+            return
+        self._stop_all_called = True
         auditor.info("Tearing down ML Orchestrator and terminating active threads...")
         self.idle_timer.stop()
-        if self.engine: self.engine.is_stopped = True
-        if self.scanner and self.scanner.isRunning(): self.scanner.wait()
-        if self.cluster_worker and self.cluster_worker.isRunning(): self.cluster_worker.wait()
-        if self.warmup_worker and self.warmup_worker.isRunning(): self.warmup_worker.wait()
+        if self.scanner and hasattr(self.scanner, "stop"):
+            try:
+                self.scanner.stop()
+            except Exception as e:
+                auditor.warning(f"ScannerBridge.stop failed: {e}")
+        if self.engine:
+            self.engine.request_scan_abort()
+
+        def _stop_qthread(t, name: str, timeout_ms: int = 5000):
+            if not t:
+                return
+            try:
+                if hasattr(t, "requestInterruption"):
+                    t.requestInterruption()
+                if hasattr(t, "quit"):
+                    t.quit()
+                if hasattr(t, "isRunning") and t.isRunning():
+                    if not t.wait(timeout_ms):
+                        auditor.warning(f"{name} did not stop in {timeout_ms}ms. Forcing terminate().")
+                        try:
+                            t.terminate()
+                        except Exception as e:
+                            auditor.error(f"Failed to terminate {name}: {e}")
+                        t.wait(2000)
+            except Exception as e:
+                auditor.error(f"Failed stopping {name}: {e}")
+
+        # Stop QThreads first (they may own/process child pools)
+        _stop_qthread(self.scanner, "ScannerBridge", timeout_ms=8000)
+        _stop_qthread(self.cluster_worker, "ClusterWorker", timeout_ms=5000)
+        _stop_qthread(self.warmup_worker, "EngineWarmupWorker", timeout_ms=5000)
+        _stop_qthread(self.maintenance_worker, "MaintenanceWorker", timeout_ms=5000)
+
+        # Hard kill any leftover multiprocessing workers (FFmpeg/OpenCV decode lives there)
+        try:
+            children = multiprocessing.active_children()
+            if children:
+                auditor.warning(f"Terminating {len(children)} active child process(es).")
+            for p in children:
+                try:
+                    p.terminate()
+                except Exception:
+                    # осознанное глушение: процесс уже мог быть завершен
+                    pass
+            for p in children:
+                try:
+                    p.join(timeout=2.0)
+                except Exception:
+                    pass
+            # If still alive, escalate
+            for p in children:
+                try:
+                    if p.is_alive() and hasattr(p, "kill"):
+                        auditor.warning(f"Escalating kill for pid={getattr(p, 'pid', None)}")
+                        p.kill()
+                except Exception:
+                    pass
+        except Exception as e:
+            auditor.error(f"Failed to terminate child processes: {e}")

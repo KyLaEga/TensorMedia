@@ -17,11 +17,21 @@ def calculate_smart_score(item_data):
         try:
             w, h = map(int, res.split('x'))
             score += (w * h) / 1000000.0 * 50 
-        except Exception:
+        except Exception as e:
+            from utils.logger import auditor
+            auditor.warning(f"Failed to parse resolution '{res}': {e}")
             pass
             
     # 3. Вес длительности для видеофайлов
     score += item_data.get('duration', 0.0) * 10
+
+    # 4. Вес резкости изображения (sharpness)
+    sharpness = item_data.get('sharpness', 0.0)
+    if sharpness > 0:
+        # Резкость может варьироваться от 0 до нескольких тысяч в зависимости от контента
+        # Логарифмируем, чтобы избежать экстремальных перекосов
+        import math
+        score += math.log1p(sharpness) * 20.0
     
     return score
 

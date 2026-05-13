@@ -3,6 +3,8 @@ import sys
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 
+from utils.env_config import get_logs_dir
+
 class SystemAuditor:
     """Singleton-диспетчер системного аудита и телеметрии."""
     _instance = None
@@ -14,8 +16,7 @@ class SystemAuditor:
         return cls._instance
 
     def _init_logger(self):
-        self.log_dir = Path("logs")
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir = get_logs_dir()
         self.log_file = self.log_dir / "tensor_media.log"
 
         self.logger = logging.getLogger("TensorMedia")
@@ -41,14 +42,6 @@ class SystemAuditor:
 
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
-
-        sys.excepthook = self._handle_unhandled_exception
-
-    def _handle_unhandled_exception(self, exc_type, exc_value, exc_traceback):
-        if issubclass(exc_type, KeyboardInterrupt):
-            sys.__excepthook__(exc_type, exc_value, exc_traceback)
-            return
-        self.logger.critical("FATAL RUNTIME EXCEPTION:", exc_info=(exc_type, exc_value, exc_traceback))
 
     def get_logger(self):
         return self.logger

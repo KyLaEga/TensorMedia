@@ -5,12 +5,12 @@ import queue
 import time
 from pathlib import Path
 
-from utils.env_config import get_cache_dir
+from utils.env_config import get_data_dir
 from utils.logger import auditor
 
 class VectorCache:
     def __init__(self, db_name="vectors.db"):
-        self.db_path = get_cache_dir() / db_name
+        self.db_path = get_data_dir() / db_name
         self.db_lock = threading.RLock()
         
         self._init_db()
@@ -19,7 +19,7 @@ class VectorCache:
         self.shutdown_event = threading.Event()
         self.is_running = True
         
-        self.worker_thread = threading.Thread(target=self._writer_worker, daemon=False)
+        self.worker_thread = threading.Thread(target=self._writer_worker, daemon=True)
         self.worker_thread.start()
 
     def _init_db(self):
@@ -76,7 +76,8 @@ class VectorCache:
                             batch.clear()
                         # Финальное слияние и транкация WAL-журнала перед выходом
                         try: conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                        except sqlite3.Error: pass
+                        except sqlite3.Error as e:
+                            auditor.warning(f"Failed to truncate WAL on exit: {e}")
                         break
                         
                     if item == "PURGE_SIGNAL":
@@ -112,14 +113,16 @@ class VectorCache:
             if batch:
                 self._execute_batch(conn, batch)
                 try: conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                except sqlite3.Error: pass
+                except sqlite3.Error as e:
+                    auditor.warning(f"Failed to truncate WAL after batch: {e}")
                 
         except Exception as global_e:
              auditor.error(f"VectorCache fatal worker error: {global_e}")
         finally:
             if conn:
                 try: conn.close()
-                except Exception: pass
+                except Exception as e:
+                    auditor.warning(f"Failed to close SQLite connection: {e}")
 
     def _execute_batch(self, conn, batch):
         if not batch: return
@@ -197,7 +200,7 @@ class VectorCache:
                     for i in range(0, len(paths), chunk_size):
                         chunk = paths[i:i+chunk_size]
                         placeholders = ','.join(['?'] * len(chunk))
-                        cursor.execute(f"SELECT path, size, mtime, phash, resolution, duration, codec, sharpness, fps FROM metadata WHERE path IN ({placeholders})", chunk)
+                        cursor.execute(f"SELECT path, size, mtime, phash, resolution, duration, codec, sharpness, fps FROM metadata WHERE path IN ({placeholders})", chunk) # nosec B608
                         for row in cursor.fetchall():
                             meta[row[0]] = {
                                 "size": row[1], "mtime": row[2], "phash": row[3],
@@ -218,12 +221,90 @@ class VectorCache:
                     row = cursor.fetchone()
                     if row and row[0]:
                         return np.frombuffer(row[0], dtype=np.float32)
-            except Exception: pass
+            except Exception as e:
+                auditor.error(f"Critical failure in get_vector for {path}: {e}", exc_info=True)
         return None
 
     def sync(self):
         while not self.write_queue.empty():
             time.sleep(0.01)
+
+    def delete_paths(self, paths: list[str]):
+        self.sync()
+        if not paths:
+            return
+        with self.db_lock:
+            try:
+                with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+                    cursor = conn.cursor()
+                    cursor.executemany(
+                        "DELETE FROM metadata WHERE path = ?",
+                        [(p,) for p in paths],
+                    )
+                    conn.commit()
+            except Exception as e:
+                auditor.error(f"Failed to delete cache entries: {e}")
+
+    def move_paths(self, src_dst_pairs: list[tuple[str, str]]):
+        """
+        Update cached metadata to track moved files.
+        Keeps vectors/faces intact by rewriting the primary key `path`.
+        """
+        self.sync()
+        if not src_dst_pairs:
+            return
+        with self.db_lock:
+            try:
+                with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+                    cursor = conn.cursor()
+                    cursor.executemany(
+                        "UPDATE metadata SET path = ? WHERE path = ?",
+                        [(dst, src) for (src, dst) in src_dst_pairs],
+                    )
+                    conn.commit()
+            except Exception as e:
+                auditor.error(f"Failed to move cache entries: {e}")
+
+    def run_maintenance(self):
+        """
+        Выполняет очистку базы данных от записей, файлы которых больше не существуют на диске,
+        и дефрагментирует файл БД (VACUUM).
+        """
+        if not self.is_running: return
+        
+        auditor.info("Starting database maintenance (GC & Vacuum)...")
+        start_time = time.time()
+        
+        orphans = []
+        with self.db_lock:
+            try:
+                with sqlite3.connect(str(self.db_path), timeout=60.0) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT path FROM metadata")
+                    all_paths = [row[0] for row in cursor.fetchall()]
+                    
+                    # Проверка существования файлов (I/O операция)
+                    import os
+                    for p in all_paths:
+                        if not os.path.exists(p):
+                            orphans.append((p,))
+                    
+                    if orphans:
+                        auditor.info(f"Maintenance: Found {len(orphans)} orphaned records. Deleting...")
+                        cursor.executemany("DELETE FROM metadata WHERE path = ?", orphans)
+                        conn.commit()
+                    
+                    # Дефрагментация
+                    auditor.info("Maintenance: Running VACUUM...")
+                    conn.execute("VACUUM")
+                    conn.commit()
+                    
+            except Exception as e:
+                auditor.error(f"Database maintenance failed: {e}")
+                return
+
+        duration = time.time() - start_time
+        auditor.info(f"Database maintenance completed in {duration:.2f}s. Removed {len(orphans)} orphans.")
 
     def close(self):
         self.is_running = False

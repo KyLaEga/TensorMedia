@@ -7,28 +7,50 @@ import zipfile
 import numpy as np
 import torch
 import cv2
-import faiss
-import hashlib
 import blake3
 import psutil
 from PIL import Image
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import shared_memory
+from multiprocessing import Pool, Value, shared_memory
 
 cv2.setNumThreads(0)
 
 from transformers import AutoProcessor, SiglipVisionModel
-from utils.env_config import get_app_data_dir, get_models_dir
+from utils.env_config import get_models_dir
 from utils.logger import auditor
 from core.profiler import HardwareProfiler
-from core.db.vector_cache import VectorCache
+from utils.batch_operations import DBConnectionPool
+from core.ml.faiss_manager import FaissManager
 
 os.environ["LOKY_MAX_CPU_COUNT"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE" 
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# Set by Pool initializer in extract_features; workers check before heavy decode.
+_worker_cancel_flag = None
+
+def _scan_pool_init(cancel_flag):
+    global _worker_cancel_flag
+    _worker_cancel_flag = cancel_flag
+
+def _scan_io_cancelled() -> bool:
+    global _worker_cancel_flag
+    if _worker_cancel_flag is None:
+        return False
+    try:
+        return bool(_worker_cancel_flag.value)
+    except Exception:
+        # осознанное глушение: если флаг недоступен, считаем что не отменено
+        return False
+
+def _cancelled_io_result(file_path: Path, size, mtime, file_hash, vector) -> dict:
+    return {
+        "path": str(file_path), "size": size, "mtime": mtime, "phash": file_hash,
+        "vector": vector, "shm_blocks": [], "res": "",
+        "dur": 0.0, "codec": "", "sharpness": 0.0, "fps": 0.0,
+    }
 
 def calculate_optical_sharpness(frame: np.ndarray) -> float:
     try:
@@ -53,6 +75,8 @@ def calculate_optical_sharpness(frame: np.ndarray) -> float:
 
 def process_single_file_io(task_data: tuple) -> dict:
     file_path, size, mtime, file_hash, vector, scan_mode = task_data
+    if _scan_io_cancelled():
+        return _cancelled_io_result(file_path, size, mtime, file_hash, vector)
     res, dur, codec, sharpness, fps_val = "", 0.0, "", 0.0, 0.0
     shm_blocks = [] 
     ext = file_path.suffix.lower()
@@ -62,7 +86,11 @@ def process_single_file_io(task_data: tuple) -> dict:
     def _allocate_shm(img_obj):
         arr = np.array(img_obj)
         try:
-            shm = shared_memory.SharedMemory(create=True, size=arr.nbytes)
+            import uuid
+            # macOS has a 31-character limit for shared memory names.
+            # "tm_shm_" (7) + 20 chars of UUID = 27 chars (safe).
+            shm_name = f"tm_shm_{uuid.uuid4().hex[:20]}"
+            shm = shared_memory.SharedMemory(name=shm_name, create=True, size=arr.nbytes)
             shm_arr = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf)
             np.copyto(shm_arr, arr)
             shm_blocks.append({
@@ -72,7 +100,8 @@ def process_single_file_io(task_data: tuple) -> dict:
                 "is_shm": True
             })
             shm.close()
-        except OSError:
+        except OSError as e:
+            auditor.warning(f"Failed to allocate shared memory for image: {e}")
             shm_blocks.append({
                 "shape": arr.shape,
                 "dtype": str(arr.dtype),
@@ -82,10 +111,13 @@ def process_single_file_io(task_data: tuple) -> dict:
 
     try:
         if ext in {'.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v'}:
+            if _scan_io_cancelled():
+                return _cancelled_io_result(file_path, size, mtime, file_hash, vector)
             try:
                 cap = cv2.VideoCapture(str(file_path), cv2.CAP_AVFOUNDATION, [cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY])
                 if not cap.isOpened(): cap = cv2.VideoCapture(str(file_path)) 
-            except Exception:
+            except Exception as e:
+                auditor.warning(f"Failed to open video {file_path} with AVFOUNDATION: {e}")
                 cap = cv2.VideoCapture(str(file_path))
 
             try:
@@ -100,6 +132,8 @@ def process_single_file_io(task_data: tuple) -> dict:
                     check_points = [0.20, 0.40, 0.60, 0.80]
                     max_sharp = 0.0
                     for cp in check_points:
+                        if _scan_io_cancelled():
+                            break
                         target = int(total_frames * cp) if total_frames > 0 else 0
                         cap.set(cv2.CAP_PROP_POS_FRAMES, target)
                         ret, frame = cap.read()
@@ -125,6 +159,8 @@ def process_single_file_io(task_data: tuple) -> dict:
                 cap.release()
                 
         elif ext in {'.jpg', '.png', '.webp', '.bmp', '.heic', '.jpeg'}:
+            if _scan_io_cancelled():
+                return _cancelled_io_result(file_path, size, mtime, file_hash, vector)
             with Image.open(file_path) as img: 
                 res = f"{img.width}x{img.height}"
                 if vector is None: 
@@ -133,6 +169,8 @@ def process_single_file_io(task_data: tuple) -> dict:
                 sharpness = calculate_optical_sharpness(np.array(img.convert('L')))
         
         elif ext == '.gif':
+            if _scan_io_cancelled():
+                return _cancelled_io_result(file_path, size, mtime, file_hash, vector)
             try:
                 with Image.open(file_path) as img:
                     tot_frames = getattr(img, "n_frames", 1)
@@ -140,6 +178,8 @@ def process_single_file_io(task_data: tuple) -> dict:
                         check_points = [0.20, 0.40, 0.60, 0.80] if tot_frames > 3 else [0.0]
                         max_sharp = 0.0
                         for cp in check_points:
+                            if _scan_io_cancelled():
+                                break
                             target_frame = min(max(0, int(tot_frames * cp)), tot_frames - 1)
                             img.seek(target_frame)
                             frame_pil = img.convert("RGB")
@@ -161,6 +201,8 @@ def process_single_file_io(task_data: tuple) -> dict:
                 auditor.warning(f"Worker GIF error {file_path}: {e}")
         
         elif ext == '.cbz':
+            if _scan_io_cancelled():
+                return _cancelled_io_result(file_path, size, mtime, file_hash, vector)
             with zipfile.ZipFile(file_path, 'r') as z:
                 names = sorted([n for n in z.namelist() if n.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))])
                 if names:
@@ -173,6 +215,8 @@ def process_single_file_io(task_data: tuple) -> dict:
                     best_img_for_model = None
                     
                     for cp in check_points:
+                        if _scan_io_cancelled():
+                            break
                         idx = int(total_pages * cp) if total_pages > 0 else 0
                         with z.open(names[idx]) as f:
                             with Image.open(f) as img:
@@ -190,15 +234,22 @@ def process_single_file_io(task_data: tuple) -> dict:
                     sharpness = float(max_sharp)
 
         elif ext == '.pdf':
+            if _scan_io_cancelled():
+                return _cancelled_io_result(file_path, size, mtime, file_hash, vector)
             try:
                 import fitz 
                 with fitz.open(str(file_path)) as doc:
-                    total_pages = min(len(doc), 50)
+                    total_pages = len(doc)
+                    if total_pages == 0:
+                        return _cancelled_io_result(file_path, size, mtime, file_hash, vector)
+                    
                     check_points = [0.0, 0.30, 0.60] if total_pages > 3 else [0.0]
                     max_sharp = -1.0
                     best_img_for_model = None
                     
                     for cp in check_points:
+                        if _scan_io_cancelled():
+                            break
                         page_num = int(total_pages * cp)
                         if page_num >= total_pages: page_num = total_pages - 1
                         page = doc.load_page(page_num)
@@ -211,11 +262,18 @@ def process_single_file_io(task_data: tuple) -> dict:
                             if sharp > max_sharp: 
                                 max_sharp = sharp
                                 best_img_for_model = img.resize(target_size, Image.Resampling.BICUBIC)
+                    
                     if best_img_for_model and vector is None:
                         _allocate_shm(best_img_for_model)
                     sharpness = float(max_sharp)
             except Exception as e: 
                 auditor.warning(f"Worker PDF error {file_path}: {e}")
+                # Возвращаем результат без вектора, чтобы файл был в списке
+                return {
+                    "path": str(file_path), "size": size, "mtime": mtime, "phash": file_hash, 
+                    "vector": None, "shm_blocks": [], "res": "", 
+                    "dur": 0.0, "codec": "", "sharpness": 0.0, "fps": 0.0
+                }
 
     except Exception as e:
         auditor.warning(f"Worker I/O Error for {file_path}: {e}")
@@ -238,6 +296,30 @@ class SmartClusterEngine:
         self.current_file_data = []
         self.is_paused = False
         self.is_stopped = False
+        self._io_pool = None
+        self._scan_cancel_flag = None
+        self.faiss_manager = FaissManager(scan_mode="visual")
+
+    def request_scan_abort(self):
+        """Signal workers + terminate I/O Pool (safe from non-scan thread)."""
+        self.is_stopped = True
+        self.is_paused = False
+        cf = getattr(self, "_scan_cancel_flag", None)
+        if cf is not None:
+            try:
+                cf.value = 1
+            except Exception:
+                # осознанное глушение: игнорируем ошибку записи во флаг отмены
+                pass
+        pool = getattr(self, "_io_pool", None)
+        if pool is not None:
+            try:
+                pool.terminate()
+            except Exception:
+                # осознанное глушение: процесс пула уже мог быть завершен
+                pass
+            # Не вызываем pool.join(): при зависшем FFI (OpenCV/FFmpeg) join блокирует выход процесса.
+            self._io_pool = None
 
     def unload_models(self):
         if self.processor is not None: del self.processor
@@ -260,16 +342,17 @@ class SmartClusterEngine:
         self.scan_mode = mode
         self.unload_models()
         self.scan_mode = mode
+        self.faiss_manager.set_scan_mode(mode)
 
         auditor.info(f"Loading weights into {self.device.type} for mode: {mode}")
 
         if mode == "visual":
             siglip_local_path = str(get_models_dir() / "siglip-base-patch16-224")
-            self.processor = AutoProcessor.from_pretrained(siglip_local_path, local_files_only=True)
+            self.processor = AutoProcessor.from_pretrained(siglip_local_path, local_files_only=True) # nosec B615
             target_dtype = torch.float16 if self.device.type in ("cuda", "mps") else torch.float32
             
             try:
-                self.model = SiglipVisionModel.from_pretrained(
+                self.model = SiglipVisionModel.from_pretrained( # nosec B615
                     siglip_local_path, 
                     local_files_only=True,
                     torch_dtype=target_dtype
@@ -277,7 +360,7 @@ class SmartClusterEngine:
             except Exception as e:
                 auditor.error(f"Failed to load to {self.device.type} with {target_dtype}: {e}. Falling back to CPU.")
                 self.device = torch.device("cpu")
-                self.model = SiglipVisionModel.from_pretrained(
+                self.model = SiglipVisionModel.from_pretrained( # nosec B615
                     siglip_local_path, 
                     local_files_only=True,
                     torch_dtype=torch.float32
@@ -287,7 +370,24 @@ class SmartClusterEngine:
         elif mode == "faces":
             os.environ["TORCH_HOME"] = str(get_models_dir() / "torch")
             try:
+                import sys
                 from facenet_pytorch import MTCNN, InceptionResnetV1
+                
+                # В режиме PyInstaller (frozen) facenet_pytorch может искать веса по неправильному пути.
+                # Мы переопределяем путь к данным, если запущены из бандла.
+                if getattr(sys, 'frozen', False):
+                    import facenet_pytorch.models.mtcnn as mtcnn_module
+                    if hasattr(sys, '_MEIPASS'):
+                        base_dir = Path(sys._MEIPASS)
+                    else:
+                        base_dir = Path(sys.executable).parent.parent / "Resources"
+                    
+                    # Патчим путь к весам pnet, rnet, onet
+                    # mtcnn.py делает: os.path.join(os.path.dirname(__file__), '../data/pnet.pt')
+                    # Чтобы путь разрешился, промежуточная папка должна существовать.
+                    # Папка data существует, поэтому используем её вместо models.
+                    mtcnn_module.os.path.dirname = lambda x: str(base_dir / "facenet_pytorch" / "data")
+                
                 self.mtcnn = MTCNN(keep_all=False, device='cpu')
                 self.resnet = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
             except ImportError:
@@ -325,6 +425,7 @@ class SmartClusterEngine:
             
             try:
                 for i, img in enumerate(images):
+                    if self.is_stopped: break
                     try:
                         face = self.mtcnn(img)
                         if face is not None:
@@ -332,7 +433,8 @@ class SmartClusterEngine:
                                 emb = self.resnet(face.unsqueeze(0).to(self.device))
                                 emb_norm = torch.nn.functional.normalize(emb, p=2, dim=-1)
                                 results[i] = emb_norm.cpu().numpy().astype(np.float32)[0]
-                    except Exception: pass
+                    except Exception as e:
+                        auditor.warning(f"Failed to process face extraction for image index {i}: {e}")
             except Exception as e:
                 auditor.error(f"Face vector extraction failed: {e}")
             return results
@@ -343,6 +445,7 @@ class SmartClusterEngine:
                     all_f_norms = []
                     chunk_size = 32 
                     for i in range(0, len(images), chunk_size):
+                        if self.is_stopped: break
                         chunk = images[i:i+chunk_size]
                         if self.processor is None or self.model is None:
                             raise RuntimeError("NPU Engine not initialized")
@@ -370,6 +473,8 @@ class SmartClusterEngine:
                     return run_on_device(self.device)
                 except Exception as e:
                     auditor.error(f"H/W NPU Fail: {e}. Fallback to CPU execution.")
+                    if self.model is None:
+                        raise RuntimeError("Model was forcefully unloaded from memory.")
                     self.device = torch.device("cpu")
                     self.model = self.model.to("cpu")
                     return run_on_device(self.device)
@@ -384,6 +489,10 @@ class SmartClusterEngine:
         self.is_stopped = False
         self.current_file_data = []
         
+        # Сброс флага отмены для новых процессов
+        if self._scan_cancel_flag is not None:
+            self._scan_cancel_flag.value = 0
+        
         if progress_callback: progress_callback(0, 0, "Indexing disk...")
             
         def fast_scandir(directory):
@@ -397,7 +506,8 @@ class SmartClusterEngine:
                         ext = os.path.splitext(entry.name)[1].lower()
                         if allowed_exts and ext not in allowed_exts: continue
                         discovered.append(Path(entry.path))
-            except PermissionError: pass
+            except PermissionError as e:
+                auditor.warning(f"Permission denied while scanning directory {directory}: {e}")
             return discovered
 
         files = []
@@ -406,12 +516,16 @@ class SmartClusterEngine:
             if p_dir.is_dir():
                 files.extend(fast_scandir(d))
                 
+        # В режиме двух папок (dual mode) нам нужно убедиться, что мы не сравниваем файлы внутри одной папки,
+        # но FAISS ищет по всем векторам. Логика фильтрации "эталон vs проверяемая" реализована в faiss_manager.py
+        # и tree_model.py. Здесь мы просто собираем все файлы.
+                
         if not files: return self.current_file_data
         
         if progress_callback: progress_callback(0, 0, f"Found: {len(files)} files...")
         
         db_name = f"meta_v2_{self.scan_mode}.db"
-        cache_db = VectorCache(db_name)
+        cache_db = DBConnectionPool.get_connection(db_name)
         
         file_strs = [str(f) for f in files]
         meta_cache = cache_db.get_metadata_for_paths(file_strs)
@@ -445,12 +559,15 @@ class SmartClusterEngine:
                 
                 file_hash = self._compute_fast_hash(file_path)
                 tasks.append((file_path, size, mtime, file_hash, None, self.scan_mode))
-            except Exception: continue
+            except Exception as e:
+                auditor.warning(f"Failed to prepare file task for {file_path}: {e}")
+                continue
 
         vram_gb = 0
         if self.device.type == "cuda":
             try: vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            except Exception: pass
+            except Exception as e:
+                auditor.warning(f"Failed to get CUDA memory properties: {e}")
 
         chunk_size = 256
         batch_size = 64 if vram_gb >= 8 else 32
@@ -461,87 +578,137 @@ class SmartClusterEngine:
         safe_workers = max(1, int(available_ram_mb // 1500))
         max_workers = min(max(1, os.cpu_count() - 1 if os.cpu_count() else 1), safe_workers)
         
-        # Checkpointing: Инкрементальное сохранение батчей
-        for chunk_start in range(0, len(tasks), chunk_size):
-            if self.is_stopped: break
-            chunk_tasks = tasks[chunk_start : chunk_start + chunk_size]
-            chunk_results = []
-            
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(process_single_file_io, task): task for task in chunk_tasks}
-                for future in as_completed(futures):
-                    while self.is_paused and not self.is_stopped: time.sleep(0.1)
-                    if self.is_stopped: 
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        break
-                    res = future.result()
-                    if res: chunk_results.append(res)
-                    if progress_callback:
-                        progress_callback(bypassed_count + chunk_start + len(chunk_results), len(files), f"{translator.tr('scan_npu')}{Path(res['path']).name}")
-
-            if self.is_stopped: break
-                
-            needs_vector = [r for r in chunk_results if r['vector'] is None and len(r.get('shm_blocks', [])) > 0]
-            
-            for i in range(0, len(needs_vector), batch_size):
-                while self.is_paused and not self.is_stopped: time.sleep(0.1)
+        cancel_flag = Value('i', 0)
+        self._scan_cancel_flag = cancel_flag
+        try:
+            for chunk_start in range(0, len(tasks), chunk_size):
                 if self.is_stopped: break
-                
-                batch = needs_vector[i:i+batch_size]
-                flat_images, counts = [], []
-                for b in batch:
-                    imgs = []
-                    for shm_meta in b['shm_blocks']:
-                        if shm_meta.get("is_shm"):
-                            try:
-                                shm = shared_memory.SharedMemory(name=shm_meta['name'])
-                                arr = np.ndarray(shm_meta['shape'], dtype=shm_meta['dtype'], buffer=shm.buf)
-                                imgs.append(Image.fromarray(arr.copy()))
-                                shm.close()
-                                shm.unlink()
-                            except Exception as e:
-                                auditor.error(f"SHM Read Fault: {e}")
-                                try: shm.unlink() 
-                                except: pass
+                chunk_tasks = tasks[chunk_start : chunk_start + chunk_size]
+                if not chunk_tasks:
+                    continue
+                chunk_results = []
+
+                pool = None
+                try:
+                    pool = Pool(
+                        processes=max_workers,
+                        initializer=_scan_pool_init,
+                        initargs=(cancel_flag,),
+                        maxtasksperchild=16,
+                    )
+                    self._io_pool = pool
+                    for res in pool.imap_unordered(process_single_file_io, chunk_tasks, chunksize=1):
+                        while self.is_paused and not self.is_stopped:
+                            time.sleep(0.1)
+                        if self.is_stopped:
+                            break
+                        if res:
+                            chunk_results.append(res)
+                        if progress_callback and res:
+                            progress_callback(
+                                bypassed_count + chunk_start + len(chunk_results),
+                                len(files),
+                                f"{translator.tr('scan_npu')}{Path(res['path']).name}",
+                            )
+                except Exception as e:
+                    if self.is_stopped:
+                        auditor.debug(f"Scan I/O pool iteration ended: {e}")
+                    else:
+                        auditor.error(f"Scan I/O pool error: {e}")
+                finally:
+                    self._io_pool = None
+                    if pool is not None:
+                        try:
+                            if self.is_stopped:
+                                pool.terminate()
+                                # Без join при отмене — избегаем дедлока на зависших воркерах.
+                            else:
+                                pool.close()
+                                pool.join()
+                        except Exception as ex:
+                            auditor.warning(f"I/O pool shutdown: {ex}")
+
+                if self.is_stopped:
+                    # Критическая очистка зомби-сегментов SHM при прерывании
+                    for r in chunk_results:
+                        for shm_meta in r.get('shm_blocks', []):
+                            if shm_meta.get("is_shm"):
+                                try:
+                                    shared_memory.SharedMemory(name=shm_meta['name']).unlink()
+                                except Exception:
+                                    # осознанное глушение: SHM сегмент уже мог быть удален или недоступен
+                                    pass
+                    break
+
+                needs_vector = [r for r in chunk_results if r['vector'] is None and len(r.get('shm_blocks', [])) > 0]
+
+                for i in range(0, len(needs_vector), batch_size):
+                    while self.is_paused and not self.is_stopped:
+                        time.sleep(0.1)
+                    if self.is_stopped:
+                        break
+
+                    batch = needs_vector[i:i+batch_size]
+                    flat_images, counts = [], []
+                    for b in batch:
+                        imgs = []
+                        for shm_meta in b['shm_blocks']:
+                            if shm_meta.get("is_shm"):
+                                try:
+                                    shm = shared_memory.SharedMemory(name=shm_meta['name'])
+                                    arr = np.ndarray(shm_meta['shape'], dtype=shm_meta['dtype'], buffer=shm.buf)
+                                    imgs.append(Image.fromarray(arr.copy()))
+                                    shm.close()
+                                    shm.unlink()
+                                except Exception as e:
+                                    auditor.error(f"SHM Read Fault: {e}")
+                                    try:
+                                        shm.unlink()
+                                    except Exception:
+                                        # осознанное глушение: не удается удалить SHM после сбоя
+                                        pass
+                            else:
+                                try:
+                                    arr = np.frombuffer(shm_meta['data'], dtype=shm_meta['dtype']).reshape(shm_meta['shape'])
+                                    imgs.append(Image.fromarray(arr.copy()))
+                                except Exception as e:
+                                    auditor.error(f"Critical failure parsing SHM fallback data: {e}", exc_info=True)
+                        flat_images.extend(imgs)
+                        counts.append(len(imgs))
+
+                    flat_vectors = self._compute_vector_batch(flat_images)
+
+                    idx = 0
+                    for b, count in zip(batch, counts):
+                        file_vecs = flat_vectors[idx:idx+count]
+                        idx += count
+                        valid_vecs = [v for v in file_vecs if v is not None]
+                        if valid_vecs:
+                            avg_vec = np.mean(valid_vecs, axis=0)
+                            b['vector'] = avg_vec / np.linalg.norm(avg_vec)
                         else:
-                            try:
-                                arr = np.frombuffer(shm_meta['data'], dtype=shm_meta['dtype']).reshape(shm_meta['shape'])
-                                imgs.append(Image.fromarray(arr.copy()))
-                            except Exception: pass
-                    flat_images.extend(imgs)
-                    counts.append(len(imgs))
-                
-                flat_vectors = self._compute_vector_batch(flat_images)
-                
-                idx = 0
-                for b, count in zip(batch, counts):
-                    file_vecs = flat_vectors[idx:idx+count]
-                    idx += count
-                    valid_vecs = [v for v in file_vecs if v is not None]
-                    if valid_vecs:
-                        avg_vec = np.mean(valid_vecs, axis=0)
-                        b['vector'] = avg_vec / np.linalg.norm(avg_vec)
-                    else: b['vector'] = None
-                
-                del flat_images, flat_vectors, batch
-                
-            for r in chunk_results: 
-                r['shm_blocks'] = []
-            
-            # Сохранение промежуточных результатов конвейера на диск (Защита от потери данных при краше)
-            insert_batch = []
-            for r in chunk_results:
-                if r['vector'] is not None:
-                    insert_batch.append((
-                        str(r['path']), int(r['size']), float(r['mtime']), str(r['phash']), 
-                        str(r['res']), float(r['dur']), str(r['codec']), float(r['sharpness']), 
-                        float(r['fps']), r['vector']
-                    ))
-            if insert_batch: cache_db.save_batch(insert_batch)
-            all_results.extend(chunk_results)
+                            b['vector'] = None
+
+                    del flat_images, flat_vectors, batch
+
+                for r in chunk_results:
+                    r['shm_blocks'] = []
+
+                insert_batch = []
+                for r in chunk_results:
+                    if r['vector'] is not None:
+                        insert_batch.append((
+                            str(r['path']), int(r['size']), float(r['mtime']), str(r['phash']),
+                            str(r['res']), float(r['dur']), str(r['codec']), float(r['sharpness']),
+                            float(r['fps']), r['vector']
+                        ))
+                if insert_batch:
+                    cache_db.save_batch(insert_batch)
+                all_results.extend(chunk_results)
+        finally:
+            self._scan_cancel_flag = None
 
         if self.is_stopped: 
-            cache_db.close()
             return []
             
         if progress_callback: progress_callback(len(files), len(files), translator.tr("scan_faiss"))
@@ -554,94 +721,11 @@ class SmartClusterEngine:
                     "codec": r['codec'], "sharpness": r['sharpness'], "fps": r['fps'], "mtime": r['mtime'] 
                 })
 
-        cache_db.close()
         return self.current_file_data
 
     def build_clusters(self, threshold: float) -> list:
-        clusters = []
-        file_data = self.current_file_data.copy()
-        if not file_data or len(file_data) < 2: return clusters
-
-        state_str = "".join([f"{item['path']}_{item['size']}_{item['mtime']}" for item in file_data])
-        state_signature = hashlib.md5(state_str.encode('utf-8')).hexdigest()
-        
-        cache_dir = get_app_data_dir() / "faiss_cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        dist_file = cache_dir / f"{self.scan_mode}_{state_signature}_dist.npy"
-        keys_file = cache_dir / f"{self.scan_mode}_{state_signature}_keys.npy"
-        
-        k = min(10000, len(file_data))
-        cache_valid = False
-        
-        if dist_file.exists() and keys_file.exists():
-            try:
-                tmp_keys = np.load(keys_file)
-                if tmp_keys.shape[1] >= k:
-                    distances = np.load(dist_file)[:, :k]
-                    keys = tmp_keys[:, :k]
-                    cache_valid = True
-            except Exception: pass
-                
-        if not cache_valid:
-            vectors = np.vstack([item["vector"] for item in file_data]).astype(np.float32)
-            index = faiss.IndexFlatIP(vectors.shape[1])
-            index.add(vectors)
-            distances, keys = index.search(vectors, k)
-            
-            for old_file in cache_dir.glob(f"{self.scan_mode}_*.npy"):
-                try: os.remove(old_file)
-                except Exception: pass
-                
-            np.save(dist_file, distances)
-            np.save(keys_file, keys)
-
-        sim_threshold = 1.0 - threshold
-        seq_exts = {'.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v', '.gif'}
-        doc_exts = {'.cbz', '.pdf'}
-        adj = {i: [] for i in range(len(file_data))}
-        
-        for i in range(len(file_data)):
-            ext_i = Path(file_data[i]["path"]).suffix.lower()
-            is_seq_i = ext_i in seq_exts
-            is_doc_i = ext_i in doc_exts
-            
-            for j in range(k):
-                n_idx = int(keys[i][j])
-                if n_idx == i or n_idx == -1: continue
-                
-                sim = float(distances[i][j])
-                ext_j = Path(file_data[n_idx]["path"]).suffix.lower()
-                
-                if is_seq_i and ext_j in seq_exts: sim = 1.0 - (1.0 - sim) * 1.45
-                if is_doc_i and ext_j in doc_exts:
-                    local_threshold = min(0.98, sim_threshold + 0.05)
-                    sim = (sim - 0.80) / 0.20 if sim > 0.80 else 0.0
-                    if sim >= local_threshold: adj[i].append((n_idx, sim))
-                    continue
-
-                if sim >= sim_threshold: adj[i].append((n_idx, sim))
-
-        visited = set()
-        for i in range(len(file_data)):
-            if i not in visited:
-                cluster_indices = [i]
-                visited.add(i)
-                for n_idx, _ in adj[i]:
-                    if n_idx not in visited:
-                        visited.add(n_idx)
-                        cluster_indices.append(n_idx)
-                
-                if len(cluster_indices) > 1:
-                    clusters.append([file_data[idx] for idx in cluster_indices])
-                    
-        refined_clusters = []
-        for cluster in clusters:
-            base_item = max(cluster, key=lambda x: x['size'])
-            base_vec = base_item['vector']
-            for item in cluster:
-                item['similarity'] = 1.0 if item == base_item else max(0.0, float(np.dot(base_vec, item['vector'])))
-            cluster.sort(key=lambda x: x['similarity'], reverse=True)
-            refined_clusters.append(cluster)
-            
-        return refined_clusters
+        return self.faiss_manager.build_clusters(
+            self.current_file_data.copy(),
+            threshold,
+            self.scan_mode,
+        )

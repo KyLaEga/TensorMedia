@@ -1,7 +1,8 @@
 name: Build and Release TensorMedia
 on:
   push:
-    branches: [main]
+    tags:
+      - 'v*' # Запуск при создании тега версии, например v1.0.0
 
 jobs:
   build:
@@ -15,19 +16,17 @@ jobs:
             artifact_name: macOS
           - os: windows-latest
             artifact_name: Windows
-          - os: ubuntu-latest
+          - os: ubuntu-22.04 # Используем 22.04 для лучшей совместимости GLIBC
             artifact_name: Linux-CPU
             type: cpu
-          - os: ubuntu-latest
-            artifact_name: Linux-CUDA
-            type: cuda
 
     steps:
     - uses: actions/checkout@v4
     
     - uses: actions/setup-python@v5
       with:
-        python-version: '3.11'
+        python-version: '3.12.13'
+        cache: 'pip' # Кэширование зависимостей pip
     
     - name: Install System Dependencies (Linux)
       if: startsWith(matrix.os, 'ubuntu')
@@ -47,8 +46,15 @@ jobs:
     - name: Install Project Dependencies
       run: pip install -r requirements.txt
 
+    - name: Cache ML Models
+      id: cache-models
+      uses: actions/cache@v4
+      with:
+        path: models
+        key: ml-models-${{ hashFiles('setup_models.py') }}
+
     - name: Fetch ML Models into CI
-      # ФИКС: Жестко заставляем Windows-терминал понимать UTF-8 и эмодзи
+      if: steps.cache-models.outputs.cache-hit != 'true'
       env:
         PYTHONIOENCODING: "utf8"
       run: python setup_models.py
@@ -56,9 +62,16 @@ jobs:
     - name: Compile Binary (Cross-Platform)
       run: pyinstaller --noconfirm TensorMedia.spec
 
+    - name: List Dist Directory (Debug)
+      run: |
+        ls -R dist/
+      shell: bash
+
     - name: Build Windows Installer (.exe)
       if: matrix.os == 'windows-latest'
-      run: iscc setup.iss
+      run: |
+        # Inno Setup (iscc) предустановлен на windows-latest
+        iscc setup.iss
 
     - name: Build macOS Image (.dmg)
       if: matrix.os == 'macos-latest'
@@ -72,13 +85,14 @@ jobs:
       if: startsWith(matrix.os, 'ubuntu')
       run: |
         cd dist
-        tar -czvf TensorMedia-${{ matrix.artifact_name }}-x86_64.tar.gz TensorMedia/
+        tar -czvf TensorMedia-Linux-x86_64.tar.gz TensorMedia/
 
-    - name: Upload Artifacts
-      uses: actions/upload-artifact@v4
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v2
       with:
-        name: TensorMedia-${{ matrix.artifact_name }}
-        path: |
+        files: |
           dist/TensorMedia_Setup.exe
           dist/TensorMedia-macOS.dmg
-          dist/TensorMedia-Linux-*.tar.gz
+          dist/TensorMedia-Linux-x86_64.tar.gz
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

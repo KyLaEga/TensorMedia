@@ -5,11 +5,11 @@
     <!-- Позволяет PyTorch компилировать и выполнять графы вычислений "на лету" -->
     <key>com.apple.security.cs.allow-jit</key>
     <true/>
-    
+
     <!-- Необходим для размещения C++ структур FAISS и матриц весов в памяти -->
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
     <true/>
-    
+
     <!-- Разрешает загрузку .so / .dylib файлов от PyTorch/OpenCV, не подписанных твоим сертификатом -->
     <key>com.apple.security.cs.disable-library-validation</key>
     <true/>

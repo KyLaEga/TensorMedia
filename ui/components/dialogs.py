@@ -97,7 +97,9 @@ class VisualDeleteDialog(QDialog):
             try:
                 if os.path.exists(p) and os.path.isfile(p):
                     total_bytes += os.path.getsize(p)
-            except OSError: pass
+            except OSError as e:
+                from utils.logger import auditor
+                auditor.warning(f"Failed to get size for {p}: {e}")
         
         size_mb = total_bytes / (1024 * 1024)
         
@@ -116,8 +118,10 @@ class VisualDeleteDialog(QDialog):
         
         self.grid_container = QWidget()
         self.grid = QGridLayout(self.grid_container)
-        self.grid.setSpacing(12)
-        self.grid.setContentsMargins(10, 10, 10, 10)
+        # Установка марджина и отступов 1% от ширины диалога
+        margin = max(10, int(self.width() * 0.01))
+        self.grid.setSpacing(margin)
+        self.grid.setContentsMargins(margin, margin, margin, margin)
         
         count = len(files)
         if count <= 2: cols = 2
@@ -134,7 +138,7 @@ class VisualDeleteDialog(QDialog):
             card_frame.setStyleSheet("background-color: #2B2D31; border-radius: 6px;")
             
             vbox = QVBoxLayout(card_frame)
-            vbox.setContentsMargins(4, 4, 4, 6) 
+            vbox.setContentsMargins(4, 4, 4, 4) 
             vbox.setSpacing(4)
             
             img_lbl = ScalableImageLabel()

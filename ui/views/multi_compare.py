@@ -71,6 +71,7 @@ class GridImageLabel(QLabel):
             try:
                 self._movie.frameChanged.disconnect(self._on_frame_update)
             except Exception:
+                # осознанное глушение: сигнал мог быть не подключен
                 pass
             self._movie.deleteLater()
             self._movie = None

@@ -18,6 +18,42 @@ class WorkerSignals(QObject):
     finished = Signal(str, QImage)
     error = Signal(str)
 
+class ImageLoaderWorker(QRunnable):
+    def __init__(self, path: str, token: CancellationToken):
+        super().__init__()
+        self.path = path
+        self.token = token
+        self.signals = WorkerSignals()
+        self.setAutoDelete(True)
+
+    def run(self):
+        if self.token.cancelled: return
+        
+        from PySide6.QtGui import QImageReader
+        qim = QImage()
+        try:
+            reader = QImageReader(self.path)
+            reader.setAutoTransform(True)
+            
+            # Ограничиваем размер при чтении для экономии RAM и ускорения отрисовки
+            # 1280x720 достаточно для большинства превью
+            size = reader.size()
+            if size.isValid():
+                if size.width() > 1280 or size.height() > 1280:
+                    size.scale(1280, 1280, Qt.AspectRatioMode.KeepAspectRatio)
+                    reader.setScaledSize(size)
+            
+            if self.token.cancelled: return
+            qim = reader.read()
+            
+            if not self.token.cancelled:
+                self.signals.finished.emit(self.path, qim)
+        except Exception as e:
+            from utils.logger import auditor
+            auditor.error(f"[ImageLoader] Decoding error {self.path}: {e}")
+            if not self.token.cancelled:
+                self.signals.error.emit(self.path)
+
 class DocLoaderWorker(QRunnable):
     def __init__(self, path: str, token: CancellationToken):
         super().__init__()
@@ -138,6 +174,24 @@ class ScalableImageLabel(QLabel):
         self._movie.start()
         self.update()
 
+    def load_image(self, path: str):
+        self._clear_movie()
+        self._cancel_pending_workers()
+        
+        self.is_loading = True
+        self.is_error = False
+        self.is_empty = False
+        self._cached_scaled_pixmap = None
+        self._pixmap = None
+        self._current_load_path = path
+        self.update()
+        
+        self._current_token = CancellationToken()
+        worker = ImageLoaderWorker(path, self._current_token)
+        worker.signals.finished.connect(self._on_document_loaded) # Используем тот же колбэк
+        worker.signals.error.connect(self._on_document_error)
+        self._thread_pool.start(worker)
+
     def load_document(self, path: str):
         self._clear_movie()
         self._cancel_pending_workers()
@@ -202,7 +256,7 @@ class ScalableImageLabel(QLabel):
                 pm_scaled = pm.scaled(
                     self.size(),
                     Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation 
+                    Qt.TransformationMode.FastTransformation # Быстрое масштабирование для видео/GIF
                 )
                 x = (self.width() - pm_scaled.width()) // 2
                 y = (self.height() - pm_scaled.height()) // 2
@@ -211,11 +265,14 @@ class ScalableImageLabel(QLabel):
 
         pm = self._pixmap
         if pm and not pm.isNull():
+            # Кэшируем масштабированное изображение
             if self._cached_scaled_pixmap is None or self.size() != self._last_size:
+                # Если изображение очень большое, используем Smooth, иначе Fast для скорости
+                mode = Qt.TransformationMode.SmoothTransformation if pm.width() > self.width() * 1.5 else Qt.TransformationMode.FastTransformation
                 self._cached_scaled_pixmap = pm.scaled(
                     self.size(), 
                     Qt.AspectRatioMode.KeepAspectRatio, 
-                    Qt.TransformationMode.SmoothTransformation
+                    mode
                 )
                 self._last_size = self.size()
 
