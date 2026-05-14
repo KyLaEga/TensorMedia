@@ -3,6 +3,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -22,7 +23,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
-    # Включаем поддержку длинных путей для Windows
+    # Включаем поддержку длинных путей для Windows (предотвращает ошибки сборки PyInstaller)
     - name: Enable Long Paths on Windows
       if: matrix.os == 'windows-latest'
       run: git config --system core.longpaths true
