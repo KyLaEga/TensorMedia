@@ -2,7 +2,7 @@ name: Build and Release TensorMedia
 on:
   push:
     tags:
-      - 'v*' # Запуск при создании тега версии, например v1.0.0
+      - 'v*'
 
 jobs:
   build:
@@ -16,17 +16,21 @@ jobs:
             artifact_name: macOS
           - os: windows-latest
             artifact_name: Windows
-          - os: ubuntu-22.04 # Используем 22.04 для лучшей совместимости GLIBC
+          - os: ubuntu-22.04
             artifact_name: Linux-CPU
-            type: cpu
 
     steps:
     - uses: actions/checkout@v4
     
+    # Включаем поддержку длинных путей для Windows
+    - name: Enable Long Paths on Windows
+      if: matrix.os == 'windows-latest'
+      run: git config --system core.longpaths true
+    
     - uses: actions/setup-python@v5
       with:
         python-version: '3.12.13'
-        cache: 'pip' # Кэширование зависимостей pip
+        cache: 'pip'
     
     - name: Install System Dependencies (Linux)
       if: startsWith(matrix.os, 'ubuntu')
@@ -39,9 +43,13 @@ jobs:
         python -m pip install --upgrade pip
         pip install pyinstaller
 
-    - name: Install PyTorch (Linux CPU Version)
-      if: matrix.type == 'cpu'
+    - name: Install PyTorch (Windows / Linux CPU Version)
+      if: matrix.os == 'ubuntu-22.04' || matrix.os == 'windows-latest'
       run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+    - name: Install PyTorch (macOS MPS Version)
+      if: matrix.os == 'macos-latest'
+      run: pip install torch torchvision
 
     - name: Install Project Dependencies
       run: pip install -r requirements.txt
@@ -62,15 +70,9 @@ jobs:
     - name: Compile Binary (Cross-Platform)
       run: pyinstaller --noconfirm TensorMedia.spec
 
-    - name: List Dist Directory (Debug)
-      run: |
-        ls -R dist/
-      shell: bash
-
     - name: Build Windows Installer (.exe)
       if: matrix.os == 'windows-latest'
       run: |
-        # Inno Setup (iscc) предустановлен на windows-latest
         iscc setup.iss
 
     - name: Build macOS Image (.dmg)

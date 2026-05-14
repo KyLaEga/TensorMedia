@@ -1,25 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
 import sys
 import os
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
-
-# Определяем базовый путь
 base_path = os.path.abspath('.')
 
-# Собираем данные
 datas = [
     ('assets', 'assets'),
     ('models', 'models'),
 ]
 
-# Добавляем специфичные для библиотек данные
-datas += collect_data_files('torch')
+# Исключаем полные бинарники PyTorch, полагаясь на анализ импортов, 
+# собираем только необходимые конфигурации transformers и facenet.
 datas += collect_data_files('transformers')
 datas += collect_data_files('facenet_pytorch')
 
-# Скрытые импорты
 hiddenimports = [
     'PySide6.QtCore',
     'PySide6.QtGui',
@@ -30,7 +26,7 @@ hiddenimports = [
     'numpy',
     'cv2',
     'PIL.Image',
-    'fitz', # PyMuPDF
+    'fitz',
     'pymupdf',
     'blake3',
     'send2trash',
@@ -39,7 +35,6 @@ hiddenimports = [
     'facenet_pytorch',
 ]
 
-# Исключаем ненужные модули для уменьшения размера
 excludes = [
     'tkinter',
     'unittest',
@@ -77,11 +72,12 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False, # Скрываем консоль для GUI приложения
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
-    codesign_identity=None,
+    # КРИТИЧНО для macOS ARM64 (Apple Silicon): '-' означает Ad-Hoc подпись
+    codesign_identity='-' if sys.platform == 'darwin' else None,
     entitlements_file='entitlements.plist' if sys.platform == 'darwin' else None,
     icon='assets/icons/app.ico' if os.path.exists('assets/icons/app.ico') else None,
 )

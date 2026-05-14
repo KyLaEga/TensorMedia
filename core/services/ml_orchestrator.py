@@ -8,7 +8,6 @@ from ui.workers import ScannerBridge, ClusterWorker, EngineWarmupWorker, Mainten
 from utils.logger import auditor
 
 class MLOrchestrator(QObject):
-    """Изолированный сервис управления инференсом и I/O пулами с интеграцией телеметрии."""
     def __init__(self):
         super().__init__()
         self.engine = None
@@ -67,7 +66,6 @@ class MLOrchestrator(QObject):
         auditor.info("NPU Engine Warmup complete. Bus event emitted.")
         bus.evt_engine_ready.emit(engine)
         
-        # Запуск фонового обслуживания БД после прогрева движка
         self.maintenance_worker = MaintenanceWorker()
         self.maintenance_worker.start()
 
@@ -76,7 +74,6 @@ class MLOrchestrator(QObject):
         bus.evt_engine_ready.emit(None)
 
     def _handle_scan(self, dirs, exts, mode):
-        # Строгая блокировка выгрузки модели во время I/O
         if self.idle_timer.isActive():
             self.idle_timer.stop()
             
@@ -115,9 +112,9 @@ class MLOrchestrator(QObject):
         if self.scanner and self.scanner.isRunning():
             auditor.warning("Stopping active scanner thread...")
             self.scanner.stop()
-            self.scanner.wait(2000) # Даем 2 секунды на мягкую остановку
+            self.scanner.wait(2000)
             if self.scanner.isRunning():
-                self.scanner.terminate() # Принудительно убиваем, если завис
+                self.scanner.terminate()
                 self.scanner.wait()
         
         if self.engine:
@@ -134,6 +131,13 @@ class MLOrchestrator(QObject):
             return
         if not self.engine or not getattr(self.engine, 'current_file_data', []): 
             bus.evt_clustering_completed.emit([])
+            self._reset_idle_timer()
+            return
+            
+        available_ram_mb = psutil.virtual_memory().available / (1024 * 1024)
+        if available_ram_mb < 512.0:
+            auditor.critical(f"OOM Prevented: Available RAM ({available_ram_mb:.1f} MB) is critically low for FAISS.")
+            bus.evt_scan_error.emit("Not enough system memory to perform clustering safely.")
             self._reset_idle_timer()
             return
             
@@ -181,13 +185,11 @@ class MLOrchestrator(QObject):
             except Exception as e:
                 auditor.error(f"Failed stopping {name}: {e}")
 
-        # Stop QThreads first (they may own/process child pools)
         _stop_qthread(self.scanner, "ScannerBridge", timeout_ms=8000)
         _stop_qthread(self.cluster_worker, "ClusterWorker", timeout_ms=5000)
         _stop_qthread(self.warmup_worker, "EngineWarmupWorker", timeout_ms=5000)
         _stop_qthread(self.maintenance_worker, "MaintenanceWorker", timeout_ms=5000)
 
-        # Hard kill any leftover multiprocessing workers (FFmpeg/OpenCV decode lives there)
         try:
             children = multiprocessing.active_children()
             if children:
@@ -196,18 +198,15 @@ class MLOrchestrator(QObject):
                 try:
                     p.terminate()
                 except Exception:
-                    # осознанное глушение: процесс уже мог быть завершен
                     pass
             for p in children:
                 try:
                     p.join(timeout=2.0)
                 except Exception:
                     pass
-            # If still alive, escalate
             for p in children:
                 try:
                     if p.is_alive() and hasattr(p, "kill"):
-                        auditor.warning(f"Escalating kill for pid={getattr(p, 'pid', None)}")
                         p.kill()
                 except Exception:
                     pass

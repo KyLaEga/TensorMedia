@@ -25,8 +25,6 @@ class DBConnectionPool:
 
     @classmethod
     def run_maintenance_all(cls):
-        """Запускает GC и Vacuum для всех баз данных в пуле."""
-        # Убеждаемся, что основные базы инициализированы
         for mode in ["visual", "faces"]:
             cls.get_connection(f"meta_v2_{mode}.db")
             
@@ -52,10 +50,30 @@ class BatchOperations:
                 tx = json.load(f)
             
             if tx.get("status") == "pending":
-                auditor.warning(f"Detected pending transaction [{tx.get('op')}]. Executing state reconciliation.")
+                op = tx.get("op")
+                auditor.warning(f"Detected pending transaction [{op}]. Executing state reconciliation.")
+                
+                if op == "move":
+                    payload = tx.get("payload", {})
+                    completed = payload.get("completed_moves", [])
+                    rollbacks = 0
+                    for src, dst in completed:
+                        try:
+                            src_path = Path(src)
+                            dst_path = Path(dst)
+                            if dst_path.exists() and not src_path.exists():
+                                src_path.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.move(str(dst_path), str(src_path))
+                                rollbacks += 1
+                        except Exception as e:
+                            auditor.error(f"Rollback failed for {dst} -> {src}: {e}")
+                    
+                    if rollbacks > 0:
+                        auditor.info(f"Transaction Rollback Complete: {rollbacks} files restored.")
             
             journal.unlink()
         except Exception as e:
+            auditor.error(f"Journal recovery failed: {e}")
             if journal.exists():
                 journal.unlink()
 
@@ -65,7 +83,6 @@ class BatchOperations:
             with open(BatchOperations._journal_path(), "w", encoding="utf-8") as f:
                 json.dump({"op": op_type, "payload": payload, "status": "pending"}, f)
         except Exception:
-            # осознанное глушение: игнорируем ошибку записи журнала, чтобы не прерывать пакетную операцию
             pass
 
     @staticmethod
@@ -75,7 +92,6 @@ class BatchOperations:
             try:
                 journal.unlink()
             except Exception:
-                # осознанное глушение: файл журнала мог быть уже удален
                 pass
 
     @staticmethod
@@ -84,12 +100,11 @@ class BatchOperations:
             return
         
         modes = [scan_mode] if scan_mode else ["visual", "faces"]
-        
         norm_paths = [str(Path(p).resolve()) for p in file_paths]
+        
         for mode in modes:
             db_name = f"meta_v2_{mode}.db"
             cache = DBConnectionPool.get_connection(db_name)
-            
             try:
                 cache.delete_paths(norm_paths)
             except Exception as e:
@@ -123,8 +138,9 @@ class BatchOperations:
     def move_files(file_paths: list, target_dir: str, scan_mode: str = None) -> dict:
         results = {"success": [], "failed": []}
         target = Path(target_dir).resolve()
+        completed_moves = []
         
-        BatchOperations._log_transaction("move", {"targets": file_paths, "destination": str(target)})
+        BatchOperations._log_transaction("move", {"targets": file_paths, "destination": str(target), "completed_moves": completed_moves})
         
         if not target.exists():
             target.mkdir(parents=True, exist_ok=True)
@@ -138,7 +154,10 @@ class BatchOperations:
                         raise FileExistsError("Target file already exists")
                         
                     shutil.move(str(src), str(dst))
+                    completed_moves.append((str(src), str(dst)))
                     results["success"].append((path, str(dst)))
+                    
+                    BatchOperations._log_transaction("move", {"targets": file_paths, "destination": str(target), "completed_moves": completed_moves})
             except Exception as e:
                 results["failed"].append((path, str(e)))
 
