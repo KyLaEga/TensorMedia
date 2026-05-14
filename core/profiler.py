@@ -25,24 +25,20 @@ class HardwareProfiler:
         current_ram = HardwareProfiler.get_ram_usage_mb()
         metrics = {"triggered": False, "pre_mb": current_ram, "post_mb": current_ram, "recovered_mb": 0.0}
         
-        # Контроль лимита Unified Memory / VRAM
         if current_ram > threshold_mb or force:
             if not force:
                 auditor.warning(f"RAM Threshold Exceeded: {current_ram:.1f} MB. Executing GC.")
             else:
                 auditor.debug(f"Forced GC requested. Active RAM: {current_ram:.1f} MB")
             
-            # Избегаем агрессивной сборки мусора в рантайме, чтобы не ломать предсказание ветвлений CPU
-            gc.collect(generation=1 if not force else 2)
+            gc.collect(generation=2)
             
             device = HardwareProfiler.get_device()
             
-            # Физическая очистка кэшей акселераторов
             if device.type == "cuda":
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect() 
             elif device.type == "mps":
-                # Выполняется только при переполнении/сбросе. Защищает от Metal API CPU Spikes.
                 torch.mps.empty_cache()
                 
             post_ram = HardwareProfiler.get_ram_usage_mb()

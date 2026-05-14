@@ -9,8 +9,6 @@ from core.services.fs_service import SafeFSExecutor, BatchOpWorker
 from ui.components.dialogs import VisualDeleteDialog
 
 class SelectionController(QObject):
-    """Отвечает за логику выделения файлов, авто-выбор и файловые операции (Move/Delete)."""
-    
     def __init__(self, main_controller):
         super().__init__()
         self.main_controller = main_controller
@@ -82,16 +80,32 @@ class SelectionController(QObject):
 
         new_state = Qt.CheckState.Checked if valid_items[0].checkState() == Qt.CheckState.Unchecked else Qt.CheckState.Unchecked
         
+        self.view.model.blockSignals(True)
+        min_row = float('inf')
+        max_row = -1
+        parent_idx = valid_indexes[0].parent()
+
         for child, idx in zip(valid_items, valid_indexes): 
             child.check_state = new_state
-            self.view.model.dataChanged.emit(idx, idx.siblingAtColumn(5), [Qt.ItemDataRole.CheckStateRole, Qt.ItemDataRole.DisplayRole])
-            self.view.model.itemChanged.emit(child, idx) 
+            r = idx.row()
+            if r < min_row: min_row = r
+            if r > max_row: max_row = r
+
+        self.view.model.blockSignals(False)
+        
+        if min_row != float('inf'):
+            first_idx = self.view.model.index(min_row, 0, parent_idx)
+            last_idx = self.view.model.index(max_row, 5, parent_idx)
+            self.view.model.dataChanged.emit(first_idx, last_idx, [Qt.ItemDataRole.CheckStateRole, Qt.ItemDataRole.DisplayRole])
+            self.view.model.itemChanged.emit(valid_items[0], valid_indexes[0])
 
         self.view.tree.viewport().update()
         self.main_controller._update_savings()
 
     def clear_selection(self):
         proxy = self.view.proxy_model
+        self.view.model.blockSignals(True)
+        
         for i in range(proxy.rowCount()):
             group_idx = proxy.index(i, 0)
             src_group_idx = proxy.mapToSource(group_idx)
@@ -106,6 +120,7 @@ class SelectionController(QObject):
                 if child and not child.raw_dict.get('is_ref', False):
                     child.check_state = Qt.CheckState.Unchecked
                     
+        self.view.model.blockSignals(False)
         self.view.model.dataChanged.emit(
             self.view.model.index(0, 0, QModelIndex()),
             self.view.model.index(self.view.model.rowCount()-1, 5, QModelIndex()),

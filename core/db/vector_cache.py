@@ -3,6 +3,9 @@ import numpy as np
 import threading
 import queue
 import time
+import atexit
+import signal
+import sys
 from pathlib import Path
 
 from utils.env_config import get_data_dir
@@ -21,6 +24,19 @@ class VectorCache:
         
         self.worker_thread = threading.Thread(target=self._writer_worker, daemon=True)
         self.worker_thread.start()
+
+        atexit.register(self.close)
+        if threading.current_thread() is threading.main_thread():
+            try:
+                signal.signal(signal.SIGINT, self._signal_handler)
+                signal.signal(signal.SIGTERM, self._signal_handler)
+            except ValueError:
+                pass
+
+    def _signal_handler(self, signum, frame):
+        auditor.warning(f"Signal {signum} received. Flushing VectorCache before exit.")
+        self.close()
+        sys.exit(0)
 
     def _init_db(self):
         with self.db_lock:
@@ -74,7 +90,6 @@ class VectorCache:
                             self._execute_batch(conn, batch)
                             transaction_counter += len(batch)
                             batch.clear()
-                        # Финальное слияние и транкация WAL-журнала перед выходом
                         try: conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                         except sqlite3.Error as e:
                             auditor.warning(f"Failed to truncate WAL on exit: {e}")
@@ -88,12 +103,11 @@ class VectorCache:
                         continue
 
                     batch.append(item)
-                    if len(batch) >= 50 or self.write_queue.empty():
+                    if len(batch) >= 10 or self.write_queue.empty():
                         self._execute_batch(conn, batch)
                         transaction_counter += len(batch)
                         batch.clear()
                         
-                        # Предотвращение фрагментации диска: сброс журнала каждые 5000 записей
                         if transaction_counter >= 5000:
                             try:
                                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -200,7 +214,7 @@ class VectorCache:
                     for i in range(0, len(paths), chunk_size):
                         chunk = paths[i:i+chunk_size]
                         placeholders = ','.join(['?'] * len(chunk))
-                        cursor.execute(f"SELECT path, size, mtime, phash, resolution, duration, codec, sharpness, fps FROM metadata WHERE path IN ({placeholders})", chunk) # nosec B608
+                        cursor.execute(f"SELECT path, size, mtime, phash, resolution, duration, codec, sharpness, fps FROM metadata WHERE path IN ({placeholders})", chunk)
                         for row in cursor.fetchall():
                             meta[row[0]] = {
                                 "size": row[1], "mtime": row[2], "phash": row[3],
@@ -246,10 +260,6 @@ class VectorCache:
                 auditor.error(f"Failed to delete cache entries: {e}")
 
     def move_paths(self, src_dst_pairs: list[tuple[str, str]]):
-        """
-        Update cached metadata to track moved files.
-        Keeps vectors/faces intact by rewriting the primary key `path`.
-        """
         self.sync()
         if not src_dst_pairs:
             return
@@ -266,10 +276,6 @@ class VectorCache:
                 auditor.error(f"Failed to move cache entries: {e}")
 
     def run_maintenance(self):
-        """
-        Выполняет очистку базы данных от записей, файлы которых больше не существуют на диске,
-        и дефрагментирует файл БД (VACUUM).
-        """
         if not self.is_running: return
         
         auditor.info("Starting database maintenance (GC & Vacuum)...")
@@ -283,7 +289,6 @@ class VectorCache:
                     cursor.execute("SELECT path FROM metadata")
                     all_paths = [row[0] for row in cursor.fetchall()]
                     
-                    # Проверка существования файлов (I/O операция)
                     import os
                     for p in all_paths:
                         if not os.path.exists(p):
@@ -294,7 +299,6 @@ class VectorCache:
                         cursor.executemany("DELETE FROM metadata WHERE path = ?", orphans)
                         conn.commit()
                     
-                    # Дефрагментация
                     auditor.info("Maintenance: Running VACUUM...")
                     conn.execute("VACUUM")
                     conn.commit()

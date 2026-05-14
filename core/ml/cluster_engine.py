@@ -12,6 +12,7 @@ import psutil
 from PIL import Image
 from pathlib import Path
 from multiprocessing import Pool, Value, shared_memory
+import concurrent.futures
 
 cv2.setNumThreads(0)
 
@@ -28,7 +29,6 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# Set by Pool initializer in extract_features; workers check before heavy decode.
 _worker_cancel_flag = None
 
 def _scan_pool_init(cancel_flag):
@@ -42,7 +42,6 @@ def _scan_io_cancelled() -> bool:
     try:
         return bool(_worker_cancel_flag.value)
     except Exception:
-        # осознанное глушение: если флаг недоступен, считаем что не отменено
         return False
 
 def _cancelled_io_result(file_path: Path, size, mtime, file_hash, vector) -> dict:
@@ -87,8 +86,6 @@ def process_single_file_io(task_data: tuple) -> dict:
         arr = np.array(img_obj)
         try:
             import uuid
-            # macOS has a 31-character limit for shared memory names.
-            # "tm_shm_" (7) + 20 chars of UUID = 27 chars (safe).
             shm_name = f"tm_shm_{uuid.uuid4().hex[:20]}"
             shm = shared_memory.SharedMemory(name=shm_name, create=True, size=arr.nbytes)
             shm_arr = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf)
@@ -113,50 +110,61 @@ def process_single_file_io(task_data: tuple) -> dict:
         if ext in {'.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v'}:
             if _scan_io_cancelled():
                 return _cancelled_io_result(file_path, size, mtime, file_hash, vector)
-            try:
-                cap = cv2.VideoCapture(str(file_path), cv2.CAP_AVFOUNDATION, [cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY])
-                if not cap.isOpened(): cap = cv2.VideoCapture(str(file_path)) 
-            except Exception as e:
-                auditor.warning(f"Failed to open video {file_path} with AVFOUNDATION: {e}")
-                cap = cv2.VideoCapture(str(file_path))
+            
+            cap = None
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(cv2.VideoCapture, str(file_path), cv2.CAP_AVFOUNDATION, [cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY])
+                try:
+                    cap = future.result(timeout=5.0)
+                    if not cap or not cap.isOpened():
+                        if cap: cap.release()
+                        future_fb = executor.submit(cv2.VideoCapture, str(file_path))
+                        cap = future_fb.result(timeout=5.0)
+                except concurrent.futures.TimeoutError:
+                    auditor.error(f"Watchdog: VideoCapture timeout for {file_path}")
+                    cap = None
+                except Exception as e:
+                    auditor.warning(f"Failed to open video {file_path}: {e}")
+                    cap = None
 
-            try:
-                if cap.isOpened():
-                    res = f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}"
-                    fps_val = float(cap.get(cv2.CAP_PROP_FPS))
-                    total_frames = float(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    if fps_val > 0: dur = float(total_frames / fps_val)
-                    fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
-                    codec = "".join([chr((fourcc >> 8 * i) & 0xFF) for i in range(4)]).strip().lower()
-                    
-                    check_points = [0.20, 0.40, 0.60, 0.80]
-                    max_sharp = 0.0
-                    for cp in check_points:
-                        if _scan_io_cancelled():
-                            break
-                        target = int(total_frames * cp) if total_frames > 0 else 0
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-                        ret, frame = cap.read()
-                        if ret and frame.mean() > 15.0:
-                            if vector is None:
-                                h_fr, w_fr = frame.shape[:2]
-                                scale_fr = min(target_size[0]/w_fr, target_size[1]/h_fr)
-                                if scale_fr < 1.0:
-                                    frame_res = cv2.resize(frame, (int(w_fr * scale_fr), int(h_fr * scale_fr)), interpolation=cv2.INTER_AREA)
-                                else:
-                                    frame_res = frame
-                                _allocate_shm(cv2.cvtColor(frame_res, cv2.COLOR_BGR2RGB))
+            if cap is not None:
+                try:
+                    if cap.isOpened():
+                        res = f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}"
+                        fps_val = float(cap.get(cv2.CAP_PROP_FPS))
+                        total_frames = float(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                        if fps_val > 0: dur = float(total_frames / fps_val)
+                        fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+                        codec = "".join([chr((fourcc >> 8 * i) & 0xFF) for i in range(4)]).strip().lower()
+                        
+                        check_points = [0.20, 0.40, 0.60, 0.80]
+                        max_sharp = 0.0
+                        for cp in check_points:
+                            if _scan_io_cancelled():
+                                break
+                            target = int(total_frames * cp) if total_frames > 0 else 0
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+                            ret, frame = cap.read()
+                            if ret and frame.mean() > 15.0:
+                                if vector is None:
+                                    h_fr, w_fr = frame.shape[:2]
+                                    scale_fr = min(target_size[0]/w_fr, target_size[1]/h_fr)
+                                    if scale_fr < 1.0:
+                                        frame_res = cv2.resize(frame, (int(w_fr * scale_fr), int(h_fr * scale_fr)), interpolation=cv2.INTER_AREA)
+                                    else:
+                                        frame_res = frame
+                                    _allocate_shm(cv2.cvtColor(frame_res, cv2.COLOR_BGR2RGB))
 
-                            h, w = frame.shape[:2]
-                            if max(w, h) > 256:
-                                scale = 256.0 / max(w, h)
-                                frame_sm = cv2.resize(frame, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-                            else: frame_sm = frame
-                            sharp = calculate_optical_sharpness(cv2.cvtColor(frame_sm, cv2.COLOR_BGR2GRAY))
-                            if sharp > max_sharp: max_sharp = sharp
-                    sharpness = float(max_sharp)
-            finally:
-                cap.release()
+                                h, w = frame.shape[:2]
+                                if max(w, h) > 256:
+                                    scale = 256.0 / max(w, h)
+                                    frame_sm = cv2.resize(frame, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                                else: frame_sm = frame
+                                sharp = calculate_optical_sharpness(cv2.cvtColor(frame_sm, cv2.COLOR_BGR2GRAY))
+                                if sharp > max_sharp: max_sharp = sharp
+                        sharpness = float(max_sharp)
+                finally:
+                    cap.release()
                 
         elif ext in {'.jpg', '.png', '.webp', '.bmp', '.heic', '.jpeg'}:
             if _scan_io_cancelled():
@@ -268,7 +276,6 @@ def process_single_file_io(task_data: tuple) -> dict:
                     sharpness = float(max_sharp)
             except Exception as e: 
                 auditor.warning(f"Worker PDF error {file_path}: {e}")
-                # Возвращаем результат без вектора, чтобы файл был в списке
                 return {
                     "path": str(file_path), "size": size, "mtime": mtime, "phash": file_hash, 
                     "vector": None, "shm_blocks": [], "res": "", 
@@ -277,6 +284,12 @@ def process_single_file_io(task_data: tuple) -> dict:
 
     except Exception as e:
         auditor.warning(f"Worker I/O Error for {file_path}: {e}")
+        for block in shm_blocks:
+            if block.get("is_shm"):
+                try:
+                    shared_memory.SharedMemory(name=block['name']).unlink()
+                except Exception:
+                    pass
         shm_blocks.clear()
 
     return {
@@ -301,7 +314,6 @@ class SmartClusterEngine:
         self.faiss_manager = FaissManager(scan_mode="visual")
 
     def request_scan_abort(self):
-        """Signal workers + terminate I/O Pool (safe from non-scan thread)."""
         self.is_stopped = True
         self.is_paused = False
         cf = getattr(self, "_scan_cancel_flag", None)
@@ -309,16 +321,13 @@ class SmartClusterEngine:
             try:
                 cf.value = 1
             except Exception:
-                # осознанное глушение: игнорируем ошибку записи во флаг отмены
                 pass
         pool = getattr(self, "_io_pool", None)
         if pool is not None:
             try:
                 pool.terminate()
             except Exception:
-                # осознанное глушение: процесс пула уже мог быть завершен
                 pass
-            # Не вызываем pool.join(): при зависшем FFI (OpenCV/FFmpeg) join блокирует выход процесса.
             self._io_pool = None
 
     def unload_models(self):
@@ -348,11 +357,11 @@ class SmartClusterEngine:
 
         if mode == "visual":
             siglip_local_path = str(get_models_dir() / "siglip-base-patch16-224")
-            self.processor = AutoProcessor.from_pretrained(siglip_local_path, local_files_only=True) # nosec B615
+            self.processor = AutoProcessor.from_pretrained(siglip_local_path, local_files_only=True)
             target_dtype = torch.float16 if self.device.type in ("cuda", "mps") else torch.float32
             
             try:
-                self.model = SiglipVisionModel.from_pretrained( # nosec B615
+                self.model = SiglipVisionModel.from_pretrained(
                     siglip_local_path, 
                     local_files_only=True,
                     torch_dtype=target_dtype
@@ -360,7 +369,7 @@ class SmartClusterEngine:
             except Exception as e:
                 auditor.error(f"Failed to load to {self.device.type} with {target_dtype}: {e}. Falling back to CPU.")
                 self.device = torch.device("cpu")
-                self.model = SiglipVisionModel.from_pretrained( # nosec B615
+                self.model = SiglipVisionModel.from_pretrained(
                     siglip_local_path, 
                     local_files_only=True,
                     torch_dtype=torch.float32
@@ -373,8 +382,6 @@ class SmartClusterEngine:
                 import sys
                 from facenet_pytorch import MTCNN, InceptionResnetV1
                 
-                # В режиме PyInstaller (frozen) facenet_pytorch может искать веса по неправильному пути.
-                # Мы переопределяем путь к данным, если запущены из бандла.
                 if getattr(sys, 'frozen', False):
                     import facenet_pytorch.models.mtcnn as mtcnn_module
                     if hasattr(sys, '_MEIPASS'):
@@ -382,10 +389,6 @@ class SmartClusterEngine:
                     else:
                         base_dir = Path(sys.executable).parent.parent / "Resources"
                     
-                    # Патчим путь к весам pnet, rnet, onet
-                    # mtcnn.py делает: os.path.join(os.path.dirname(__file__), '../data/pnet.pt')
-                    # Чтобы путь разрешился, промежуточная папка должна существовать.
-                    # Папка data существует, поэтому используем её вместо models.
                     mtcnn_module.os.path.dirname = lambda x: str(base_dir / "facenet_pytorch" / "data")
                 
                 self.mtcnn = MTCNN(keep_all=False, device='cpu')
@@ -489,7 +492,6 @@ class SmartClusterEngine:
         self.is_stopped = False
         self.current_file_data = []
         
-        # Сброс флага отмены для новых процессов
         if self._scan_cancel_flag is not None:
             self._scan_cancel_flag.value = 0
         
@@ -515,10 +517,6 @@ class SmartClusterEngine:
             p_dir = Path(d)
             if p_dir.is_dir():
                 files.extend(fast_scandir(d))
-                
-        # В режиме двух папок (dual mode) нам нужно убедиться, что мы не сравниваем файлы внутри одной папки,
-        # но FAISS ищет по всем векторам. Логика фильтрации "эталон vs проверяемая" реализована в faiss_manager.py
-        # и tree_model.py. Здесь мы просто собираем все файлы.
                 
         if not files: return self.current_file_data
         
@@ -621,7 +619,6 @@ class SmartClusterEngine:
                         try:
                             if self.is_stopped:
                                 pool.terminate()
-                                # Без join при отмене — избегаем дедлока на зависших воркерах.
                             else:
                                 pool.close()
                                 pool.join()
@@ -629,14 +626,12 @@ class SmartClusterEngine:
                             auditor.warning(f"I/O pool shutdown: {ex}")
 
                 if self.is_stopped:
-                    # Критическая очистка зомби-сегментов SHM при прерывании
                     for r in chunk_results:
                         for shm_meta in r.get('shm_blocks', []):
                             if shm_meta.get("is_shm"):
                                 try:
                                     shared_memory.SharedMemory(name=shm_meta['name']).unlink()
                                 except Exception:
-                                    # осознанное глушение: SHM сегмент уже мог быть удален или недоступен
                                     pass
                     break
 
@@ -665,7 +660,6 @@ class SmartClusterEngine:
                                     try:
                                         shm.unlink()
                                     except Exception:
-                                        # осознанное глушение: не удается удалить SHM после сбоя
                                         pass
                             else:
                                 try:
