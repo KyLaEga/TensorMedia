@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from PySide6.QtCore import QObject, Qt
-from PySide6.QtGui import QPixmap, QImageReader
+from PySide6.QtGui import QPixmap, QImageReader, QImage
 from ui.components.image_label import ScalableImageLabel
 
 class PreviewController(QObject):
@@ -18,6 +18,7 @@ class PreviewController(QObject):
             self.view.preview_stack.setCurrentIndex(0)
             self.view.single_preview_label.clear_view()
             return
+            
         ext = Path(p).suffix.lower()
         if ext in {'.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v'}:
             self.view.preview_stack.setCurrentIndex(1)
@@ -29,17 +30,34 @@ class PreviewController(QObject):
                 movie = QMovie(p)
                 movie.setCacheMode(QMovie.CacheMode.CacheAll)
                 self.view.single_preview_label.setMovie(movie)
-            elif ext in {'.pdf', '.cbz'}:
+            elif ext == '.pdf':
+                # КРИТИЧЕСКИЙ ПАТЧ: Прямой рендер PDF без альфа-канала для предотвращения SegFault
+                try:
+                    import fitz
+                    with fitz.open(p) as doc:
+                        if len(doc) > 0:
+                            page = doc.load_page(0)
+                            pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
+                            qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+                            pixmap = QPixmap.fromImage(qimg)
+                            self.view.single_preview_label.setPixmap(pixmap.scaled(
+                                self.view.single_preview_label.size(),
+                                Qt.AspectRatioMode.KeepAspectRatio,
+                                Qt.TransformationMode.SmoothTransformation
+                            ))
+                            self.view.single_preview_label.setVisible(True)
+                except Exception as e:
+                    from utils.logger import auditor
+                    auditor.warning(f"PDF Preview rendering failed for {p}: {e}")
+            elif ext == '.cbz':
                 self.view.single_preview_label.load_document(p)
             else:
-                # Асинхронная загрузка обычных изображений
                 self.view.single_preview_label.load_image(p)
 
     def render_multi_preview(self, paths):
         self.view.video_player.stop()
         self.view.preview_stack.setCurrentIndex(2)
         
-        # Очистка сетки
         for r in reversed(range(self.view.multi_grid.count())):
             item_at = self.view.multi_grid.itemAt(r)
             if item_at:
@@ -72,7 +90,6 @@ class PreviewController(QObject):
                 video_paths.append(p)
                 self.main_controller.multi_preview_lbls[p] = lbl
             else:
-                # Асинхронная загрузка для каждого элемента в сетке
                 lbl.load_image(p)
             
             self.view.multi_grid.addWidget(lbl, i // cols, i % cols)

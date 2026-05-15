@@ -45,13 +45,25 @@ class ArbitrageSortFilterProxyModel(QSortFilterProxyModel):
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
         model = self.sourceModel()
         
+        # Если это узел 1 уровня (Группа/Кластер)
         if not source_parent.isValid():
             group_index = model.index(source_row, 0, source_parent)
+            
+            # 1. Сначала проверяем совпадение текста с названием самой группы
+            if self.search_text:
+                group_item = model.itemFromIndex(group_index)
+                if group_item:
+                    group_text = str(group_item.data(0)).lower()
+                    if self.search_text in group_text:
+                        return True
+
+            # 2. Если группа не совпала или поиска нет, проверяем совпадение среди дочерних элементов
             for i in range(model.rowCount(group_index)):
                 if self.filterAcceptsRow(i, group_index):
                     return True
             return False
 
+        # Если это узел 2 уровня (Файл)
         index = model.index(source_row, 0, source_parent)
         data = model.data(index, Qt.ItemDataRole.UserRole)
         
@@ -108,7 +120,6 @@ class ArbitrageSortFilterProxyModel(QSortFilterProxyModel):
             elif col == 5: 
                 return float(left_data.get('mtime', 0.0)) < float(right_data.get('mtime', 0.0))
         except Exception:
-            # осознанное глушение: если сортировка не удалась, оставляем порядок по умолчанию
             pass
 
         return super().lessThan(left, right)
@@ -143,7 +154,6 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'tree'):
             self.tree._trigger_stretch()
         
-        # Установка динамического марджина и отступов 1% от ширины окна
         margin = max(4, int(self.width() * 0.01))
         if hasattr(self, 'single_prev_layout'):
             self.single_prev_layout.setContentsMargins(margin, margin, margin, margin)
@@ -698,7 +708,6 @@ class MainWindow(QMainWindow):
         
         single_prev_card = QWidget()
         self.single_prev_layout = QVBoxLayout(single_prev_card)
-        # Динамический марджин будет установлен в resizeEvent
         self.single_preview_label = ScalableImageLabel()
         self.single_prev_layout.addWidget(self.single_preview_label)
         self.preview_stack.addWidget(single_prev_card)

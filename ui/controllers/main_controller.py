@@ -206,17 +206,12 @@ class MainController(QObject):
                 self._start_scan()
 
     def _on_window_closed(self):
-        """Паттерн корректного завершения потоков при закрытии окна."""
-        bus.cmd_stop_scan.emit() # Сигнализируем ядру об остановке
-
-        # 1. Снимаем Condition-блокировки VideoWorker и ждем завершения
+        bus.cmd_stop_scan.emit() 
         if hasattr(self, 'video_worker') and self.video_worker.isRunning():
             self.video_worker.stop()
             self.video_worker.requestInterruption()
             self.video_worker.quit()
             self.video_worker.wait(2000)
-
-        # 2. Корректно завершаем локальные задачи UI
         self.selection_controller.cleanup_workers()
 
     def _expand_all_safely(self):
@@ -264,9 +259,6 @@ class MainController(QObject):
         secs = self.scan_seconds % 60
         self.view.lbl_stat_time.setText(f"{hrs:02d}:{mins:02d}:{secs:02d}")
 
-    # ============================================================
-    # АНАЛИТИКА НА БАЗЕ PROXY MODEL
-    # ============================================================
     def _update_statistics_panel(self):
         total_files = 0
         dup_count = 0
@@ -368,9 +360,6 @@ class MainController(QObject):
         self.view.lbl_stat_selected.setText(str(selected_count))
         self.view.lbl_stat_saved.setText(f"{saved_bytes / (1024*1024):.1f} MB")
 
-    # ============================================================
-    # МАРШРУТИЗАЦИЯ СИГНАЛОВ И ИНТЕРФЕЙСА (MOUSE & KEYBOARD)
-    # ============================================================
     def _on_item_changed(self, item, source_index):
         if not item: return
         
@@ -492,20 +481,31 @@ class MainController(QObject):
         bus.cmd_recluster.emit(threshold)
 
     def _on_clustering_finished(self, clusters):
+        self.view.tree.setUpdatesEnabled(False)
+        
+        if hasattr(self.view.model, 'clear_data'):
+            self.view.model.clear_data()
+        else:
+            self.view.model.clear()
+            
         if not clusters:
-            auditor.info("Clustering sequence finished, but 0 target duplicates were found.")
+            self.view.tree.setUpdatesEnabled(True)
             self._set_status("status_npu_ready")
             self.view.btn_scan.setEnabled(True)
             self.view.progress_bar.setValue(100)
             from PySide6.QtWidgets import QApplication
             QApplication.restoreOverrideCursor()
             
-            title = "Сканирование завершено" if translator.current_lang == "ru" else "Scan Complete"
-            msg = "Дубликаты не найдены. Попробуйте снизить порог чувствительности (Ползунок %) или выбрать другие директории." if translator.current_lang == "ru" else "No duplicates found. Try lowering the matching threshold (%) or selecting different directories."
-            QMessageBox.information(self.view, title, msg)
+            # КРИТИЧЕСКИЙ ПАТЧ: Предупреждение выводится только если в кэше реально есть файлы
+            if self.orchestrator.engine and len(getattr(self.orchestrator.engine, 'current_file_data', [])) > 0:
+                title = "Сканирование завершено" if translator.current_lang == "ru" else "Scan Complete"
+                msg = "Дубликаты не найдены. Попробуйте снизить порог чувствительности (Ползунок %) или выбрать другие директории." if translator.current_lang == "ru" else "No duplicates found. Try lowering the matching threshold (%) or selecting different directories."
+                QMessageBox.information(self.view, title, msg)
             return
-            
+
         self._start_render_tree(clusters)
+        self.view.tree.setUpdatesEnabled(True)
+        self.view.tree.expandAll()
         self._update_statistics_panel()
         from PySide6.QtWidgets import QApplication
         QApplication.restoreOverrideCursor()
@@ -569,7 +569,6 @@ class MainController(QObject):
             dirs_to_scan.append(self.target_dir_b)
 
         exts = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.heic', '.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v', '.pdf', '.cbz', '.gif'}
-        # Фильтруем по чекбоксам, но сохраняем регистр
         final_exts = set()
         if self.view.chk_img.isChecked(): final_exts.update({'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.heic', '.JPG', '.JPEG', '.PNG', '.WEBP', '.BMP', '.HEIC'})
         if self.view.chk_vid.isChecked(): final_exts.update({'.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v', '.MP4', '.MOV', '.MKV', '.WEBM', '.AVI', '.M4V'})
@@ -612,13 +611,10 @@ class MainController(QObject):
         if self.is_paused:
             self._set_status("status_wait")
             self.view.btn_pause.setText(translator.tr("btn_resume") if translator.tr("btn_resume") else "Продолжить")
-            # Если есть иконка, можно также сменить её:
-            # self.view.btn_pause.setIcon(QIcon("assets/play.png"))
         else:
             self.current_status_key = None
             self.view.lbl_status.setText("Scanning..." if translator.current_lang == "en" else "Сканирование...")
             self.view.btn_pause.setText(translator.tr("btn_pause") if translator.tr("btn_pause") else "Пауза")
-            # self.view.btn_pause.setIcon(QIcon("assets/pause.png"))
 
     def _stop_scan(self):
         self.is_stopped_requested = True
@@ -648,7 +644,6 @@ class MainController(QObject):
         self.view.btn_stop.hide()
         self.view.btn_scan.show()
         
-        # Сброс текста кнопки паузы при завершении
         self.view.btn_pause.setText(translator.tr("btn_pause") if translator.tr("btn_pause") else "Пауза")
         
         if self.is_stopped_requested:
@@ -663,14 +658,8 @@ class MainController(QObject):
         valid_clusters = []
         dirs_to_watch = set()
         
-        # В режиме двух папок (dual mode) нам нужно убедиться, что в кластере есть файлы из ОБЕИХ папок.
-        # Используем абсолютные нормализованные пути для надежного сравнения.
         ref_path = os.path.normpath(os.path.abspath(self.target_dir_a)) if self.target_dir_a else None
         
-        if self.view.rb_dual.isChecked():
-            auditor.info(f"Dual Mode Filtering: Reference Dir = {ref_path}")
-            auditor.info(f"Total clusters before filtering: {len(clusters)}")
-
         for cluster in clusters:
             if self.view.rb_dual.isChecked() and ref_path:
                 has_a = False
@@ -678,13 +667,11 @@ class MainController(QObject):
                 for it in cluster:
                     try:
                         item_path = os.path.normpath(os.path.abspath(it['path']))
-                        # Проверяем, находится ли файл внутри ref_path
                         if os.path.commonpath([ref_path, item_path]) == ref_path:
                             has_a = True
                         else:
                             has_b = True
                     except Exception as e:
-                        auditor.warning(f"Path comparison failed for {it['path']}: {e}")
                         has_b = True 
                 
                 if not (has_a and has_b):
@@ -693,9 +680,6 @@ class MainController(QObject):
             valid_clusters.append(cluster)
             for it in cluster:
                 dirs_to_watch.add(str(Path(it['path']).parent))
-
-        if self.view.rb_dual.isChecked():
-            auditor.info(f"Total clusters after filtering: {len(valid_clusters)}")
 
         self.fs_service.update_watch_paths(dirs_to_watch)
         self.view.model.itemChanged.disconnect(self.selection_controller.on_item_changed)
@@ -719,7 +703,6 @@ class MainController(QObject):
         self._update_statistics_panel()
         self._set_status("status_done")
         QApplication.restoreOverrideCursor()
-        self.view._switch_tab(1)
 
     def _prune_dead_nodes(self, processed_paths):
         paths_set = set(processed_paths) if isinstance(processed_paths, (list, set)) else {processed_paths}

@@ -5,13 +5,12 @@ import os
 from pathlib import Path
 
 from PySide6.QtWidgets import QTreeView, QAbstractItemView
-from PySide6.QtCore import Qt, QUrl, QMimeData, QModelIndex, QTimer, QAbstractItemModel, Signal
+from PySide6.QtCore import Qt, QUrl, QMimeData, QModelIndex, QTimer, QAbstractItemModel, Signal, QSortFilterProxyModel
 from PySide6.QtGui import QDrag, QColor
 
 from utils.i18n import translator
 
 class TreeItem:
-    """ Масштабируемый узел графа. __slots__ блокирует создание __dict__, экономя 65% RAM. """
     __slots__ = ('parentItem', 'itemData', 'childItems', 'is_cluster', 'raw_dict', 'check_state')
 
     def __init__(self, data: list, parent=None, is_cluster=False, raw_dict=None):
@@ -206,8 +205,6 @@ class LazyClusterModel(QAbstractItemModel):
             return None
             
         elif role == Qt.ForegroundRole:
-            # В светлой теме синий текст эталона может быть плохо виден, 
-            # но мы оставляем его для акцента, если он не мешает.
             if not item.is_cluster and item.raw_dict.get('is_ref', False):
                 return QColor("#5865F2")
             return None
@@ -289,6 +286,59 @@ class LazyClusterModel(QAbstractItemModel):
         if index.isValid():
             return index.internalPointer()
         return None
+
+
+# ============================================================
+# КРИТИЧЕСКИЙ ПАТЧ: Рекурсивная фильтрация для групп
+# ============================================================
+class MediaProxyModel(QSortFilterProxyModel):
+    """Обеспечивает сквозную фильтрацию: если искомое слово есть в дочернем файле, группа остается видимой."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._filter_mode = 0
+        self._filter_text = ""
+
+    def set_filters(self, mode: int, text: str):
+        self._filter_mode = mode
+        self._filter_text = text.lower()
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        if not source_parent.isValid():
+            # Это узел группы (Кластер)
+            # 1. Проверяем, совпадает ли само имя кластера
+            if self._matches_filter(source_row, source_parent):
+                return True
+                
+            # 2. Если имя кластера не совпадает, проверяем детей внутри
+            source_model = self.sourceModel()
+            idx = source_model.index(source_row, 0, source_parent)
+            for i in range(source_model.rowCount(idx)):
+                if self._matches_filter(i, idx):
+                    return True
+            return False
+        else:
+            # Это узел файла
+            return self._matches_filter(source_row, source_parent)
+
+    def _matches_filter(self, source_row, source_parent):
+        source_model = self.sourceModel()
+        idx = source_model.index(source_row, 0, source_parent)
+        item = source_model.itemFromIndex(idx)
+        
+        if not item: return False
+
+        if self._filter_text:
+            text = str(item.data(0)).lower()
+            if self._filter_text not in text:
+                return False
+
+        if self._filter_mode == 1: 
+            return item.checkState() == Qt.CheckState.Checked
+        elif self._filter_mode == 2: 
+            return item.checkState() == Qt.CheckState.Unchecked
+
+        return True
 
 
 class MediaTreeView(QTreeView):

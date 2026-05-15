@@ -93,7 +93,11 @@ class FaissManager:
             np.save(dist_file, distances)
             np.save(keys_file, keys)
 
+        # КРИТИЧЕСКИЙ ПАТЧ: Экспоненциальная калибровка для FaceNet
         sim_threshold = 1.0 - threshold
+        if mode == "faces":
+            sim_threshold = max(0.20, 0.85 - (threshold * 3.0))
+
         seq_exts = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
         doc_exts = {".cbz", ".pdf", ".gif"}
         adj = {i: [] for i in range(len(valid_file_data))}
@@ -111,14 +115,15 @@ class FaissManager:
                 sim = float(distances[i][j])
                 ext_j = Path(valid_file_data[n_idx]["path"]).suffix.lower()
 
-                if is_seq_i and ext_j in seq_exts:
-                    sim = 1.0 - (1.0 - sim) * 1.45
-                
-                if is_doc_i and ext_j in doc_exts:
-                    local_threshold = max(0.70, sim_threshold - 0.05)
-                    if sim >= local_threshold:
-                        adj[i].append((n_idx, sim))
-                    continue
+                if mode != "faces":
+                    if is_seq_i and ext_j in seq_exts:
+                        sim = 1.0 - (1.0 - sim) * 1.45
+                    
+                    if is_doc_i and ext_j in doc_exts:
+                        local_threshold = max(0.70, sim_threshold - 0.05)
+                        if sim >= local_threshold:
+                            adj[i].append((n_idx, sim))
+                        continue
 
                 if sim >= sim_threshold:
                     adj[i].append((n_idx, sim))
