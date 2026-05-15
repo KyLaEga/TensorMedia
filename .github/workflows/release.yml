@@ -23,14 +23,13 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
-    # Включаем поддержку длинных путей для Windows (предотвращает ошибки сборки PyInstaller)
     - name: Enable Long Paths on Windows
       if: matrix.os == 'windows-latest'
       run: git config --system core.longpaths true
     
     - uses: actions/setup-python@v5
       with:
-        python-version: '3.12.13'
+        python-version: '3.12' # Исправлено: гибкая версия для предотвращения ошибки отсутствия патча
         cache: 'pip'
     
     - name: Install System Dependencies (Linux)
@@ -90,7 +89,21 @@ jobs:
         cd dist
         tar -czvf TensorMedia-Linux-x86_64.tar.gz TensorMedia/
 
+    # Сохранение артефактов для ручного запуска (workflow_dispatch)
+    - name: Upload Artifacts (Manual Run)
+      if: startsWith(github.ref, 'refs/tags/') == false
+      uses: actions/upload-artifact@v4
+      with:
+        name: TensorMedia-${{ matrix.artifact_name }}
+        path: |
+          dist/TensorMedia_Setup.exe
+          dist/TensorMedia-macOS.dmg
+          dist/TensorMedia-Linux-x86_64.tar.gz
+        retention-days: 5
+
+    # Создание релиза ТОЛЬКО при пуше тега (v*)
     - name: Upload to Release
+      if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
       with:
         files: |
