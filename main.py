@@ -1,7 +1,6 @@
 import sys
 import os
 
-# ИЗОЛЯЦИЯ I/O: Блокирует падение без терминала
 if sys.stdout is None:
     sys.stdout = open(os.devnull, 'w')
 if sys.stderr is None:
@@ -75,7 +74,6 @@ class ApplicationBootstrap:
             window = MainWindow()
             controller = MainController(window) 
             
-            # Guarantee teardown is invoked on ANY app shutdown path
             if cls.orchestrator:
                 window.window_closed.connect(cls.orchestrator.stop_all)
                 app.aboutToQuit.connect(cls.orchestrator.stop_all)
@@ -88,6 +86,9 @@ class ApplicationBootstrap:
             sys.exit(1)
 
 if __name__ == "__main__":
-    import multiprocessing
     multiprocessing.freeze_support()
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
     ApplicationBootstrap.execute()

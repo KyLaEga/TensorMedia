@@ -11,8 +11,7 @@ datas = [
     ('models', 'models'),
 ]
 
-# Исключаем полные бинарники PyTorch, полагаясь на анализ импортов, 
-# собираем только необходимые конфигурации transformers и facenet.
+# Сбор только необходимых конфигураций для инференса
 datas += collect_data_files('transformers')
 datas += collect_data_files('facenet_pytorch')
 
@@ -22,6 +21,7 @@ hiddenimports = [
     'PySide6.QtWidgets',
     'PySide6.QtMultimedia',
     'PySide6.QtMultimediaWidgets',
+    'shiboken6',  # ИНЪЕКЦИЯ: Критически важно для инициализации PySide6 на Windows
     'torch',
     'numpy',
     'cv2',
@@ -37,8 +37,6 @@ hiddenimports = [
 
 excludes = [
     'tkinter',
-    'unittest',
-    'pytest',
     'matplotlib',
     'notebook',
     'jupyter',
@@ -71,12 +69,11 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,  # ИСПРАВЛЕНИЕ: Отключение сжатия для предотвращения порчи Qt6 DLL
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
-    # КРИТИЧНО для macOS ARM64 (Apple Silicon): '-' означает Ad-Hoc подпись
     codesign_identity='-' if sys.platform == 'darwin' else None,
     entitlements_file='entitlements.plist' if sys.platform == 'darwin' else None,
     icon='assets/icons/app.ico' if os.path.exists('assets/icons/app.ico') else None,
@@ -88,7 +85,7 @@ coll = COLLECT(
     a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,  # ИСПРАВЛЕНИЕ: Отключение сжатия для предотвращения порчи Qt6 DLL
     upx_exclude=[],
     name='TensorMedia',
 )
