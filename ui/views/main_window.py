@@ -24,16 +24,13 @@ from ui.components.video_player import BuiltInVideoPlayer, JumpSlider
 from ui.components.media_tree import MediaTreeView, LazyClusterModel
 from ui.components.image_label import ScalableImageLabel
 
-
 class ArbitrageSortFilterProxyModel(QSortFilterProxyModel):
-    """ Аппаратный прокси-слой для математически точной сортировки и скрытия узлов """
     def __init__(self, parent=None):
         super().__init__(parent)
         self.filter_type = 0 
         self.search_text = ""
 
     def set_filters(self, f_type: int, text: str):
-        # БЛОКИРОВКА холостой инвалидации кэша. Защищает QTreeView от сброса стейта при удалении узлов.
         text_lower = text.lower()
         if self.filter_type == f_type and self.search_text == text_lower:
             return
@@ -45,11 +42,9 @@ class ArbitrageSortFilterProxyModel(QSortFilterProxyModel):
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
         model = self.sourceModel()
         
-        # Если это узел 1 уровня (Группа/Кластер)
         if not source_parent.isValid():
             group_index = model.index(source_row, 0, source_parent)
             
-            # 1. Сначала проверяем совпадение текста с названием самой группы
             if self.search_text:
                 group_item = model.itemFromIndex(group_index)
                 if group_item:
@@ -57,13 +52,11 @@ class ArbitrageSortFilterProxyModel(QSortFilterProxyModel):
                     if self.search_text in group_text:
                         return True
 
-            # 2. Если группа не совпала или поиска нет, проверяем совпадение среди дочерних элементов
             for i in range(model.rowCount(group_index)):
                 if self.filterAcceptsRow(i, group_index):
                     return True
             return False
 
-        # Если это узел 2 уровня (Файл)
         index = model.index(source_row, 0, source_parent)
         data = model.data(index, Qt.ItemDataRole.UserRole)
         
@@ -202,12 +195,12 @@ class MainWindow(QMainWindow):
         top_bar.setSpacing(8)
         
         self.combo_theme = QComboBox()
-        self.combo_theme.addItems(["🌙 Dark", "☀️ Light", "💻 Sys"])
+        self.combo_theme.addItems(["Dark", "Light", "System"])
         self.combo_theme.setFixedHeight(34) 
         self.combo_theme.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         
         self.combo_lang = QComboBox()
-        self.combo_lang.addItems(["🇬🇧 EN", "🇷🇺 RU"])
+        self.combo_lang.addItems(["EN", "RU"])
         
         self.combo_lang.blockSignals(True)
         self.combo_lang.setCurrentIndex(0 if translator.current_lang == "en" else 1)
@@ -742,7 +735,7 @@ class MainWindow(QMainWindow):
         self.multi_sync_slider.setRange(0, 100)
         self.multi_sync_slider.setValue(25)
         self.multi_sync_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        ms_layout.addWidget(QLabel("🎥"))
+        ms_layout.addWidget(QLabel("[Sync]"))
         ms_layout.addWidget(self.multi_sync_slider)
         multi_layout.addWidget(self.multi_slider_panel)
         self.multi_slider_panel.hide()
@@ -910,7 +903,7 @@ class MainWindow(QMainWindow):
         lang = getattr(translator, 'current_lang', 'en')
         is_ru = (lang == 'ru')
 
-        self.btn_toggle_db.setText("📦 Управление ядром данных" if is_ru else "📦 Data Core Management")
+        self.btn_toggle_db.setText("Управление ядром данных" if is_ru else "Data Core Management")
         self.lbl_db_info.setText(
             "Очистка матриц FAISS и SQLite-векторов. Потребуется полный рескан файлов." if is_ru 
             else "Clears FAISS matrices and SQLite vectors. Requires full rescan."
@@ -978,7 +971,7 @@ class MainWindow(QMainWindow):
             h, m = divmod(m, 60)
             sub_s = int((elapsed_seconds - int(elapsed_seconds)) * 10)
             time_str = f"{h:02d}:{m:02d}:{s:02d}.{sub_s}"
-            self.lbl_telemetry.setText(f"⏱ {time_str} | 🧠 {ram_mb:.1f} MB")
+            self.lbl_telemetry.setText(f"[ {time_str} | {ram_mb:.1f} MB ]")
         except Exception as e:
             auditor.warning(f"HUD format error: {e}")
 

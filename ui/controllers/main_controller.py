@@ -1,3 +1,6 @@
+# ============================================================
+# MODULE: ui/controllers/main_controller.py
+# ============================================================
 import os
 import shutil
 import subprocess
@@ -323,17 +326,17 @@ class MainController(QObject):
             
         self.view.leg_img_title.setText(translator.tr('chk_img'))
         self.view.leg_img_pct.setText(f"{int(p_img)}%")
-        self.view.leg_img_dup.setText(f"📦 {img_stat[2]}")
+        self.view.leg_img_dup.setText(f"+ {img_stat[2]}")
         self.view.leg_img_sz.setText(f"{img_stat[1] / (1024*1024):.1f} MB")
 
         self.view.leg_vid_title.setText(translator.tr('chk_vid'))
         self.view.leg_vid_pct.setText(f"{int(p_vid)}%")
-        self.view.leg_vid_dup.setText(f"📦 {vid_stat[2]}")
+        self.view.leg_vid_dup.setText(f"+ {vid_stat[2]}")
         self.view.leg_vid_sz.setText(f"{vid_stat[1] / (1024*1024):.1f} MB")
 
         self.view.leg_doc_title.setText(translator.tr('chk_doc'))
         self.view.leg_doc_pct.setText(f"{int(p_doc)}%")
-        self.view.leg_doc_dup.setText(f"📦 {doc_stat[2]}")
+        self.view.leg_doc_dup.setText(f"+ {doc_stat[2]}")
         self.view.leg_doc_sz.setText(f"{doc_stat[1] / (1024*1024):.1f} MB")
         
         pcs = "шт." if translator.current_lang == "ru" else "pcs"

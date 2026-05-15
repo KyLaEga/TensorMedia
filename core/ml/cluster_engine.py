@@ -12,7 +12,6 @@ import psutil
 from PIL import Image
 from pathlib import Path
 from multiprocessing import Pool, Value, shared_memory
-import concurrent.futures
 
 cv2.setNumThreads(0)
 
@@ -80,8 +79,6 @@ def process_single_file_io(task_data: tuple) -> dict:
     shm_blocks = [] 
     ext = file_path.suffix.lower()
 
-    target_size = (512, 512) if scan_mode == "faces" else (224, 224)
-
     def _allocate_shm(img_obj):
         arr = np.array(img_obj)
         try:
@@ -111,58 +108,44 @@ def process_single_file_io(task_data: tuple) -> dict:
             if _scan_io_cancelled():
                 return _cancelled_io_result(file_path, size, mtime, file_hash, vector)
             
-            cap = None
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(cv2.VideoCapture, str(file_path), cv2.CAP_AVFOUNDATION, [cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY])
+            # КРИТИЧЕСКИЙ ПАТЧ: Синхронное открытие видео предотвращает Deadlock на Windows
+            cap = cv2.VideoCapture(str(file_path))
+            
+            if cap is not None and cap.isOpened():
                 try:
-                    cap = future.result(timeout=5.0)
-                    if not cap or not cap.isOpened():
-                        if cap: cap.release()
-                        future_fb = executor.submit(cv2.VideoCapture, str(file_path))
-                        cap = future_fb.result(timeout=5.0)
-                except concurrent.futures.TimeoutError:
-                    auditor.error(f"Watchdog: VideoCapture timeout for {file_path}")
-                    cap = None
-                except Exception as e:
-                    auditor.warning(f"Failed to open video {file_path}: {e}")
-                    cap = None
+                    res = f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}"
+                    fps_val = float(cap.get(cv2.CAP_PROP_FPS))
+                    total_frames = float(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    if fps_val > 0: dur = float(total_frames / fps_val)
+                    fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+                    codec = "".join([chr((fourcc >> 8 * i) & 0xFF) for i in range(4)]).strip().lower()
+                    
+                    check_points = [0.20, 0.40, 0.60, 0.80]
+                    max_sharp = 0.0
+                    for cp in check_points:
+                        if _scan_io_cancelled():
+                            break
+                        target = int(total_frames * cp) if total_frames > 0 else 0
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+                        ret, frame = cap.read()
+                        if ret and frame.mean() > 15.0:
+                            if vector is None:
+                                img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                                # КРИТИЧЕСКИЙ ПАТЧ ПРОПОРЦИЙ
+                                if scan_mode == "faces":
+                                    img_pil.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
+                                else:
+                                    img_pil = img_pil.resize((224, 224), Image.Resampling.BICUBIC)
+                                _allocate_shm(img_pil)
 
-            if cap is not None:
-                try:
-                    if cap.isOpened():
-                        res = f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}"
-                        fps_val = float(cap.get(cv2.CAP_PROP_FPS))
-                        total_frames = float(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                        if fps_val > 0: dur = float(total_frames / fps_val)
-                        fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
-                        codec = "".join([chr((fourcc >> 8 * i) & 0xFF) for i in range(4)]).strip().lower()
-                        
-                        check_points = [0.20, 0.40, 0.60, 0.80]
-                        max_sharp = 0.0
-                        for cp in check_points:
-                            if _scan_io_cancelled():
-                                break
-                            target = int(total_frames * cp) if total_frames > 0 else 0
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-                            ret, frame = cap.read()
-                            if ret and frame.mean() > 15.0:
-                                if vector is None:
-                                    h_fr, w_fr = frame.shape[:2]
-                                    scale_fr = min(target_size[0]/w_fr, target_size[1]/h_fr)
-                                    if scale_fr < 1.0:
-                                        frame_res = cv2.resize(frame, (int(w_fr * scale_fr), int(h_fr * scale_fr)), interpolation=cv2.INTER_AREA)
-                                    else:
-                                        frame_res = frame
-                                    _allocate_shm(cv2.cvtColor(frame_res, cv2.COLOR_BGR2RGB))
-
-                                h, w = frame.shape[:2]
-                                if max(w, h) > 256:
-                                    scale = 256.0 / max(w, h)
-                                    frame_sm = cv2.resize(frame, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-                                else: frame_sm = frame
-                                sharp = calculate_optical_sharpness(cv2.cvtColor(frame_sm, cv2.COLOR_BGR2GRAY))
-                                if sharp > max_sharp: max_sharp = sharp
-                        sharpness = float(max_sharp)
+                            h, w = frame.shape[:2]
+                            if max(w, h) > 256:
+                                scale = 256.0 / max(w, h)
+                                frame_sm = cv2.resize(frame, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                            else: frame_sm = frame
+                            sharp = calculate_optical_sharpness(cv2.cvtColor(frame_sm, cv2.COLOR_BGR2GRAY))
+                            if sharp > max_sharp: max_sharp = sharp
+                    sharpness = float(max_sharp)
                 finally:
                     cap.release()
                 
@@ -172,7 +155,14 @@ def process_single_file_io(task_data: tuple) -> dict:
             with Image.open(file_path) as img: 
                 res = f"{img.width}x{img.height}"
                 if vector is None: 
-                    _allocate_shm(img.convert("RGB").resize(target_size, Image.Resampling.BICUBIC))
+                    img_rgb = img.convert("RGB")
+                    # КРИТИЧЕСКИЙ ПАТЧ ПРОПОРЦИЙ: MTCNN не видит лица на сплюснутых квадратах
+                    if scan_mode == "faces":
+                        img_rgb.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
+                        _allocate_shm(img_rgb)
+                    else:
+                        _allocate_shm(img_rgb.resize((224, 224), Image.Resampling.BICUBIC))
+                
                 img.thumbnail((256, 256))
                 sharpness = calculate_optical_sharpness(np.array(img.convert('L')))
         
@@ -193,7 +183,12 @@ def process_single_file_io(task_data: tuple) -> dict:
                             frame_pil = img.convert("RGB")
                             if not res: res = f"{frame_pil.width}x{frame_pil.height}"
                             if vector is None: 
-                                _allocate_shm(frame_pil.resize(target_size, Image.Resampling.BICUBIC))
+                                if scan_mode == "faces":
+                                    frame_pil.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
+                                    _allocate_shm(frame_pil)
+                                else:
+                                    _allocate_shm(frame_pil.resize((224, 224), Image.Resampling.BICUBIC))
+                                    
                             frame_pil.thumbnail((256, 256))
                             sharp = calculate_optical_sharpness(np.array(frame_pil.convert('L')))
                             if sharp > max_sharp: max_sharp = sharp
@@ -202,7 +197,11 @@ def process_single_file_io(task_data: tuple) -> dict:
                         frame_pil = img.convert("RGB")
                         res = f"{frame_pil.width}x{frame_pil.height}"
                         if vector is None: 
-                            _allocate_shm(frame_pil.resize(target_size, Image.Resampling.BICUBIC))
+                            if scan_mode == "faces":
+                                frame_pil.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
+                                _allocate_shm(frame_pil)
+                            else:
+                                _allocate_shm(frame_pil.resize((224, 224), Image.Resampling.BICUBIC))
                         frame_pil.thumbnail((256, 256))
                         sharpness = calculate_optical_sharpness(np.array(frame_pil.convert('L')))
             except Exception as e: 
@@ -235,7 +234,11 @@ def process_single_file_io(task_data: tuple) -> dict:
                                 sharp = calculate_optical_sharpness(np.array(img_thumb.convert('L')))
                                 if sharp > max_sharp: 
                                     max_sharp = sharp
-                                    best_img_for_model = img_rgb.resize(target_size, Image.Resampling.BICUBIC)
+                                    if scan_mode == "faces":
+                                        img_rgb.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
+                                        best_img_for_model = img_rgb
+                                    else:
+                                        best_img_for_model = img_rgb.resize((224, 224), Image.Resampling.BICUBIC)
                     
                     if best_img_for_model and vector is None:
                         _allocate_shm(best_img_for_model)
@@ -269,7 +272,11 @@ def process_single_file_io(task_data: tuple) -> dict:
                             sharp = calculate_optical_sharpness(np.array(img_thumb.convert('L')))
                             if sharp > max_sharp: 
                                 max_sharp = sharp
-                                best_img_for_model = img.resize(target_size, Image.Resampling.BICUBIC)
+                                if scan_mode == "faces":
+                                    img.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
+                                    best_img_for_model = img
+                                else:
+                                    best_img_for_model = img.resize((224, 224), Image.Resampling.BICUBIC)
                     
                     if best_img_for_model and vector is None:
                         _allocate_shm(best_img_for_model)
@@ -669,7 +676,6 @@ class SmartClusterEngine:
                         valid_vecs = [v for v in file_vecs if v is not None]
                         if valid_vecs:
                             avg_vec = np.mean(valid_vecs, axis=0)
-                            # КРИТИЧЕСКИЙ ПАТЧ: Защита от деления на ноль для предотвращения NaN в FAISS
                             norm = np.linalg.norm(avg_vec)
                             if norm > 1e-8:
                                 b['vector'] = avg_vec / norm

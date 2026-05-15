@@ -63,16 +63,16 @@ class BuiltInVideoPlayer(QWidget):
         cp_layout.setContentsMargins(10, 0, 10, 0)
         cp_layout.setSpacing(10)
         
-        self.btn_play = QPushButton("⏸️")
+        self.btn_play = QPushButton("Play")
         self.btn_play.setObjectName("player_btn")
-        self.btn_play.setFixedWidth(30)
+        self.btn_play.setFixedWidth(50)
         self.btn_play.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_play.clicked.connect(self._toggle_play)
         cp_layout.addWidget(self.btn_play)
         
-        self.btn_mute = QPushButton("🔊")
+        self.btn_mute = QPushButton("Vol")
         self.btn_mute.setObjectName("player_btn")
-        self.btn_mute.setFixedWidth(30)
+        self.btn_mute.setFixedWidth(40)
         self.btn_mute.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_mute.clicked.connect(self._toggle_mute)
         cp_layout.addWidget(self.btn_mute)
@@ -102,7 +102,7 @@ class BuiltInVideoPlayer(QWidget):
         self.combo_speed.currentTextChanged.connect(self._change_speed)
         cp_layout.addWidget(self.combo_speed)
         
-        self.chk_autoplay = QCheckBox("Автоплей")
+        self.chk_autoplay = QCheckBox("Autoplay")
         self.chk_autoplay.setChecked(True)
         self.chk_autoplay.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         cp_layout.addWidget(self.chk_autoplay)
@@ -112,7 +112,6 @@ class BuiltInVideoPlayer(QWidget):
     def load_video(self, path: str):
         self.stop()
         
-        # Защита от сбоев загрузки
         if not os.path.exists(path):
             from utils.logger import auditor
             auditor.error(f"Video file missing: {path}")
@@ -123,41 +122,36 @@ class BuiltInVideoPlayer(QWidget):
         if self.chk_autoplay.isChecked():
             self._pending_seek = False
             self.player.play()
-            self.btn_play.setText("⏸️")
+            self.btn_play.setText("Pause")
         else:
             self._pending_seek = True
-            self.btn_play.setText("▶️")
-            # КРИТИЧЕСКИЙ ПАТЧ: Отложенная пауза. AVFoundation падает, 
-            # если сделать pause() до того как видео загрузится в память.
+            self.btn_play.setText("Play")
             QTimer.singleShot(100, self.player.pause)
 
     def stop(self):
-        # КРИТИЧЕСКИЙ ПАТЧ: На macOS вызов self.player.setSource(QUrl()) 
-        # (очистка источника) вызывает фатальный SegFault в AVFoundation.
-        # Теперь мы только останавливаем воспроизведение.
         if self.player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
             self.player.stop()
 
     def _toggle_play(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
-            self.btn_play.setText("▶️")
+            self.btn_play.setText("Play")
         else:
             self.player.play()
-            self.btn_play.setText("⏸️")
+            self.btn_play.setText("Pause")
 
     def _toggle_mute(self):
         is_muted = not self.audio_output.isMuted()
         self.audio_output.setMuted(is_muted)
-        self.btn_mute.setText("🔇" if is_muted else "🔊")
+        self.btn_mute.setText("Mute" if is_muted else "Vol")
 
     def _change_volume(self, value):
         self.audio_output.setVolume(value / 100.0)
         if value == 0:
-            self.btn_mute.setText("🔇")
+            self.btn_mute.setText("Mute")
         elif self.audio_output.isMuted():
             self.audio_output.setMuted(False)
-            self.btn_mute.setText("🔊")
+            self.btn_mute.setText("Vol")
             
     def _change_speed(self, text):
         speed = float(text.replace('x', ''))
