@@ -288,11 +288,7 @@ class LazyClusterModel(QAbstractItemModel):
         return None
 
 
-# ============================================================
-# КРИТИЧЕСКИЙ ПАТЧ: Рекурсивная фильтрация для групп
-# ============================================================
 class MediaProxyModel(QSortFilterProxyModel):
-    """Обеспечивает сквозную фильтрацию: если искомое слово есть в дочернем файле, группа остается видимой."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self._filter_mode = 0
@@ -305,12 +301,9 @@ class MediaProxyModel(QSortFilterProxyModel):
 
     def filterAcceptsRow(self, source_row, source_parent):
         if not source_parent.isValid():
-            # Это узел группы (Кластер)
-            # 1. Проверяем, совпадает ли само имя кластера
             if self._matches_filter(source_row, source_parent):
                 return True
                 
-            # 2. Если имя кластера не совпадает, проверяем детей внутри
             source_model = self.sourceModel()
             idx = source_model.index(source_row, 0, source_parent)
             for i in range(source_model.rowCount(idx)):
@@ -318,7 +311,6 @@ class MediaProxyModel(QSortFilterProxyModel):
                     return True
             return False
         else:
-            # Это узел файла
             return self._matches_filter(source_row, source_parent)
 
     def _matches_filter(self, source_row, source_parent):
@@ -359,6 +351,15 @@ class MediaTreeView(QTreeView):
         window = self.window()
         if hasattr(window, '_retranslate_ui'):
             window._retranslate_ui()
+
+    # КРИТИЧЕСКИЙ ПАТЧ: Делегирование клавиш глобальным хукам (Hotkeys)
+    # Защищает от случайного срабатывания навигации дерева.
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+            event.ignore()
+            return
+        super().keyPressEvent(event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

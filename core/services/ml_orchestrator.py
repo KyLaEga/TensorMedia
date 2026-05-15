@@ -1,6 +1,7 @@
 import time
 import psutil
 import multiprocessing
+import threading
 from PySide6.QtCore import QObject, QTimer
 from core.events import bus
 from core.ml.cluster_engine import SmartClusterEngine
@@ -54,6 +55,11 @@ class MLOrchestrator(QObject):
         })
 
     def _handle_warmup(self):
+        if self.warmup_worker is not None:
+            if self.warmup_worker.isRunning(): return
+            self.warmup_worker.deleteLater()
+            self.warmup_worker = None
+
         auditor.info("Initiating NPU Engine Warmup sequence...")
         self.warmup_worker = EngineWarmupWorker()
         self.warmup_worker.engine_ready.connect(self._on_engine_ready)
@@ -66,6 +72,8 @@ class MLOrchestrator(QObject):
         auditor.info("NPU Engine Warmup complete. Bus event emitted.")
         bus.evt_engine_ready.emit(engine)
         
+        if self.maintenance_worker is not None:
+            self.maintenance_worker.deleteLater()
         self.maintenance_worker = MaintenanceWorker()
         self.maintenance_worker.start()
 
@@ -79,9 +87,16 @@ class MLOrchestrator(QObject):
             
         self.t_start = time.time()
         
-        if self.engine is None or (self.scanner and self.scanner.isRunning()):
-            auditor.warning("Scan rejected: Engine not ready or scanner already running.")
+        if self.engine is None:
+            auditor.warning("Scan rejected: Engine not ready.")
             return
+
+        if self.scanner is not None:
+            if self.scanner.isRunning():
+                auditor.warning("Scan rejected: Scanner already running.")
+                return
+            self.scanner.deleteLater()
+            self.scanner = None
             
         auditor.info(f"Starting Scan Matrix [Mode: {mode} | Dirs: {dirs}]")
         self.scanner = ScannerBridge(self.engine, dirs, exts, mode)
@@ -111,11 +126,10 @@ class MLOrchestrator(QObject):
         self._reset_idle_timer()
         if self.scanner and self.scanner.isRunning():
             auditor.warning("Stopping active scanner thread...")
-            self.scanner.stop()
-            self.scanner.wait(2000)
-            if self.scanner.isRunning():
-                self.scanner.terminate()
-                self.scanner.wait()
+            if hasattr(self.scanner, "stop"):
+                self.scanner.stop()
+            self.scanner.requestInterruption()
+            self.scanner.quit()
         
         if self.engine:
             self.engine.request_scan_abort()
@@ -127,8 +141,13 @@ class MLOrchestrator(QObject):
             
         self.t_start = time.time()
         
-        if self.cluster_worker and self.cluster_worker.isRunning(): 
-            return
+        # КРИТИЧЕСКИЙ ПАТЧ: Безопасное удаление старого воркера перед созданием нового
+        if self.cluster_worker is not None:
+            if self.cluster_worker.isRunning(): 
+                return # Игнорируем спам ползунком, пока идет расчет
+            self.cluster_worker.deleteLater()
+            self.cluster_worker = None
+
         if not self.engine or not getattr(self.engine, 'current_file_data', []): 
             bus.evt_clustering_completed.emit([])
             self._reset_idle_timer()
@@ -156,59 +175,42 @@ class MLOrchestrator(QObject):
         if self._stop_all_called:
             return
         self._stop_all_called = True
-        auditor.info("Tearing down ML Orchestrator and terminating active threads...")
+        auditor.info("Tearing down ML Orchestrator asynchronously...")
+        
         self.idle_timer.stop()
-        if self.scanner and hasattr(self.scanner, "stop"):
-            try:
-                self.scanner.stop()
-            except Exception as e:
-                auditor.warning(f"ScannerBridge.stop failed: {e}")
         if self.engine:
             self.engine.request_scan_abort()
 
-        def _stop_qthread(t, name: str, timeout_ms: int = 5000):
+        def _soft_stop_qthread(t, name: str):
             if not t:
                 return
             try:
+                if hasattr(t, "stop"):
+                    t.stop()
                 if hasattr(t, "requestInterruption"):
                     t.requestInterruption()
                 if hasattr(t, "quit"):
                     t.quit()
-                if hasattr(t, "isRunning") and t.isRunning():
-                    if not t.wait(timeout_ms):
-                        auditor.warning(f"{name} did not stop in {timeout_ms}ms. Forcing terminate().")
-                        try:
-                            t.terminate()
-                        except Exception as e:
-                            auditor.error(f"Failed to terminate {name}: {e}")
-                        t.wait(2000)
+                QTimer.singleShot(3000, lambda: auditor.warning(f"Thread {name} timeout") if t.isRunning() else None)
             except Exception as e:
                 auditor.error(f"Failed stopping {name}: {e}")
 
-        _stop_qthread(self.scanner, "ScannerBridge", timeout_ms=8000)
-        _stop_qthread(self.cluster_worker, "ClusterWorker", timeout_ms=5000)
-        _stop_qthread(self.warmup_worker, "EngineWarmupWorker", timeout_ms=5000)
-        _stop_qthread(self.maintenance_worker, "MaintenanceWorker", timeout_ms=5000)
+        _soft_stop_qthread(self.scanner, "ScannerBridge")
+        _soft_stop_qthread(self.cluster_worker, "ClusterWorker")
+        _soft_stop_qthread(self.warmup_worker, "EngineWarmupWorker")
+        _soft_stop_qthread(self.maintenance_worker, "MaintenanceWorker")
 
-        try:
-            children = multiprocessing.active_children()
-            if children:
-                auditor.warning(f"Terminating {len(children)} active child process(es).")
-            for p in children:
-                try:
-                    p.terminate()
-                except Exception:
-                    pass
-            for p in children:
-                try:
-                    p.join(timeout=2.0)
-                except Exception:
-                    pass
-            for p in children:
-                try:
-                    if p.is_alive() and hasattr(p, "kill"):
-                        p.kill()
-                except Exception:
-                    pass
-        except Exception as e:
-            auditor.error(f"Failed to terminate child processes: {e}")
+        def _kill_children():
+            try:
+                children = multiprocessing.active_children()
+                if children:
+                    auditor.warning(f"Terminating {len(children)} active child process(es).")
+                for p in children:
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+            except Exception as e:
+                auditor.error(f"Failed to terminate child processes: {e}")
+                
+        threading.Thread(target=_kill_children, daemon=True).start()

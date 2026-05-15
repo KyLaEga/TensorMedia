@@ -1,5 +1,5 @@
 # ============================================================
-# MODULE: core/ml/faiss_manager.py — FAISS index, search, disk cache, clustering graph
+# MODULE: core/ml/faiss_manager.py
 # ============================================================
 import hashlib
 import os
@@ -11,7 +11,6 @@ import faiss
 import numpy as np
 
 from utils.env_config import get_data_dir
-
 
 class FaissManager:
     def __init__(self, scan_mode: str = "visual"):
@@ -51,8 +50,11 @@ class FaissManager:
 
         valid_file_data = []
         for item in file_data:
-            if item.get("vector") is not None and isinstance(item["vector"], np.ndarray):
-                valid_file_data.append(item)
+            vec = item.get("vector")
+            if vec is not None and isinstance(vec, np.ndarray):
+                # КРИТИЧЕСКИЙ ПАТЧ: Фильтрация NaN/Inf, которые ломают C++ SIMD циклы FAISS
+                if np.isfinite(vec).all():
+                    valid_file_data.append(item)
 
         if not valid_file_data or len(valid_file_data) < 2:
             return clusters
@@ -80,7 +82,10 @@ class FaissManager:
                 auditor.warning(f"Failed to load FAISS cache: {e}")
 
         if not cache_valid:
-            vectors = np.vstack([item["vector"] for item in valid_file_data]).astype(np.float32)
+            vectors_raw = np.vstack([item["vector"] for item in valid_file_data]).astype(np.float32)
+            # КРИТИЧЕСКИЙ ПАТЧ: Принудительное выделение непрерывного блока памяти (C-Contiguous)
+            vectors = np.ascontiguousarray(vectors_raw)
+            
             distances, keys = self.build_index_and_search(vectors, k)
 
             for old_file in cache_dir.glob(f"{mode}_*.npy"):
@@ -93,7 +98,6 @@ class FaissManager:
             np.save(dist_file, distances)
             np.save(keys_file, keys)
 
-        # КРИТИЧЕСКИЙ ПАТЧ: Экспоненциальная калибровка для FaceNet
         sim_threshold = 1.0 - threshold
         if mode == "faces":
             sim_threshold = max(0.20, 0.85 - (threshold * 3.0))

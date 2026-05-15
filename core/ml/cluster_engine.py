@@ -261,7 +261,7 @@ def process_single_file_io(task_data: tuple) -> dict:
                         page_num = int(total_pages * cp)
                         if page_num >= total_pages: page_num = total_pages - 1
                         page = doc.load_page(page_num)
-                        pix = page.get_pixmap(matrix=fitz.Matrix(0.5, 0.5))
+                        pix = page.get_pixmap(matrix=fitz.Matrix(0.5, 0.5), alpha=False)
                         with Image.frombytes("RGB", [pix.width, pix.height], pix.samples) as img:
                             if not res: res = f"{img.width}x{img.height}"
                             img_thumb = img.copy()
@@ -564,8 +564,7 @@ class SmartClusterEngine:
         vram_gb = 0
         if self.device.type == "cuda":
             try: vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            except Exception as e:
-                auditor.warning(f"Failed to get CUDA memory properties: {e}")
+            except Exception: pass
 
         chunk_size = 256
         batch_size = 64 if vram_gb >= 8 else 32
@@ -578,7 +577,17 @@ class SmartClusterEngine:
         
         cancel_flag = Value('i', 0)
         self._scan_cancel_flag = cancel_flag
+        
+        pool = None
         try:
+            pool = Pool(
+                processes=max_workers,
+                initializer=_scan_pool_init,
+                initargs=(cancel_flag,),
+                maxtasksperchild=64, 
+            )
+            self._io_pool = pool
+            
             for chunk_start in range(0, len(tasks), chunk_size):
                 if self.is_stopped: break
                 chunk_tasks = tasks[chunk_start : chunk_start + chunk_size]
@@ -586,15 +595,7 @@ class SmartClusterEngine:
                     continue
                 chunk_results = []
 
-                pool = None
                 try:
-                    pool = Pool(
-                        processes=max_workers,
-                        initializer=_scan_pool_init,
-                        initargs=(cancel_flag,),
-                        maxtasksperchild=16,
-                    )
-                    self._io_pool = pool
                     for res in pool.imap_unordered(process_single_file_io, chunk_tasks, chunksize=1):
                         while self.is_paused and not self.is_stopped:
                             time.sleep(0.1)
@@ -613,17 +614,6 @@ class SmartClusterEngine:
                         auditor.debug(f"Scan I/O pool iteration ended: {e}")
                     else:
                         auditor.error(f"Scan I/O pool error: {e}")
-                finally:
-                    self._io_pool = None
-                    if pool is not None:
-                        try:
-                            if self.is_stopped:
-                                pool.terminate()
-                            else:
-                                pool.close()
-                                pool.join()
-                        except Exception as ex:
-                            auditor.warning(f"I/O pool shutdown: {ex}")
 
                 if self.is_stopped:
                     for r in chunk_results:
@@ -679,7 +669,12 @@ class SmartClusterEngine:
                         valid_vecs = [v for v in file_vecs if v is not None]
                         if valid_vecs:
                             avg_vec = np.mean(valid_vecs, axis=0)
-                            b['vector'] = avg_vec / np.linalg.norm(avg_vec)
+                            # КРИТИЧЕСКИЙ ПАТЧ: Защита от деления на ноль для предотвращения NaN в FAISS
+                            norm = np.linalg.norm(avg_vec)
+                            if norm > 1e-8:
+                                b['vector'] = avg_vec / norm
+                            else:
+                                b['vector'] = None
                         else:
                             b['vector'] = None
 
@@ -701,6 +696,16 @@ class SmartClusterEngine:
                 all_results.extend(chunk_results)
         finally:
             self._scan_cancel_flag = None
+            self._io_pool = None
+            if pool is not None:
+                try:
+                    if self.is_stopped:
+                        pool.terminate()
+                    else:
+                        pool.close()
+                        pool.join()
+                except Exception as ex:
+                    auditor.warning(f"I/O pool shutdown: {ex}")
 
         if self.is_stopped: 
             return []

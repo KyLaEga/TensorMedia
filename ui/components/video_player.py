@@ -4,7 +4,7 @@
 import os
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QLabel, QComboBox, QCheckBox, QSlider, QSizePolicy)
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, QTimer
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 
@@ -111,20 +111,32 @@ class BuiltInVideoPlayer(QWidget):
 
     def load_video(self, path: str):
         self.stop()
+        
+        # Защита от сбоев загрузки
+        if not os.path.exists(path):
+            from utils.logger import auditor
+            auditor.error(f"Video file missing: {path}")
+            return
+            
         self.player.setSource(QUrl.fromLocalFile(os.path.abspath(path)))
+        
         if self.chk_autoplay.isChecked():
             self._pending_seek = False
             self.player.play()
             self.btn_play.setText("⏸️")
         else:
             self._pending_seek = True
-            self.player.pause()
             self.btn_play.setText("▶️")
+            # КРИТИЧЕСКИЙ ПАТЧ: Отложенная пауза. AVFoundation падает, 
+            # если сделать pause() до того как видео загрузится в память.
+            QTimer.singleShot(100, self.player.pause)
 
     def stop(self):
+        # КРИТИЧЕСКИЙ ПАТЧ: На macOS вызов self.player.setSource(QUrl()) 
+        # (очистка источника) вызывает фатальный SegFault в AVFoundation.
+        # Теперь мы только останавливаем воспроизведение.
         if self.player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
             self.player.stop()
-        self.player.setSource(QUrl())
 
     def _toggle_play(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:

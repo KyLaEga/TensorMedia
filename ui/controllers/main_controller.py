@@ -1,6 +1,3 @@
-# ============================================================
-# MODULE: ui/controllers/main_controller.py
-# ============================================================
 import os
 import shutil
 import subprocess
@@ -35,6 +32,7 @@ class MainController(QObject):
         self.engine_ready = False
         self.is_paused = False
         self.is_stopped_requested = False
+        self.engine = None
         
         self.current_status_key = "status_wait"
         self.current_status_args = []
@@ -86,8 +84,14 @@ class MainController(QObject):
         v.mode_btn_group.idClicked.connect(self._sync_radio_to_slider)
         v.slider_threshold.valueChanged.connect(self._on_slider_change)
         v.slider_threshold.sliderReleased.connect(self._trigger_recluster)
-        v.search_input.textChanged.connect(self._apply_view_filter)
+        
+        self.search_debounce_timer = QTimer(self)
+        self.search_debounce_timer.setSingleShot(True)
+        self.search_debounce_timer.setInterval(300)
+        self.search_debounce_timer.timeout.connect(self._apply_view_filter)
+        v.search_input.textChanged.connect(lambda: self.search_debounce_timer.start())
         v.combo_view_filter.currentIndexChanged.connect(self._apply_view_filter)
+        
         v.btn_auto_select.clicked.connect(self.selection_controller.apply_auto_selection)
         v.btn_clear_select.clicked.connect(self.selection_controller.clear_selection)
         v.btn_scan.clicked.connect(self._start_scan)
@@ -192,6 +196,7 @@ class MainController(QObject):
             self._check_ready()
             return
 
+        self.engine = engine
         self.engine_ready = True
         self._set_status("status_npu_ready")
         self._check_ready()
@@ -208,10 +213,10 @@ class MainController(QObject):
     def _on_window_closed(self):
         bus.cmd_stop_scan.emit() 
         if hasattr(self, 'video_worker') and self.video_worker.isRunning():
-            self.video_worker.stop()
+            if hasattr(self.video_worker, "stop"):
+                self.video_worker.stop()
             self.video_worker.requestInterruption()
             self.video_worker.quit()
-            self.video_worker.wait(2000)
         self.selection_controller.cleanup_workers()
 
     def _expand_all_safely(self):
@@ -493,11 +498,11 @@ class MainController(QObject):
             self._set_status("status_npu_ready")
             self.view.btn_scan.setEnabled(True)
             self.view.progress_bar.setValue(100)
-            from PySide6.QtWidgets import QApplication
+            from PySide6.QtWidgets import QApplication, QMessageBox
             QApplication.restoreOverrideCursor()
             
-            # КРИТИЧЕСКИЙ ПАТЧ: Предупреждение выводится только если в кэше реально есть файлы
-            if self.orchestrator.engine and len(getattr(self.orchestrator.engine, 'current_file_data', [])) > 0:
+            if hasattr(self, 'engine') and self.engine and len(getattr(self.engine, 'current_file_data', [])) > 0:
+                from utils.i18n import translator
                 title = "Сканирование завершено" if translator.current_lang == "ru" else "Scan Complete"
                 msg = "Дубликаты не найдены. Попробуйте снизить порог чувствительности (Ползунок %) или выбрать другие директории." if translator.current_lang == "ru" else "No duplicates found. Try lowering the matching threshold (%) or selecting different directories."
                 QMessageBox.information(self.view, title, msg)

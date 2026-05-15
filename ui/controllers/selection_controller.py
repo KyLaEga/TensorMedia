@@ -103,6 +103,10 @@ class SelectionController(QObject):
         self.main_controller._update_savings()
 
     def clear_selection(self):
+        # КРИТИЧЕСКИЙ ПАТЧ: Запрет сброса выбора при наборе текста в поиске
+        if getattr(self.view, 'search_input', None) and self.view.search_input.hasFocus():
+            return
+            
         proxy = self.view.proxy_model
         self.view.model.blockSignals(True)
         
@@ -236,6 +240,10 @@ class SelectionController(QObject):
             self.move_worker.start()
 
     def process_delete(self, default_hard=False):
+        # КРИТИЧЕСКИЙ ПАТЧ: Защита от случайного удаления при стирании текста в поиске кнопкой Backspace
+        if getattr(self.view, 'search_input', None) and self.view.search_input.hasFocus():
+            return
+            
         to_del = []
         proxy = self.view.proxy_model
         
@@ -291,6 +299,7 @@ class SelectionController(QObject):
     def cleanup_workers(self):
         for worker in [self.auto_worker, self.del_worker, self.move_worker]:
             if worker and worker.isRunning():
+                if hasattr(worker, "stop"):
+                    worker.stop()
                 worker.requestInterruption()
                 worker.quit()
-                worker.wait(2000)
