@@ -239,10 +239,33 @@ class ScalableImageLabel(QLabel):
             self._movie.setFileName("")
             try:
                 self._movie.frameChanged.disconnect(self.update)
-            except Exception:
+            except (RuntimeError, TypeError):
+                # Signal may not have been connected — benign, no log needed.
                 pass
             self._movie.deleteLater()
             self._movie = None
+
+    def _draw_centered(self, painter, pm):
+        # Масштабируем строго по доступному rect() с сохранением пропорций
+        # (KeepAspectRatio гарантирует отсутствие обрезки), отрисовываем по центру.
+        # Учитываем devicePixelRatio: на Retina цель в физических пикселях, иначе
+        # изображение либо мылит, либо выходит за границы виджета в полноэкранном
+        # режиме.
+        rect = self.rect()
+        dpr = self.devicePixelRatioF()
+        target = rect.size() * dpr
+        scaled = pm.scaled(
+            target,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        scaled.setDevicePixelRatio(dpr)
+        # Логические размеры (с учётом dpr) — никогда не превышают rect().
+        w = scaled.width() / dpr
+        h = scaled.height() / dpr
+        x = rect.x() + (rect.width() - w) / 2
+        y = rect.y() + (rect.height() - h) / 2
+        painter.drawPixmap(int(x), int(y), scaled)
 
     def paintEvent(self, event):
         from utils.i18n import translator
@@ -250,42 +273,38 @@ class ScalableImageLabel(QLabel):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         painter.eraseRect(self.rect())
 
-        if self._movie: 
+        if self._movie:
             pm = self._movie.currentPixmap()
             if not pm.isNull():
-                pm_scaled = pm.scaled(
-                    self.size(),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.FastTransformation # Быстрое масштабирование для видео/GIF
-                )
-                x = (self.width() - pm_scaled.width()) // 2
-                y = (self.height() - pm_scaled.height()) // 2
-                painter.drawPixmap(x, y, pm_scaled)
+                self._draw_centered(painter, pm)
                 return
 
         pm = self._pixmap
         if pm and not pm.isNull():
-            # Кэшируем масштабированное изображение
+            # Кэшируем масштабированное изображение, пересоздаём при смене размера.
             if self._cached_scaled_pixmap is None or self.size() != self._last_size:
-                # Если изображение очень большое, используем Smooth, иначе Fast для скорости
-                mode = Qt.TransformationMode.SmoothTransformation if pm.width() > self.width() * 1.5 else Qt.TransformationMode.FastTransformation
-                self._cached_scaled_pixmap = pm.scaled(
-                    self.size(), 
-                    Qt.AspectRatioMode.KeepAspectRatio, 
-                    mode
+                dpr = self.devicePixelRatioF()
+                scaled = pm.scaled(
+                    self.rect().size() * dpr,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
                 )
+                scaled.setDevicePixelRatio(dpr)
+                self._cached_scaled_pixmap = scaled
                 self._last_size = self.size()
 
             scaled = self._cached_scaled_pixmap
-            x = (self.width() - scaled.width()) // 2
-            y = (self.height() - scaled.height()) // 2
-            painter.drawPixmap(x, y, scaled)
+            dpr = scaled.devicePixelRatio() or 1.0
+            w = scaled.width() / dpr
+            h = scaled.height() / dpr
+            rect = self.rect()
+            x = rect.x() + (rect.width() - w) / 2
+            y = rect.y() + (rect.height() - h) / 2
+            painter.drawPixmap(int(x), int(y), scaled)
         else:
             painter.setPen(Qt.GlobalColor.gray)
-            font = painter.font()
-            font.setPointSize(14)
-            painter.setFont(font)
-            
+            # Шрифт холста не переопределяем — наследуется глобальный app-шрифт.
+
             if self.is_loading:
                 text = translator.tr("img_loading")
             elif self.is_error:
@@ -296,4 +315,8 @@ class ScalableImageLabel(QLabel):
             else:
                 text = translator.tr("img_doc")
                 
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, text)
+            painter.drawText(
+                self.rect(),
+                Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                text,
+            )

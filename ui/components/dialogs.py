@@ -17,6 +17,7 @@ from PySide6.QtGui import QPixmap, QImage
 
 from ui.components.image_label import ScalableImageLabel
 from utils.i18n import translator
+from utils.theme_manager import ThemeManager
 
 class ThumbnailWorker(QThread):
     thumbnail_ready = Signal(int, QImage)
@@ -83,6 +84,12 @@ class VisualDeleteDialog(QDialog):
     def __init__(self, files, parent=None):
         super().__init__(parent)
         self.setWindowTitle(translator.tr("dialog_del_preview"))
+        # ОКОННО-МОДАЛЬНЫЙ режим (sheet): диалог подтверждения удаления
+        # вызывается в рабочем цикле, когда главное окно может занимать
+        # собственный fullscreen-Space (зелёная кнопка macOS). Window-modal
+        # привязывает его как sheet к родительскому окну и удерживает в текущем
+        # Space; app-modal всплыл бы отдельным окном и спровоцировал Spaces Jump.
+        self.setWindowModality(Qt.WindowModality.WindowModal)
         self.resize(850, 600)
         self.delete_hard = False
         self.files = files
@@ -105,9 +112,9 @@ class VisualDeleteDialog(QDialog):
         
         info_html = (
             f"<div style='margin-bottom: 5px;'>"
-            f"<span style='font-size: 16px; color: #DA3633; font-weight: bold;'>{translator.tr('dialog_del_warn')}</span><br>"
-            f"<span style='font-size: 14px; color: #DCDDDE;'>{translator.tr('dialog_del_files').format(len(files))}</span><br>"
-            f"<span style='font-size: 14px; color: #DCDDDE;'>{translator.tr('dialog_del_space').format(size_mb)}</span>"
+            f"<span style='font-size: {ThemeManager.FONT_HEADER}px; color: #DA3633; font-weight: bold;'>{translator.tr('dialog_del_warn')}</span><br>"
+            f"<span style='font-size: {ThemeManager.FONT_BASE}px; color: #DCDDDE;'>{translator.tr('dialog_del_files').format(len(files))}</span><br>"
+            f"<span style='font-size: {ThemeManager.FONT_BASE}px; color: #DCDDDE;'>{translator.tr('dialog_del_space').format(size_mb)}</span>"
             f"</div>"
         )
         layout.addWidget(QLabel(info_html))
@@ -148,7 +155,7 @@ class VisualDeleteDialog(QDialog):
             
             name_lbl = QLabel()
             name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            name_lbl.setStyleSheet("font-size: 11px; color: #DCDDDE; padding: 2px;")
+            name_lbl.setStyleSheet("color: #DCDDDE; padding: 2px;")
             name_lbl.setToolTip(Path(p).name)
             
             fm = name_lbl.fontMetrics()
@@ -202,7 +209,7 @@ class VisualDeleteDialog(QDialog):
                 icon_text = "🎥 ERROR" if ext in {'.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v'} else "📄 ERROR"
                 if hasattr(img_lbl, 'clear_view'): img_lbl.clear_view()
                 img_lbl.setText(icon_text)
-                img_lbl.setStyleSheet("font-size: 14px; font-weight: bold; color: #DA3633;")
+                img_lbl.setStyleSheet("font-weight: bold; color: #DA3633;")
 
     def _cleanup_labels(self):
         for img_lbl, _ in self.labels.values():

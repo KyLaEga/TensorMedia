@@ -54,11 +54,21 @@ class LocalWeightValidator(QDialog):
         self.btn_exit.hide()
         layout.addWidget(self.btn_exit)
 
-        self.thread = IntegrityCheckThread()
-        self.thread.check_completed.connect(self._on_check_finished)
+        # NB: must not be named `self.thread` — that shadows QObject.thread().
+        # Parent to the dialog so Qt tracks ownership.
+        self._check_thread = IntegrityCheckThread(self)
+        self._check_thread.check_completed.connect(self._on_check_finished)
 
     def start(self):
-        self.thread.start()
+        self._check_thread.start()
+
+    def closeEvent(self, event):
+        # Prevent "QThread: Destroyed while thread is still running" if the
+        # dialog is closed while the integrity check is mid-flight.
+        if self._check_thread.isRunning():
+            self._check_thread.quit()
+            self._check_thread.wait(2000)
+        super().closeEvent(event)
 
     def _on_check_finished(self, success, msg):
         if success:

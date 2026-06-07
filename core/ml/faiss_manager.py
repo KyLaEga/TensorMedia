@@ -12,6 +12,17 @@ import numpy as np
 
 from utils.env_config import get_data_dir
 
+# Neighbours retained per item. The old k=min(10000, N) made the search return
+# an N x k matrix (~1.6 GB of distances+keys at N=k=10^4, also written to disk)
+# and an O(N*k) adjacency build -> OOM on large libraries. For near-duplicate
+# clustering a small bounded fan-out is ample; raise this only if extremely
+# large identical-file groups must stay in one cluster.
+MAX_NEIGHBORS = 256
+# Above this corpus size, brute-force IndexFlatIP (O(N^2)) becomes the dominant
+# cost; switch to an approximate HNSW graph index.
+ANN_THRESHOLD = 50_000
+
+
 class FaissManager:
     def __init__(self, scan_mode: str = "visual"):
         self._scan_mode = scan_mode or "visual"
@@ -36,10 +47,26 @@ class FaissManager:
             shutil.rmtree(path, ignore_errors=True)
         path.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _atomic_save(path: Path, arr: np.ndarray) -> None:
+        # np.save appends .npy unless given a file object; write to a sibling
+        # temp via a file handle, then atomically rename. Guarantees a reader
+        # never sees a half-written array.
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "wb") as fh:
+            np.save(fh, arr)
+        os.replace(tmp, path)
+
     def build_index_and_search(self, vectors: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
-        vectors = vectors.astype(np.float32)
-        dim = vectors.shape[1]
-        index = faiss.IndexFlatIP(dim)
+        vectors = np.ascontiguousarray(vectors.astype(np.float32))
+        n, dim = vectors.shape
+        # Vectors are L2-normalised upstream, so inner product == cosine for
+        # both the exact and the HNSW path.
+        if n > ANN_THRESHOLD:
+            index = faiss.IndexHNSWFlat(dim, 32, faiss.METRIC_INNER_PRODUCT)
+            index.hnsw.efSearch = max(64, k)
+        else:
+            index = faiss.IndexFlatIP(dim)
         index.add(vectors)
         distances, keys = index.search(vectors, k)
         return distances, keys
@@ -66,7 +93,7 @@ class FaissManager:
         dist_file = cache_dir / f"{mode}_{state_signature}_dist.npy"
         keys_file = cache_dir / f"{mode}_{state_signature}_keys.npy"
 
-        k = min(10000, len(valid_file_data))
+        k = min(MAX_NEIGHBORS, len(valid_file_data))
         cache_valid = False
         distances = keys = None
 
@@ -88,15 +115,21 @@ class FaissManager:
             
             distances, keys = self.build_index_and_search(vectors, k)
 
-            for old_file in cache_dir.glob(f"{mode}_*.npy"):
+            # Only drop caches from *other* signatures of this mode; never glob
+            # -nuke files a concurrent run may have just written for the current
+            # signature. Also clear any leftover temp files.
+            keep = {dist_file.name, keys_file.name}
+            for old_file in list(cache_dir.glob(f"{mode}_*.npy")) + list(cache_dir.glob(f"{mode}_*.npy.tmp")):
+                if old_file.name in keep:
+                    continue
                 try:
                     os.remove(old_file)
                 except Exception as e:
                     from utils.logger import auditor
                     auditor.warning(f"Failed to remove old FAISS cache file {old_file}: {e}")
 
-            np.save(dist_file, distances)
-            np.save(keys_file, keys)
+            self._atomic_save(dist_file, distances)
+            self._atomic_save(keys_file, keys)
 
         sim_threshold = 1.0 - threshold
         if mode == "faces":
@@ -132,18 +165,38 @@ class FaissManager:
                 if sim >= sim_threshold:
                     adj[i].append((n_idx, sim))
 
-        visited = set()
-        for i in range(len(valid_file_data)):
-            if i not in visited:
-                cluster_indices = [i]
-                visited.add(i)
-                for n_idx, _ in adj[i]:
-                    if n_idx not in visited:
-                        visited.add(n_idx)
-                        cluster_indices.append(n_idx)
+        # СВЯЗНЫЕ КОМПОНЕНТЫ через union-find. Прежняя жадная группировка брала
+        # i + только его ПРЯМЫХ соседей и помечала их visited, из-за чего теряла
+        # транзитивные дубли (A≈B, B≈C, но A⊀C → C осиротевал) и зависела от
+        # порядка обхода (kNN-граф асимметричен: top-k у i мог не включать j,
+        # хотя у j включал i). Union-find по тем же рёбрам adj даёт корректные
+        # компоненты независимо от направления ребра и порядка.
+        parent = list(range(len(valid_file_data)))
 
-                if len(cluster_indices) > 1:
-                    clusters.append([valid_file_data[idx] for idx in cluster_indices])
+        def _find(x):
+            root = x
+            while parent[root] != root:
+                root = parent[root]
+            while parent[x] != root:  # path compression
+                parent[x], x = root, parent[x]
+            return root
+
+        def _union(a, b):
+            ra, rb = _find(a), _find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for i in range(len(valid_file_data)):
+            for n_idx, _ in adj[i]:
+                _union(i, n_idx)
+
+        components: dict = {}
+        for i in range(len(valid_file_data)):
+            components.setdefault(_find(i), []).append(i)
+
+        for cluster_indices in components.values():
+            if len(cluster_indices) > 1:
+                clusters.append([valid_file_data[idx] for idx in cluster_indices])
 
         refined_clusters = []
         for cluster in clusters:

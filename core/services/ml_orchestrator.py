@@ -1,7 +1,7 @@
+import gc
 import time
 import psutil
 import multiprocessing
-import threading
 from PySide6.QtCore import QObject, QTimer
 from core.events import bus
 from core.ml.cluster_engine import SmartClusterEngine
@@ -101,16 +101,19 @@ class MLOrchestrator(QObject):
         auditor.info(f"Starting Scan Matrix [Mode: {mode} | Dirs: {dirs}]")
         self.scanner = ScannerBridge(self.engine, dirs, exts, mode)
         self.scanner.progress_updated.connect(bus.evt_scan_progress.emit)
-        
-        def _on_scan_complete():
-            self._reset_idle_timer()
-            self._emit_telemetry("Scan+Vectorize")
-            auditor.info("Scan Matrix processing complete.")
-            bus.evt_scan_completed.emit()
-            
-        self.scanner.scan_completed.connect(_on_scan_complete)
+        self.scanner.scan_completed.connect(self._on_scan_complete)
         self.scanner.error_occurred.connect(self._handle_scan_error)
         self.scanner.start()
+
+    def _on_scan_complete(self):
+        # Bound slot on this QObject (GUI thread). A free nested function would
+        # connect as a direct functor and execute in the ScannerBridge worker
+        # thread, where QTimer.start/stop is illegal ("Timers cannot be started
+        # from another thread") and the idle-timer reset is silently dropped.
+        self._reset_idle_timer()
+        self._emit_telemetry("Scan+Vectorize")
+        auditor.info("Scan Matrix processing complete.")
+        bus.evt_scan_completed.emit()
 
     def _handle_scan_error(self, err_msg):
         self._reset_idle_timer()
@@ -119,6 +122,11 @@ class MLOrchestrator(QObject):
 
     def _handle_pause(self):
         if self.engine:
+            # is_paused is a plain bool written here (GUI thread) and polled by
+            # the extract_features() worker thread. A single bool read/write is
+            # atomic under the GIL and the flag is advisory (worst case: one
+            # extra poll iteration before the pause takes effect), so no lock is
+            # required.
             self.engine.is_paused = not self.engine.is_paused
             auditor.info(f"Engine execution paused: {self.engine.is_paused}")
 
@@ -162,14 +170,15 @@ class MLOrchestrator(QObject):
             
         auditor.info(f"Initiating FAISS Re-clustering at threshold: {threshold}")
         self.cluster_worker = ClusterWorker(self.engine, threshold)
-        
-        def _on_cluster_complete(res):
-            self._reset_idle_timer()
-            self._emit_telemetry("FAISS_Clustering")
-            bus.evt_clustering_completed.emit(res)
-            
-        self.cluster_worker.clustering_completed.connect(_on_cluster_complete)
+        self.cluster_worker.clustering_completed.connect(self._on_cluster_complete)
         self.cluster_worker.start()
+
+    def _on_cluster_complete(self, res):
+        # Bound slot on this QObject (GUI thread) — see _on_scan_complete: keeps
+        # QTimer/bus access off the ClusterWorker thread.
+        self._reset_idle_timer()
+        self._emit_telemetry("FAISS_Clustering")
+        bus.evt_clustering_completed.emit(res)
 
     def stop_all(self):
         if self._stop_all_called:
@@ -191,7 +200,16 @@ class MLOrchestrator(QObject):
                     t.requestInterruption()
                 if hasattr(t, "quit"):
                     t.quit()
-                QTimer.singleShot(3000, lambda: auditor.warning(f"Thread {name} timeout") if t.isRunning() else None)
+                # Ограниченный wait() даёт run() шанс выйти штатно (чтобы Qt не
+                # разрушил QThread «на ходу» → SIGABRT). НО terminate() здесь
+                # ЗАПРЕЩЁН: воркер может стоять в нативном коде (faiss/OpenMP,
+                # torch). QThread.terminate() обрывает поток посреди OpenMP-секции,
+                # оставляя залоченными OMP/allocator-локи → следующий gc.collect()
+                # дедлочится навсегда (регресс закрытия после FAISS re-clustering).
+                # Поэтому просто бросаем ещё живой поток: финальный os._exit(0)
+                # убьёт его мгновенно, без запуска C++-деструктора.
+                if hasattr(t, "wait") and not t.wait(2000):
+                    auditor.warning(f"Thread {name} did not stop in 2s; abandoning to os._exit")
             except Exception as e:
                 auditor.error(f"Failed stopping {name}: {e}")
 
@@ -200,17 +218,85 @@ class MLOrchestrator(QObject):
         _soft_stop_qthread(self.warmup_worker, "EngineWarmupWorker")
         _soft_stop_qthread(self.maintenance_worker, "MaintenanceWorker")
 
-        def _kill_children():
+        # GRACEFUL TEARDOWN ПУЛА multiprocessing — СИНХРОННО, до выхода процесса.
+        # К этому моменту ScannerBridge уже остановлен (его wait() выше дал
+        # extract_features() отработать свой finally и закрыть собственный пул),
+        # поэтому гонки с кооперативным teardown'ом воркера больше нет — раньше
+        # это делалось в daemon-потоке со sleep(1.5), который os._exit на выходе
+        # просто не успевал доработать, и семафоры утекали. Теперь доводим всё до
+        # конца здесь: terminate()/join() освобождает SemLock'и пула, иначе при
+        # hard-exit в консоль падает 'leaked semaphore objects'.
+        if self.engine is not None and hasattr(self.engine, "shutdown_pool"):
             try:
-                children = multiprocessing.active_children()
-                if children:
-                    auditor.warning(f"Terminating {len(children)} active child process(es).")
-                for p in children:
-                    try:
-                        p.terminate()
-                    except Exception:
-                        pass
+                self.engine.shutdown_pool()
             except Exception as e:
-                auditor.error(f"Failed to terminate child processes: {e}")
-                
-        threading.Thread(target=_kill_children, daemon=True).start()
+                auditor.error(f"Engine pool shutdown failed: {e}", exc_info=True)
+
+        # Подбираем всё, что ещё живо (на случай зависшего воркера/таймаута wait):
+        # terminate + join СИНХРОННО, чтобы семафоры дочерних процессов
+        # освободились ДО os._exit, а не утекли в resource_tracker.
+        try:
+            children = multiprocessing.active_children()
+            if children:
+                auditor.warning(f"Reaping {len(children)} live child process(es) on shutdown.")
+            for p in children:
+                try:
+                    p.terminate()
+                except Exception as e:
+                    auditor.warning(f"Failed to terminate child {getattr(p, 'pid', '?')}: {e}", exc_info=True)
+            for p in children:
+                try:
+                    p.join(timeout=2.0)
+                    # Воркер мог проигнорировать SIGTERM (застрял в нативном коде):
+                    # join по таймауту вернётся, а процесс останется жив и удержит
+                    # семафоры. Добиваем SIGKILL, иначе teardown не детерминирован.
+                    if p.is_alive():
+                        auditor.warning(f"Child {getattr(p, 'pid', '?')} survived terminate -> kill()")
+                        if hasattr(p, "kill"):
+                            p.kill()
+                        p.join(timeout=1.0)
+                except Exception as e:
+                    auditor.debug(f"Child {getattr(p, 'pid', '?')} join failed: {e}", exc_info=True)
+        except Exception as e:
+            auditor.error(f"Failed to reap child processes: {e}", exc_info=True)
+
+        # ПОСЛЕДНИЙ ШАГ — детерминированный teardown multiprocessing.
+        # Pool/Value держат POSIX-семафоры (SemLock), чьи имена снимаются
+        # (sem_unlink) и снимаются с учёта в resource_tracker только их
+        # финализаторами. terminate()/join() этого НЕ делает.
+        #
+        # gc.collect() финализирует лишь те объекты, на которые УЖЕ нет ссылок;
+        # если хоть один SemLock ещё жив (например, главный поток держит
+        # Value(lock=True) или внутренний lock Pool'а, чей хэндлер-поток не
+        # доехал до конца), gc его не тронет — и при os._exit(0) resource_tracker
+        # печатает 'leaked semaphore objects' (ровно 1 на каждый такой SemLock).
+        #
+        # Поэтому вместо «мягкого» gc вызываем штатный atexit-обработчик
+        # multiprocessing — _exit_function(). Он принудительно прогоняет ВСЕ
+        # util.Finalize-финализаторы (sem_unlink + UNREGISTER в resource_tracker)
+        # независимо от живых Python-ссылок и добивает дочерние процессы. Именно
+        # этот хук пропускает os._exit(0); вызвав его руками ДО hard-exit, мы
+        # гарантируем нулевую утечку семафоров. Вызов идемпотентен и безопасен,
+        # даже если multiprocessing в этой сессии вообще не использовался.
+        try:
+            gc.collect()
+        except Exception as e:
+            auditor.debug(f"Final gc.collect() during teardown failed: {e}", exc_info=True)
+
+        # _exit_function() внутри делает p.join() БЕЗ таймаута по всем живым
+        # детям. Сами дети к этому моменту уже сняты SIGKILL'ом в reaping-цикле
+        # выше (active_children пуст), поэтому join тривиален. Но чтобы наглухо
+        # исключить регресс «незавершающегося закрытия» (см. историю с unbounded
+        # Pool.join()), гоним хук в daemon-watchdog'е с ограниченным ожиданием:
+        # не уложился — бросаем на os._exit(0) (в худшем случае останется лишь
+        # косметический warning resource_tracker, но процесс НЕ виснет).
+        try:
+            import threading
+            from multiprocessing.util import _exit_function
+            et = threading.Thread(target=_exit_function, daemon=True)
+            et.start()
+            et.join(3.0)
+            if et.is_alive():
+                auditor.warning("multiprocessing _exit_function() timeout; abandoning to hard-exit")
+        except Exception as e:
+            auditor.debug(f"multiprocessing _exit_function() during teardown failed: {e}", exc_info=True)

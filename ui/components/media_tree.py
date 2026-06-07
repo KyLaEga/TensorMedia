@@ -146,7 +146,7 @@ class LazyClusterModel(QAbstractItemModel):
                 p = it['path']
                 try:
                     item_path = os.path.normpath(os.path.abspath(p))
-                except Exception:
+                except (ValueError, OSError):
                     item_path = p
 
                 ext = Path(p).suffix.upper()
@@ -160,7 +160,8 @@ class LazyClusterModel(QAbstractItemModel):
                     try:
                         if os.path.commonpath([ref_path, item_path]) == ref_path:
                             is_ref = True
-                    except Exception:
+                    except (ValueError, OSError):
+                        # commonpath raises ValueError for paths on different drives.
                         is_ref = False
                     display_name = f"[REF] {Path(p).name}" if is_ref else f"[INBOX] {Path(p).name}"
                 else:
@@ -339,12 +340,25 @@ class MediaTreeView(QTreeView):
         self.setDragEnabled(True)
         self.setUniformRowHeights(True)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        
+
+        # БАГ Shift-выделения: при поведении выбора по умолчанию (SelectItems)
+        # зажатый Shift строил QItemSelectionRange по отдельным ячейкам, из-за
+        # чего диапазон "терял" якорь и сбрасывал фокус с текущего кластера.
+        # Выбор целыми строками в режиме ExtendedSelection заставляет
+        # QItemSelectionModel корректно расширять диапазон от якоря до клика.
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+
         self.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.setStyleSheet("QTreeView::item { min-height: 24px; padding: 2px 0px; }")
         
         self.header().sectionResized.connect(self._on_section_resized)
         self._is_stretching = False
+
+        # Cmd+D / Ctrl+D (снятие выделения) принадлежит ровно одному владельцу —
+        # QAction "Снять выделение" в нативном QMenuBar ("Правка") MainWindow,
+        # привязанному к self.clearSelection. Здесь дубликата быть не должно,
+        # иначе вернётся конфликт двойного срабатывания.
 
     def setModel(self, model):
         super().setModel(model)
@@ -354,6 +368,8 @@ class MediaTreeView(QTreeView):
 
     # КРИТИЧЕСКИЙ ПАТЧ: Делегирование клавиш глобальным хукам (Hotkeys)
     # Защищает от случайного срабатывания навигации дерева.
+    # Cmd+D / Ctrl+D обрабатывается QAction "Снять выделение" в системном
+    # QMenuBar MainWindow — здесь он намеренно НЕ перехватывается.
     def keyPressEvent(self, event):
         key = event.key()
         if key in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Backspace, Qt.Key.Key_Delete):

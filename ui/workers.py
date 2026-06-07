@@ -2,6 +2,7 @@
 # MODULE: ui/workers.py
 # ============================================================
 import os
+import sys
 import time
 import zipfile
 import io
@@ -17,6 +18,11 @@ from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QImage
 
 cv2.setNumThreads(0)
+
+# AVFoundation is macOS-only; on Windows/Linux it does not exist and forcing it
+# makes every VideoCapture fail to open. Pick the platform-native backend and
+# let OpenCV auto-select (CAP_ANY) everywhere else.
+_VIDEO_BACKEND = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
 
 from core.ml.cluster_engine import SmartClusterEngine
 from utils.i18n import translator
@@ -38,10 +44,13 @@ class MultiVideoWorker(QThread):
             self.requests.clear()
             for p in paths:
                 self.requests[p] = pct
+            # Re-arm under the lock so a concurrent stop() can't interleave
+            # between the isRunning() check and start(). Setting the flag before
+            # notify also prevents run()'s loop from exiting on a stale False.
+            self.is_running = True
             self.cond.notify_all()
-            
-        if not self.isRunning(): 
-            self.start()
+            if not self.isRunning():
+                self.start()
             
     def run(self):
         try:
@@ -117,13 +126,13 @@ class MultiVideoWorker(QThread):
                                         old_cap.release()
                                         
                                     try:
-                                        cap = cv2.VideoCapture(p, cv2.CAP_AVFOUNDATION, [cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY])
+                                        cap = cv2.VideoCapture(p, _VIDEO_BACKEND, [cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY])
                                         if not cap.isOpened(): cap = cv2.VideoCapture(p)
                                     except Exception as e:
-                                        auditor.warning(f"Failed to open video {p} with AVFOUNDATION: {e}")
+                                        auditor.warning(f"Failed to open video {p} with HW backend: {e}")
                                         cap = cv2.VideoCapture(p)
 
-                                    if cap.isOpened(): 
+                                    if cap.isOpened():
                                         self.caps[p] = cap
                                     else: 
                                         cap.release()
@@ -140,10 +149,10 @@ class MultiVideoWorker(QThread):
                                 if not ret:
                                     cap.release()
                                     try:
-                                        cap = cv2.VideoCapture(p, cv2.CAP_AVFOUNDATION, [cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY])
+                                        cap = cv2.VideoCapture(p, _VIDEO_BACKEND, [cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY])
                                         if not cap.isOpened(): cap = cv2.VideoCapture(p)
                                     except Exception as e:
-                                        auditor.warning(f"Failed to reopen video {p} with AVFOUNDATION: {e}")
+                                        auditor.warning(f"Failed to reopen video {p} with HW backend: {e}")
                                         cap = cv2.VideoCapture(p)
 
                                     if cap.isOpened():
@@ -188,9 +197,12 @@ class MultiVideoWorker(QThread):
             
     def stop(self):
         self.is_running = False
-        with self.cond: 
+        with self.cond:
             self.cond.notify_all()
         self.quit()
+        # Join so the GUI can't destroy this QThread (and its VideoCapture
+        # handles) while run()/its finally cleanup is still executing.
+        self.wait(2000)
 
 class CompareVideoWorker(QThread):
     frame_ready = Signal(str, QImage)
@@ -205,9 +217,12 @@ class CompareVideoWorker(QThread):
 
     def request_frames(self, paths, pct):
         with self.cond:
-            for p in paths: self.requests[p] = pct 
+            for p in paths: self.requests[p] = pct
+            # Re-arm under the lock (see MultiVideoWorker.request_frames).
+            self.is_running = True
             self.cond.notify_all()
-        if not self.isRunning(): self.start()
+            if not self.isRunning():
+                self.start()
             
     def run(self):
         try:
@@ -232,10 +247,10 @@ class CompareVideoWorker(QThread):
                                 old_cap.release()
                                 
                             try:
-                                cap = cv2.VideoCapture(p, cv2.CAP_AVFOUNDATION, [cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY])
+                                cap = cv2.VideoCapture(p, _VIDEO_BACKEND, [cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY])
                                 if not cap.isOpened(): cap = cv2.VideoCapture(p)
                             except Exception as e:
-                                auditor.warning(f"Failed to open video {p} with AVFOUNDATION: {e}")
+                                auditor.warning(f"Failed to open video {p} with HW backend: {e}")
                                 cap = cv2.VideoCapture(p)
 
                             if cap.isOpened(): self.caps[p] = cap
@@ -275,9 +290,10 @@ class CompareVideoWorker(QThread):
             
     def stop(self):
         self.is_running = False
-        with self.cond: 
+        with self.cond:
             self.cond.notify_all()
         self.quit()
+        self.wait(2000)
 
 class ScannerBridge(QThread):
     progress_updated = Signal(int, int, str)
@@ -355,12 +371,29 @@ class EngineWarmupWorker(QThread):
 class MaintenanceWorker(QThread):
     """Фоновый воркер для очистки и дефрагментации баз данных."""
     finished = Signal()
-    
+
     def run(self):
         try:
             from utils.batch_operations import DBConnectionPool
             DBConnectionPool.run_maintenance_all()
         except Exception as e:
             auditor.error(f"MaintenanceWorker failed: {e}")
+        finally:
+            self.finished.emit()
+
+
+class PurgeWorker(QThread):
+    """Фоновый воркер для полного удаления всех проиндексированных данных
+    (SQLite-векторы + дисковый кэш FAISS)."""
+    finished = Signal()
+
+    def run(self):
+        try:
+            from utils.batch_operations import DBConnectionPool
+            from core.ml.faiss_manager import FaissManager
+            DBConnectionPool.purge_all()
+            FaissManager.purge_disk_cache()
+        except Exception as e:
+            auditor.error(f"PurgeWorker failed: {e}")
         finally:
             self.finished.emit()

@@ -1,4 +1,5 @@
 import os
+import time
 import shutil
 import platform
 import subprocess
@@ -8,28 +9,79 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from utils.logger import auditor
 
+
+def _invalidate_cache_paths(paths):
+    """Удаляет записи из ОБОИХ кэшей векторов (meta_v2_visual/faces.db) для
+    указанных путей. Реальный путь удаления (SafeFSExecutor) раньше БД не трогал,
+    поэтому записи удалённых файлов висели в кэше до плановой GC. Путь передаём
+    как есть (он совпадает с ключом, под которым его сохранил сканер) плюс
+    abspath-форму — лишние ключи безвредны (DELETE ... WHERE path=? ничего не
+    тронет)."""
+    if not paths:
+        return
+    try:
+        from utils.batch_operations import DBConnectionPool
+        keys = []
+        for p in paths:
+            s = str(p)
+            keys.append(s)
+            ab = os.path.normpath(os.path.abspath(s))
+            if ab != s:
+                keys.append(ab)
+        for mode in ("visual", "faces"):
+            DBConnectionPool.get_connection(f"meta_v2_{mode}.db").delete_paths(keys)
+    except Exception as e:
+        auditor.warning(f"Vector-cache invalidation (delete) failed: {e}")
+
+
+def _remap_cache_paths(pairs):
+    """Переносит записи кэша src→dst в обоих режимах при перемещении файла,
+    чтобы кэшированный вектор не терялся и не пересчитывался после move."""
+    if not pairs:
+        return
+    try:
+        from utils.batch_operations import DBConnectionPool
+        norm = []
+        for src, dst in pairs:
+            norm.append((str(src), str(dst)))
+            ab_src = os.path.normpath(os.path.abspath(str(src)))
+            if ab_src != str(src):
+                norm.append((ab_src, str(dst)))
+        for mode in ("visual", "faces"):
+            DBConnectionPool.get_connection(f"meta_v2_{mode}.db").move_paths(norm)
+    except Exception as e:
+        auditor.warning(f"Vector-cache remap (move) failed: {e}")
+
+
 class SafeFSExecutor:
     @staticmethod
     def move_files(paths, dest_dir):
         success = 0
+        moved_pairs = []
         for p in paths:
             try:
-                shutil.move(p, os.path.join(dest_dir, os.path.basename(p)))
+                dst = os.path.join(dest_dir, os.path.basename(p))
+                shutil.move(p, dst)
                 success += 1
+                moved_pairs.append((p, dst))
             except Exception as e:
                 auditor.error(f"Move failed for {p}: {e}")
+        _remap_cache_paths(moved_pairs)
         return {"deleted": 0, "moved": success, "failed": len(paths) - success}
 
     @staticmethod
     def hard_delete(paths):
         success = 0
+        removed = []
         for p in paths:
             try:
                 if os.path.isfile(p) or os.path.islink(p): os.remove(p)
                 elif os.path.isdir(p): shutil.rmtree(p)
                 success += 1
+                removed.append(p)
             except Exception as e:
                 auditor.error(f"Hard delete failed for {p}: {e}")
+        _invalidate_cache_paths(removed)
         return {"deleted": success, "moved": 0, "failed": len(paths) - success}
         
     @staticmethod
@@ -93,6 +145,7 @@ class SafeFSExecutor:
                     except Exception as e:
                         auditor.error(f"All trash methods failed for {p}: {e}")
                         failed += 1
+                _invalidate_cache_paths([p for p in paths if not os.path.exists(os.path.abspath(str(p)))])
                 return {"deleted": success, "moved": 0, "failed": failed}
             except ImportError:
                 auditor.warning("AppKit/send2trash missing, falling back to AppleScript...")
@@ -107,6 +160,7 @@ class SafeFSExecutor:
                     except Exception as e:
                         auditor.error(f"AppleScript fallback failed for {p}: {e}")
                         failed += 1
+                _invalidate_cache_paths([p for p in paths if not os.path.exists(os.path.abspath(str(p)))])
                 return {"deleted": success, "moved": 0, "failed": failed}
 
         # Для Windows и Linux оставляем send2trash
@@ -126,7 +180,8 @@ class SafeFSExecutor:
         except ImportError:
             auditor.error("CRITICAL: send2trash module not found.")
             return {"deleted": 0, "moved": 0, "failed": len(paths), "error": "send2trash_missing"}
-            
+
+        _invalidate_cache_paths([p for p in paths if not os.path.exists(os.path.abspath(str(p)))])
         return {"deleted": success, "moved": 0, "failed": failed}
 
 def reveal_in_os(path: str):
@@ -199,8 +254,19 @@ class FileSystemService(QObject):
         if dirs_to_watch and not self.observer.is_alive():
             try:
                 self.observer.start()
-            except RuntimeError:
-                pass
+            except RuntimeError as e:
+                # A watchdog Observer is a thread and cannot be restarted once
+                # stopped/joined. Recreate it so FS monitoring survives a
+                # stop()/restart cycle instead of silently dying.
+                auditor.error(f"Observer.start() failed, recreating observer: {e}", exc_info=True)
+                self.observer = Observer()
+                for d in dirs_to_watch:
+                    if os.path.exists(d) and os.path.isdir(d):
+                        self.observer.schedule(self.handler, d, recursive=False)
+                try:
+                    self.observer.start()
+                except RuntimeError as e2:
+                    auditor.error(f"Observer restart failed: {e2}", exc_info=True)
 
     def _on_fs_event(self, path: str):
         # FIX: Запуск таймера переведен в основной поток через QueuedConnection

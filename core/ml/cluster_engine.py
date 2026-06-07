@@ -2,6 +2,7 @@
 # MODULE: core/ml/cluster_engine.py
 # ============================================================
 import os
+import gc
 import time
 import zipfile
 import numpy as np
@@ -9,13 +10,21 @@ import torch
 import cv2
 import blake3
 import psutil
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from pathlib import Path
 from multiprocessing import Pool, Value, shared_memory
 
 cv2.setNumThreads(0)
 
-from transformers import AutoProcessor, SiglipVisionModel
+# Глушим C++-логгер OpenCV. Декодер AVFoundation (macOS) не читает VP8/VP9 .webm
+# и печатает "Couldn't read video stream" напрямую в stderr В ОБХОД Python — это
+# не ловится try/except. Нечитаемые файлы и так пропускаются по isOpened()==False
+# (см. ветку видео ниже), поэтому шумный C++-вывод нам не нужен.
+try:
+    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
+except Exception:
+    pass
+
 from utils.env_config import get_models_dir
 from utils.logger import auditor
 from core.profiler import HardwareProfiler
@@ -40,7 +49,8 @@ def _scan_io_cancelled() -> bool:
         return False
     try:
         return bool(_worker_cancel_flag.value)
-    except Exception:
+    except Exception as e:
+        auditor.debug(f"Failed to read scan cancel flag: {e}", exc_info=True)
         return False
 
 def _cancelled_io_result(file_path: Path, size, mtime, file_hash, vector) -> dict:
@@ -50,11 +60,33 @@ def _cancelled_io_result(file_path: Path, size, mtime, file_hash, vector) -> dic
         "dur": 0.0, "codec": "", "sharpness": 0.0, "fps": 0.0,
     }
 
+def _unlink_shm_blocks(blocks) -> None:
+    """Unlink every POSIX shared-memory segment referenced by `blocks`.
+
+    Safe to call multiple times: a segment already freed raises
+    FileNotFoundError on re-open, which we swallow. This is the single point
+    of truth for releasing /dev/shm segments so no result path can leak them.
+    """
+    for b in blocks or []:
+        if isinstance(b, dict) and b.get("is_shm"):
+            try:
+                shared_memory.SharedMemory(name=b["name"]).unlink()
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                auditor.debug(f"Failed to unlink SHM segment {b.get('name')}: {e}", exc_info=True)
+
 def calculate_optical_sharpness(frame: np.ndarray) -> float:
     try:
-        if len(frame.shape) == 3: 
+        # ВАЛИДАЦИЯ РАЗМЕРНОСТИ: пустой/одномерно-вырожденный кадр (декодер вернул
+        # 0xN или Nx0, либо None) не даёт корректной матрицы Лапласа. Дисперсия
+        # такого среза роняет numpy в RuntimeWarning "Degrees of freedom <= 0 for
+        # slice" и возвращает nan, отравляющий метрику резкости.
+        if frame is None or frame.size == 0 or frame.ndim < 2:
+            return 0.0
+        if len(frame.shape) == 3:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        else: 
+        else:
             gray = frame
         lap = cv2.Laplacian(gray, cv2.CV_64F)
         h, w = lap.shape
@@ -64,17 +96,54 @@ def calculate_optical_sharpness(frame: np.ndarray) -> float:
         for i in range(grid_size):
             for j in range(grid_size):
                 block = lap[i*bh:(i+1)*bh, j*bw:(j+1)*bw]
-                var = float(block.var()) 
+                # Срез может оказаться пустым (i*bh >= h на мелких кадрах) или из
+                # одного элемента. var() на таком массиве → "Degrees of freedom
+                # <= 0". Считаем дисперсию только для блоков из ≥2 значений.
+                if block.size < 2:
+                    continue
+                var = float(block.var())
                 if var > max_var: max_var = var
         return float(max_var)
     except Exception as e:
         auditor.warning(f"Worker Sharpness calculation error: {e}")
         return 0.0
 
+def _compute_fast_hash_io(file_path) -> str:
+    """blake3-хэш файла. Полное чтение для файлов ≤100 МБ, иначе 10 семплов +
+    метаданные. Module-level (без self), потому что вызывается ВНУТРИ воркеров
+    пула — расчёт распараллеливается по ядрам вместо серийного пре-пасса в
+    главном потоке."""
+    try:
+        h = blake3.blake3()
+        stat = file_path.stat()
+        size = stat.st_size
+        with open(file_path, 'rb') as f:
+            if size <= 100 * 1024 * 1024:
+                while chunk := f.read(1024 * 1024):
+                    h.update(chunk)
+            else:
+                step = size // 10
+                for i in range(10):
+                    f.seek(i * step, os.SEEK_SET)
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+                meta_str = f"{size}_{stat.st_mtime}_{file_path.suffix}"
+                h.update(meta_str.encode('utf-8'))
+        return h.hexdigest()
+    except Exception as e:
+        return f"FAIL_{file_path.name}_{e}"
+
+
 def process_single_file_io(task_data: tuple) -> dict:
     file_path, size, mtime, file_hash, vector, scan_mode = task_data
     if _scan_io_cancelled():
         return _cancelled_io_result(file_path, size, mtime, file_hash, vector)
+    # Хэш считаем ЗДЕСЬ, в воркере (распараллелено пулом), а не серийно в главном
+    # потоке до старта пула: чтение до 100 МБ/файл больше не блокирует пайплайн.
+    if file_hash is None:
+        file_hash = _compute_fast_hash_io(file_path)
     res, dur, codec, sharpness, fps_val = "", 0.0, "", 0.0, 0.0
     shm_blocks = [] 
     ext = file_path.suffix.lower()
@@ -94,6 +163,15 @@ def process_single_file_io(task_data: tuple) -> dict:
                 "is_shm": True
             })
             shm.close()
+            # The parent process owns unlink() for this segment. Detach it from
+            # this worker's resource_tracker so the tracker neither warns about
+            # a "leaked" segment at shutdown nor double-unlinks a name the
+            # parent may have already freed (and possibly reused).
+            try:
+                from multiprocessing import resource_tracker
+                resource_tracker.unregister(f"/{shm_name}", "shared_memory")
+            except Exception as e:
+                auditor.debug(f"resource_tracker.unregister failed for {shm_name}: {e}", exc_info=True)
         except OSError as e:
             auditor.warning(f"Failed to allocate shared memory for image: {e}")
             shm_blocks.append({
@@ -148,7 +226,15 @@ def process_single_file_io(task_data: tuple) -> dict:
                     sharpness = float(max_sharp)
                 finally:
                     cap.release()
-                
+            else:
+                # Декодер не смог открыть файл (неподдерживаемый кодек, напр.
+                # VP8/VP9 .webm на AVFoundation, или битый контейнер). Освобождаем
+                # объект VideoCapture, чтобы не утёк нативный дескриптор, и мягко
+                # пропускаем файл (vector останется None → файл не индексируется).
+                if cap is not None:
+                    cap.release()
+                auditor.debug(f"Skipping unreadable video (unsupported codec/container): {file_path}")
+
         elif ext in {'.jpg', '.png', '.webp', '.bmp', '.heic', '.jpeg'}:
             if _scan_io_cancelled():
                 return _cancelled_io_result(file_path, size, mtime, file_hash, vector)
@@ -289,14 +375,27 @@ def process_single_file_io(task_data: tuple) -> dict:
                     "dur": 0.0, "codec": "", "sharpness": 0.0, "fps": 0.0
                 }
 
+    except (UnidentifiedImageError, OSError) as e:
+        # Битый/обрезанный/подменённый файл: PIL не опознаёт формат
+        # (UnidentifiedImageError) или чтение обрывается (OSError "image file is
+        # truncated"). Это ОЖИДАЕМЫЙ скип, а не сбой пайплайна — логируем на debug
+        # и возвращаем результат без вектора (файл не попадёт в индекс).
+        auditor.debug(f"Skipping unreadable file {file_path}: {e}")
+        for block in shm_blocks:
+            if block.get("is_shm"):
+                try:
+                    shared_memory.SharedMemory(name=block['name']).unlink()
+                except Exception as ce:
+                    auditor.debug(f"Failed to unlink SHM during decode-skip cleanup: {ce}", exc_info=True)
+        shm_blocks.clear()
     except Exception as e:
         auditor.warning(f"Worker I/O Error for {file_path}: {e}")
         for block in shm_blocks:
             if block.get("is_shm"):
                 try:
                     shared_memory.SharedMemory(name=block['name']).unlink()
-                except Exception:
-                    pass
+                except Exception as e:
+                    auditor.debug(f"Failed to unlink SHM during I/O cleanup: {e}", exc_info=True)
         shm_blocks.clear()
 
     return {
@@ -321,21 +420,56 @@ class SmartClusterEngine:
         self.faiss_manager = FaissManager(scan_mode="visual")
 
     def request_scan_abort(self):
+        # Called from the GUI/orchestrator thread. Only flip cooperative flags
+        # here. The multiprocessing.Pool is owned exclusively by the
+        # extract_features() worker thread, which tears it down in its finally
+        # block. Calling pool.terminate() from this foreign thread races the
+        # imap_unordered consumer and the close()/join() teardown (double
+        # teardown / hang) and can SIGKILL workers mid shared-memory create,
+        # orphaning /dev/shm segments.
         self.is_stopped = True
         self.is_paused = False
         cf = getattr(self, "_scan_cancel_flag", None)
         if cf is not None:
             try:
                 cf.value = 1
-            except Exception:
-                pass
-        pool = getattr(self, "_io_pool", None)
+            except Exception as e:
+                # If the cancel flag can't be set, worker processes never see
+                # the abort request and the scan cannot be stopped.
+                auditor.warning(f"Failed to set scan cancel flag: {e}", exc_info=True)
+
+    def shutdown_pool(self):
+        """Корректно гасит I/O-пул multiprocessing при ЗАКРЫТИИ приложения.
+
+        Вызывается синхронно из MLOrchestrator.stop_all (GUI/orchestrator-поток)
+        уже ПОСЛЕ остановки ScannerBridge, поэтому extract_features() свой пул, как
+        правило, уже закрыл в finally и self._io_pool == None — тогда метод ничего
+        не делает. Если же воркер завис (wait() вышел по таймауту) и пул ещё жив —
+        принудительно terminate()/join(): это освобождает внутренние семафоры пула,
+        иначе при hard-exit (os._exit) resource_tracker печатает в консоль
+        'leaked semaphore objects'.
+        """
+        self.is_stopped = True
+        pool = self._io_pool
+        self._io_pool = None
+        self._scan_cancel_flag = None
         if pool is not None:
             try:
                 pool.terminate()
-            except Exception:
-                pass
-            self._io_pool = None
+                # multiprocessing.Pool.join() НЕ принимает timeout и виснет
+                # НАВСЕГДА, если воркер застрял в нативном вызове (torch/cv2/faiss)
+                # и не умер от SIGTERM — это и есть deadlock при закрытии. Гоним
+                # join в daemon-watchdog'е и ждём ограниченно; если не уложился —
+                # бросаем пул на os._exit (семафоры всё равно снимет gc.collect +
+                # reaping в stop_all), но процесс не зависает.
+                import threading
+                jt = threading.Thread(target=pool.join, daemon=True)
+                jt.start()
+                jt.join(2.0)
+                if jt.is_alive():
+                    auditor.warning("I/O pool join() timeout; abandoning pool to hard-exit")
+            except Exception as e:
+                auditor.warning(f"I/O pool hard shutdown failed: {e}", exc_info=True)
 
     def unload_models(self):
         if self.processor is not None: del self.processor
@@ -354,7 +488,12 @@ class SmartClusterEngine:
 
     def load_models(self, mode="visual"):
         if self.scan_mode == mode and self.model is not None: return
-        
+
+        # Imported lazily here (not at module level) so launching the app — or
+        # importing this module for anything other than scanning — does not pull
+        # the heavy `transformers` stack into memory until weights are needed.
+        from transformers import AutoProcessor, SiglipVisionModel
+
         self.scan_mode = mode
         self.unload_models()
         self.scan_mode = mode
@@ -367,19 +506,26 @@ class SmartClusterEngine:
             self.processor = AutoProcessor.from_pretrained(siglip_local_path, local_files_only=True)
             target_dtype = torch.float16 if self.device.type in ("cuda", "mps") else torch.float32
             
+            # low_cpu_mem_usage=True: модель инициализируется на meta-устройстве,
+            # а веса стримятся из safetensors сразу в целевые тензоры. Это убирает
+            # промежуточную random-init аллокацию полного fp32-графа (~372 МБ для
+            # vision-tower SigLIP base) и примерно вдвое срезает пик RAM в момент
+            # загрузки. Резидентный footprint остаётся ~186 МБ (fp16) — это норма.
             try:
                 self.model = SiglipVisionModel.from_pretrained(
-                    siglip_local_path, 
+                    siglip_local_path,
                     local_files_only=True,
-                    torch_dtype=target_dtype
+                    torch_dtype=target_dtype,
+                    low_cpu_mem_usage=True
                 ).to(self.device)
             except Exception as e:
                 auditor.error(f"Failed to load to {self.device.type} with {target_dtype}: {e}. Falling back to CPU.")
                 self.device = torch.device("cpu")
                 self.model = SiglipVisionModel.from_pretrained(
-                    siglip_local_path, 
+                    siglip_local_path,
                     local_files_only=True,
-                    torch_dtype=torch.float32
+                    torch_dtype=torch.float32,
+                    low_cpu_mem_usage=True
                 ).to(self.device)
             self.model.eval()
                 
@@ -405,26 +551,9 @@ class SmartClusterEngine:
                 self.scan_mode = "error"
 
     def _compute_fast_hash(self, file_path: Path) -> str:
-        try:
-            h = blake3.blake3()
-            stat = file_path.stat()
-            size = stat.st_size
-            
-            with open(file_path, 'rb') as f:
-                if size <= 100 * 1024 * 1024:
-                    while chunk := f.read(1024 * 1024): h.update(chunk)
-                else:
-                    step = size // 10
-                    for i in range(10):
-                        f.seek(i * step, os.SEEK_SET)
-                        chunk = f.read(1024 * 1024)
-                        if not chunk: break
-                        h.update(chunk)
-                    meta_str = f"{size}_{stat.st_mtime}_{file_path.suffix}"
-                    h.update(meta_str.encode('utf-8'))
-            return h.hexdigest()
-        except Exception as e:
-            return f"FAIL_{file_path.name}_{e}"
+        # Делегирует module-level реализации (та же логика), которую дополнительно
+        # вызывают воркеры пула. Метод сохранён для обратной совместимости вызовов.
+        return _compute_fast_hash_io(file_path)
 
     def _compute_vector_batch(self, images: list) -> list:
         if not images: return []
@@ -494,6 +623,11 @@ class SmartClusterEngine:
         return [None] * len(images)
 
     def extract_features(self, target_dirs: list, allowed_exts: set = None, progress_callback=None) -> list:
+        # ИЗОЛЯЦИЯ ПРОЦЕССОВ (spawn): utils.i18n тянет PySide6 (QObject/QSettings).
+        # Этот импорт ОБЯЗАН оставаться локальным. Воркеры Pool импортируют данный
+        # модуль для process_single_file_io, прогоняя его глобальную область; любой
+        # PySide6 на уровне модуля вызвал бы рекурсивный импорт и краш Shiboken в
+        # дочернем процессе. translator используется только здесь, в главном процессе.
         from utils.i18n import translator
         self.is_paused = False
         self.is_stopped = False
@@ -538,40 +672,60 @@ class SmartClusterEngine:
         if progress_callback: progress_callback(0, len(files), translator.tr("scan_io"))
         
         tasks, all_results = [], []
-        
-        for idx, file_path in enumerate(files):
+
+        # ПЕРВЫЙ ПРОХОД: stat + классификация (кэш-хит / требует обработки). Вектор
+        # здесь НЕ тянем — раньше тут был get_vector() на КАЖДЫЙ кэшированный файл,
+        # а это N барьеров sync() и N свежих sqlite-соединений (O(N) тормоз на
+        # повторном скане библиотеки). Теперь хиты собираем и забираем одним батчем.
+        hit_meta = {}        # file_str -> (size, mtime, c_m)
+        pending_files = []   # (file_path, size, mtime) — на обработку пулом
+        for file_path in files:
             if self.is_stopped: break
             try:
                 stat = file_path.stat()
                 size, mtime = stat.st_size, stat.st_mtime
                 if size == 0: continue
-                
+
                 file_str = str(file_path)
                 c_m = meta_cache.get(file_str)
-                
                 if c_m and c_m['size'] == size and c_m['mtime'] == mtime:
-                    vec = cache_db.get_vector(file_str)
-                    if vec is not None:
-                        all_results.append({
-                            "path": file_str, "size": size, "mtime": mtime, "phash": c_m['phash'], 
-                            "vector": vec, "shm_blocks": [], "res": c_m.get('res', ''), 
-                            "dur": c_m.get('dur', 0.0), "codec": c_m.get('codec', ''), 
-                            "sharpness": c_m.get('sharpness', 0.0), "fps": c_m.get('fps', 0.0)
-                        })
-                        if progress_callback and idx % 10 == 0:
-                            progress_callback(len(all_results), len(files), translator.tr("scan_cache"))
-                        continue 
-                
-                file_hash = self._compute_fast_hash(file_path)
-                tasks.append((file_path, size, mtime, file_hash, None, self.scan_mode))
+                    hit_meta[file_str] = (size, mtime, c_m)
+                else:
+                    pending_files.append((file_path, size, mtime))
             except Exception as e:
                 auditor.warning(f"Failed to prepare file task for {file_path}: {e}")
                 continue
 
+        # ОДНА батч-выборка векторов для всех кэш-хитов (вместо N поштучных).
+        cached_vectors = cache_db.get_vectors_for_paths(list(hit_meta.keys())) if hit_meta else {}
+        for file_str, (size, mtime, c_m) in hit_meta.items():
+            vec = cached_vectors.get(file_str)
+            if vec is not None:
+                all_results.append({
+                    "path": file_str, "size": size, "mtime": mtime, "phash": c_m['phash'],
+                    "vector": vec, "shm_blocks": [], "res": c_m.get('res', ''),
+                    "dur": c_m.get('dur', 0.0), "codec": c_m.get('codec', ''),
+                    "sharpness": c_m.get('sharpness', 0.0), "fps": c_m.get('fps', 0.0)
+                })
+            else:
+                # Метаданные в кэше есть, а вектор отсутствует — переотправляем
+                # файл на обработку (тот же путь, что и для кэш-промаха).
+                pending_files.append((Path(file_str), size, mtime))
+
+        if progress_callback:
+            progress_callback(len(all_results), len(files), translator.tr("scan_cache"))
+
+        # Хэш в главном потоке БОЛЬШЕ НЕ считаем (был серийный I/O-пре-пасс до
+        # 100 МБ/файл до старта пула). Передаём None — blake3 посчитается внутри
+        # воркера process_single_file_io, распараллелившись по ядрам пула.
+        for file_path, size, mtime in pending_files:
+            if self.is_stopped: break
+            tasks.append((file_path, size, mtime, None, None, self.scan_mode))
+
         vram_gb = 0
         if self.device.type == "cuda":
             try: vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            except Exception: pass
+            except Exception as e: auditor.debug(f"VRAM detection failed: {e}", exc_info=True)
 
         chunk_size = 256
         batch_size = 64 if vram_gb >= 8 else 32
@@ -582,7 +736,13 @@ class SmartClusterEngine:
         safe_workers = max(1, int(available_ram_mb // 1500))
         max_workers = min(max(1, os.cpu_count() - 1 if os.cpu_count() else 1), safe_workers)
         
-        cancel_flag = Value('i', 0)
+        # lock=False → RawValue поверх анонимного mmap-арены, БЕЗ POSIX-семафора.
+        # Value(lock=True) создаёт SemLock, который gc.collect() лишь sem_close'ит,
+        # но НЕ sem_unlink'ает; при финальном os._exit(0) resource_tracker считает
+        # его «утёкшим» и печатает 'leaked semaphore objects'. Флаг отмены —
+        # одиночный int: пишет только главный поток (0/1), читают воркеры; гонок
+        # нет, блокировка не нужна, поэтому семафор тут лишний.
+        cancel_flag = Value('i', 0, lock=False)
         self._scan_cancel_flag = cancel_flag
         
         pool = None
@@ -624,70 +784,75 @@ class SmartClusterEngine:
 
                 if self.is_stopped:
                     for r in chunk_results:
-                        for shm_meta in r.get('shm_blocks', []):
-                            if shm_meta.get("is_shm"):
-                                try:
-                                    shared_memory.SharedMemory(name=shm_meta['name']).unlink()
-                                except Exception:
-                                    pass
+                        _unlink_shm_blocks(r.get('shm_blocks', []))
                     break
 
                 needs_vector = [r for r in chunk_results if r['vector'] is None and len(r.get('shm_blocks', [])) > 0]
 
-                for i in range(0, len(needs_vector), batch_size):
-                    while self.is_paused and not self.is_stopped:
-                        time.sleep(0.1)
-                    if self.is_stopped:
-                        break
+                # Guarantee every shared-memory segment for this chunk is freed
+                # on EVERY exit path: normal completion, a pause/stop break, or
+                # a raise out of _compute_vector_batch (FATAL NPU). Previously a
+                # raise here unwound past the loop and the bare
+                # `shm_blocks = []` reset dropped references without unlinking,
+                # leaking /dev/shm segments for all unprocessed batches.
+                try:
+                    for i in range(0, len(needs_vector), batch_size):
+                        while self.is_paused and not self.is_stopped:
+                            time.sleep(0.1)
+                        if self.is_stopped:
+                            break
 
-                    batch = needs_vector[i:i+batch_size]
-                    flat_images, counts = [], []
-                    for b in batch:
-                        imgs = []
-                        for shm_meta in b['shm_blocks']:
-                            if shm_meta.get("is_shm"):
-                                try:
-                                    shm = shared_memory.SharedMemory(name=shm_meta['name'])
-                                    arr = np.ndarray(shm_meta['shape'], dtype=shm_meta['dtype'], buffer=shm.buf)
-                                    imgs.append(Image.fromarray(arr.copy()))
-                                    shm.close()
-                                    shm.unlink()
-                                except Exception as e:
-                                    auditor.error(f"SHM Read Fault: {e}")
+                        batch = needs_vector[i:i+batch_size]
+                        flat_images, counts = [], []
+                        for b in batch:
+                            imgs = []
+                            for shm_meta in b['shm_blocks']:
+                                if shm_meta.get("is_shm"):
+                                    shm = None
                                     try:
+                                        shm = shared_memory.SharedMemory(name=shm_meta['name'])
+                                        arr = np.ndarray(shm_meta['shape'], dtype=shm_meta['dtype'], buffer=shm.buf)
+                                        imgs.append(Image.fromarray(arr.copy()))
+                                        shm.close()
                                         shm.unlink()
-                                    except Exception:
-                                        pass
-                            else:
-                                try:
-                                    arr = np.frombuffer(shm_meta['data'], dtype=shm_meta['dtype']).reshape(shm_meta['shape'])
-                                    imgs.append(Image.fromarray(arr.copy()))
-                                except Exception as e:
-                                    auditor.error(f"Critical failure parsing SHM fallback data: {e}", exc_info=True)
-                        flat_images.extend(imgs)
-                        counts.append(len(imgs))
+                                    except Exception as e:
+                                        auditor.error(f"SHM Read Fault: {e}")
+                                        if shm is not None:
+                                            try:
+                                                shm.unlink()
+                                            except Exception as e:
+                                                auditor.debug(f"Failed to unlink SHM after read fault: {e}", exc_info=True)
+                                else:
+                                    try:
+                                        arr = np.frombuffer(shm_meta['data'], dtype=shm_meta['dtype']).reshape(shm_meta['shape'])
+                                        imgs.append(Image.fromarray(arr.copy()))
+                                    except Exception as e:
+                                        auditor.error(f"Critical failure parsing SHM fallback data: {e}", exc_info=True)
+                            flat_images.extend(imgs)
+                            counts.append(len(imgs))
 
-                    flat_vectors = self._compute_vector_batch(flat_images)
+                        flat_vectors = self._compute_vector_batch(flat_images)
 
-                    idx = 0
-                    for b, count in zip(batch, counts):
-                        file_vecs = flat_vectors[idx:idx+count]
-                        idx += count
-                        valid_vecs = [v for v in file_vecs if v is not None]
-                        if valid_vecs:
-                            avg_vec = np.mean(valid_vecs, axis=0)
-                            norm = np.linalg.norm(avg_vec)
-                            if norm > 1e-8:
-                                b['vector'] = avg_vec / norm
+                        idx = 0
+                        for b, count in zip(batch, counts):
+                            file_vecs = flat_vectors[idx:idx+count]
+                            idx += count
+                            valid_vecs = [v for v in file_vecs if v is not None]
+                            if valid_vecs:
+                                avg_vec = np.mean(valid_vecs, axis=0)
+                                norm = np.linalg.norm(avg_vec)
+                                if norm > 1e-8:
+                                    b['vector'] = avg_vec / norm
+                                else:
+                                    b['vector'] = None
                             else:
                                 b['vector'] = None
-                        else:
-                            b['vector'] = None
 
-                    del flat_images, flat_vectors, batch
-
-                for r in chunk_results:
-                    r['shm_blocks'] = []
+                        del flat_images, flat_vectors, batch
+                finally:
+                    for r in chunk_results:
+                        _unlink_shm_blocks(r.get('shm_blocks', []))
+                        r['shm_blocks'] = []
 
                 insert_batch = []
                 for r in chunk_results:
@@ -712,6 +877,14 @@ class SmartClusterEngine:
                         pool.join()
                 except Exception as ex:
                     auditor.warning(f"I/O pool shutdown: {ex}")
+                # Drop the last reference and force a collection HERE, while the
+                # process is healthy, so the Pool's internal SemLock finalizers
+                # run sem_unlink now instead of deferring to the gc.collect() that
+                # sits right before os._exit in MLOrchestrator.stop_all — there it
+                # races the resource_tracker and leaves the benign trailing
+                # 'leaked semaphore objects' warning at shutdown.
+                pool = None
+                gc.collect()
 
         if self.is_stopped: 
             return []

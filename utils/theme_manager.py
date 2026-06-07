@@ -1,26 +1,194 @@
+import os
+import sys
+from pathlib import Path
+
 from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QPalette, QColor
+from PySide6.QtGui import QPalette, QColor, QIcon
 
 class ThemeManager:
+    # Subdirectories (relative to the resolved asset root) for bundled files.
+    _ICONS_SUBDIR = os.path.join("assets", "icons")
+    _THEMES_SUBDIR = os.path.join("assets", "themes")
+
+    # ----------------------------------------------------------------------
+    # Design-system palettes — the single source of truth for theme colours.
+    #
+    # Every theme exposes the SAME four semantic keys so widgets can pull a
+    # colour without hard-coding a hex literal (which is how black letterbox
+    # bars and mismatched panels crept in):
+    #   bg      — app/window background (the darkest dark / lightest light)
+    #   surface — raised panels, cards, the video letterbox backing
+    #   text    — primary foreground text
+    #   border  — separators and outlines
+    # ----------------------------------------------------------------------
+    DARK = {
+        "bg": "#1E1F22",
+        "surface": "#2B2D31",
+        "text": "#DBDEE1",
+        "border": "#4E5058",
+    }
+    LIGHT = {
+        "bg": "#F2F3F5",
+        "surface": "#FFFFFF",
+        "text": "#313338",
+        "border": "#E3E5E8",
+    }
+
+    # ----------------------------------------------------------------------
+    # Typography — the semantic type scale; the ONLY font sizes allowed.
+    #
+    # The base family is set once via app.setFont() in main.py; these sizes
+    # are the entire design system. No widget or stylesheet may invent its own
+    # font-size/font-family — it references a constant here, or opts a QLabel
+    # into a tier via the dynamic "txt" property (see _typography_qss):
+    #   FONT_CAPTION — captions, secondary metadata   -> QLabel[txt="caption"]
+    #   FONT_BASE    — default body text (app.setFont) -> QLabel[txt="body"]
+    #   FONT_HEADER  — H2: card / section titles       -> QLabel[txt="h2"]
+    #   FONT_H1      — H1: top-level emphasis          -> QLabel[txt="h1"]
+    # ----------------------------------------------------------------------
+    FONT_CAPTION = 11
+    FONT_BASE = 13
+    FONT_HEADER = 16
+    FONT_H1 = 20
+
+    # ----------------------------------------------------------------------
+    # Metrics — the semantic sizing scale for interactive controls.
+    #
+    # Button heights were previously hard-coded at the call site (54 for the
+    # scan row, 40 for the bottom action bar, 48-wide for the trash square),
+    # which broke the vertical rhythm: every action button rendered at a
+    # different height. These constants are the single source of truth so
+    # every primary action shares one height and icon-only buttons form a
+    # perfect square. No widget may invent its own button geometry — it
+    # references a constant here.
+    #   BUTTON_HEIGHT_PRIMARY — text action buttons (Scan, Compare, Move,
+    #                           Back, Confirm): one shared height.
+    #   BUTTON_HEIGHT_ICON    — square icon-only buttons (Trash): used as
+    #                           BOTH width and height so the button is a
+    #                           perfect square aligned to the primary row.
+    # ----------------------------------------------------------------------
+    BUTTON_HEIGHT_PRIMARY = 40
+    BUTTON_HEIGHT_ICON = 40
+
+    # The palette currently applied to the app; widgets read it via colors().
+    # Defaults to DARK because that is the theme MainWindow applies on startup.
+    _active = DARK
+
+    @classmethod
+    def colors(cls) -> dict:
+        """Return the semantic colour map (bg/surface/text/border) for the
+        theme currently applied to the application."""
+        return cls._active
+
     @staticmethod
-    def apply_modern_dark(app: QApplication):
+    def _resource_root() -> Path:
+        """Resolve the root directory that holds bundled resources.
+
+        Explicitly honours PyInstaller's ``sys._MEIPASS`` so SVG/PNG/ICNS and
+        ``.qss`` theme files load correctly from a frozen macOS ``.app`` bundle
+        (and Windows onefile/onedir builds). Falls back to the project root when
+        running from source.
+        """
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(meipass)
+        if getattr(sys, "frozen", False):
+            exe_dir = Path(sys.executable).resolve().parent
+            # macOS .app: data files live in Contents/Resources, next to MacOS/.
+            if sys.platform == "darwin":
+                mac_resources = exe_dir.parent / "Resources"
+                if mac_resources.exists():
+                    return mac_resources
+            return exe_dir
+        return Path(__file__).resolve().parent.parent
+
+    @classmethod
+    def asset_path(cls, relative: str) -> str:
+        """Absolute path to a bundled asset (works in dev and frozen builds)."""
+        return str(cls._resource_root() / relative)
+
+    @classmethod
+    def icon_path(cls, filename: str) -> str:
+        """Absolute path to a bundled icon (SVG/PNG/ICNS)."""
+        return str(cls._resource_root() / cls._ICONS_SUBDIR / filename)
+
+    @classmethod
+    def load_icon(cls, filename: str) -> QIcon:
+        """Load a bundled icon, degrading to an empty QIcon on any failure.
+
+        A missing or invalid file never raises, so a packaging slip cannot crash
+        startup — the window simply shows no custom icon.
+        """
+        path = cls.icon_path(filename)
+        if os.path.exists(path):
+            icon = QIcon(path)
+            if not icon.isNull():
+                return icon
+        try:
+            from utils.logger import auditor
+            auditor.warning(f"ThemeManager: icon asset missing or invalid: {path}")
+        except Exception:
+            pass
+        return QIcon()
+
+    @classmethod
+    def _load_stylesheet(cls, theme_name: str, fallback_qss: str) -> str:
+        """Return the stylesheet for ``theme_name``.
+
+        Prefers an external override at ``assets/themes/<theme_name>.qss`` so the
+        theme can be tuned without code changes; on any failure (missing file, or
+        a permission/encoding error inside a misconfigured bundle) it returns the
+        embedded ``fallback_qss`` string so the UI is always styled.
+        """
+        qss_path = cls._resource_root() / cls._THEMES_SUBDIR / f"{theme_name}.qss"
+        try:
+            if qss_path.is_file():
+                text = qss_path.read_text(encoding="utf-8")
+                if text.strip():
+                    return text
+        except OSError as exc:
+            try:
+                from utils.logger import auditor
+                auditor.warning(f"ThemeManager: failed to read {qss_path}: {exc}")
+            except Exception:
+                pass
+        return fallback_qss
+
+    @classmethod
+    def _typography_qss(cls) -> str:
+        """Theme-agnostic semantic type scale, appended to every stylesheet.
+
+        Widgets opt in with a dynamic property (``label.setProperty("txt","h2")``)
+        instead of hard-coding a font-size literal. Only SIZE/WEIGHT live here —
+        colour stays theme-driven via the base ``QLabel`` rules, which Qt merges
+        with these more-specific attribute selectors.
+        """
+        return (
+            f'QLabel[txt="h1"] {{ font-size: {cls.FONT_H1}px; font-weight: bold; }}'
+            f'QLabel[txt="h2"] {{ font-size: {cls.FONT_HEADER}px; font-weight: bold; }}'
+            f'QLabel[txt="body"] {{ font-size: {cls.FONT_BASE}px; }}'
+            f'QLabel[txt="caption"] {{ font-size: {cls.FONT_CAPTION}px; }}'
+        )
+
+    @classmethod
+    def apply_modern_dark(cls, app: QApplication):
+        cls._active = cls.DARK
         app.setStyle("Fusion")
         palette = QPalette()
-        palette.setColor(QPalette.ColorRole.Window, QColor(30, 31, 34))
-        palette.setColor(QPalette.ColorRole.WindowText, QColor(219, 222, 225))
-        palette.setColor(QPalette.ColorRole.Base, QColor(43, 45, 49))
-        palette.setColor(QPalette.ColorRole.Text, QColor(219, 222, 225))
+        palette.setColor(QPalette.ColorRole.Window, QColor(cls.DARK["bg"]))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor(cls.DARK["text"]))
+        palette.setColor(QPalette.ColorRole.Base, QColor(cls.DARK["surface"]))
+        palette.setColor(QPalette.ColorRole.Text, QColor(cls.DARK["text"]))
         palette.setColor(QPalette.ColorRole.Button, QColor(64, 66, 73))
-        palette.setColor(QPalette.ColorRole.ButtonText, QColor(219, 222, 225))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor(cls.DARK["text"]))
         app.setPalette(palette)
 
         qss = """
-        QWidget { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 14px; }
         QMainWindow, QWidget#sidebar { background-color: #1E1F22; }
         QWidget#card { background-color: #2B2D31; border-radius: 8px; }
         QWidget#toolbar_flat { background-color: #2B2D31; border-radius: 6px; }
         QWidget#controls_panel, QWidget#bottom_btns, QWidget#multi_slider_panel { background-color: #2B2D31; border-top: 1px solid #1E1F22; }
-        QWidget#video_bg { background-color: #000000; }
+        QWidget#video_bg { background-color: #2B2D31; }
         
         QPushButton { 
             background-color: #404249; color: #DBDEE1; 
@@ -31,9 +199,9 @@ class ThemeManager:
         QPushButton:pressed { background-color: #313338; }
         QPushButton:disabled { background-color: #313338; color: #5C5E66; }
         
-        QPushButton#primary { background-color: #23A559; color: white; font-weight: bold; font-size: 15px; }
+        QPushButton#primary { background-color: #23A559; color: white; font-weight: bold; }
         QPushButton#primary:hover { background-color: #1D8A4A; }
-        QPushButton#action { background-color: #5865F2; color: white; font-size: 14px; }
+        QPushButton#action { background-color: #5865F2; color: white; }
         QPushButton#action:hover { background-color: #4752C4; }
         
         QPushButton#secondary { 
@@ -48,7 +216,7 @@ class ThemeManager:
         QPushButton#collapser { background-color: transparent; color: #949BA4; padding: 4px 8px; }
         QPushButton#collapser:hover { background-color: #3F4147; color: #FFFFFF; }
         
-        QPushButton#player_btn { background-color: transparent; color: #FFFFFF; font-size: 18px; font-weight: bold; padding: 0px; }
+        QPushButton#player_btn { background-color: transparent; color: #FFFFFF; font-weight: bold; padding: 0px; }
         QPushButton#player_btn:hover { color: #5865F2; }
         
         QLineEdit { 
@@ -68,28 +236,50 @@ class ThemeManager:
         QTreeWidget::item:selected { background-color: #3F4147; color: white; }
         QHeaderView::section { background-color: #1E1F22; color: #949BA4; border: none; padding: 4px 8px; font-weight: bold; }
         
-        QComboBox { 
-            background-color: transparent; color: #DBDEE1; 
-            border: 1px solid #4E5058; border-radius: 6px; 
-            padding: 4px 8px 4px 8px; 
+        /* combobox-popup: 0 forces the non-native dropdown list so item metrics
+           come from QSS (not the macOS popup delegate); without it the highlight
+           rect and the click hitbox desync on macOS/Retina. */
+        QComboBox {
+            background-color: transparent; color: #DBDEE1;
+            border: 1px solid #4E5058; border-radius: 6px;
+            padding: 4px 6px 4px 6px;
+            combobox-popup: 0;
+            outline: none;
         }
         QComboBox:hover { background-color: #3F4147; border: 1px solid #5865F2; }
-        QComboBox:focus { border: 1px solid #5865F2; }
-        QComboBox::drop-down { border: none; width: 14px; }
-        QComboBox::down-arrow { image: none; }
-        
-        QComboBox QAbstractItemView { 
-            background-color: #2B2D31; color: #DBDEE1; 
-            border-radius: 6px; border: 1px solid #4E5058; 
-            selection-background-color: #5865F2; outline: none;
+        QComboBox:focus, QComboBox:on { border: 1px solid #5865F2; }
+        QComboBox::drop-down {
+            subcontrol-origin: padding; subcontrol-position: center right;
+            width: 20px; border: none; background: transparent;
         }
+        QComboBox::down-arrow { width: 12px; height: 12px; }
+        QComboBox::down-arrow:on { top: 1px; }
+
+        QComboBox QAbstractItemView {
+            background-color: #2B2D31; color: #DBDEE1;
+            border: 1px solid #4E5058; border-radius: 6px;
+            padding: 4px; outline: none;
+            selection-background-color: #5865F2; selection-color: #FFFFFF;
+        }
+        QComboBox QAbstractItemView::item {
+            min-height: 26px; padding: 4px 10px;
+            border: none; border-radius: 4px;
+        }
+        QComboBox QAbstractItemView::item:hover { background-color: #3F4147; color: #FFFFFF; }
+        QComboBox QAbstractItemView::item:selected { background-color: #5865F2; color: #FFFFFF; }
         
         QLabel { color: #DBDEE1; }
-        QLabel#status, QLabel#elide_label { color: #949BA4; font-size: 13px; }
+        QLabel#status, QLabel#elide_label { color: #949BA4; }
         QLabel#stat_val { color: #23A559; font-weight: bold; }
-        QLabel#player_time { color: #FFFFFF; font-size: 12px; font-weight: bold; }
+        QLabel#player_time { color: #FFFFFF; font-weight: bold; }
         
-        QSplitter::handle { background-color: #1E1F22; }
+        /* Crisp 1px hairline divider (handleWidth is 1px in code). A flat tone
+           keeps it minimal; it lights up with the accent only on hover/drag so
+           the splitter never reads as a thick native macOS bar. */
+        QSplitter::handle:horizontal { width: 1px; background-color: #2B2D31; }
+        QSplitter::handle:vertical { height: 1px; background-color: #2B2D31; }
+        QSplitter::handle:hover { background-color: #5865F2; }
+        QSplitter::handle:pressed { background-color: #4752C4; }
         QProgressBar { border: none; background-color: #1E1F22; border-radius: 2px; }
         QProgressBar::chunk { background-color: #5865F2; border-radius: 2px; }
         
@@ -97,38 +287,38 @@ class ThemeManager:
         QSlider::groove:horizontal { border: none; height: 4px; background: #1E1F22; border-radius: 2px; }
         QSlider::sub-page:horizontal { background: #5865F2; border-radius: 2px; }
         QSlider::handle:horizontal { background: #FFFFFF; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; border: 1px solid #1E1F22; }
-        QSlider::handle:horizontal:hover { background: #4D8BFF; transform: scale(1.1); }
+        QSlider::handle:horizontal:hover { background: #4D8BFF; }
         """
-        app.setStyleSheet(qss)
+        app.setStyleSheet(cls._load_stylesheet("dark", qss) + cls._typography_qss())
 
-    @staticmethod
-    def apply_modern_light(app: QApplication):
+    @classmethod
+    def apply_modern_light(cls, app: QApplication):
+        cls._active = cls.LIGHT
         app.setStyle("Fusion")
         palette = QPalette()
-        palette.setColor(QPalette.ColorRole.Window, QColor(242, 243, 245))
-        palette.setColor(QPalette.ColorRole.WindowText, QColor(49, 51, 56))
-        palette.setColor(QPalette.ColorRole.Base, QColor(255, 255, 255))
-        palette.setColor(QPalette.ColorRole.Text, QColor(49, 51, 56))
-        palette.setColor(QPalette.ColorRole.Button, QColor(227, 229, 232))
-        palette.setColor(QPalette.ColorRole.ButtonText, QColor(49, 51, 56))
+        palette.setColor(QPalette.ColorRole.Window, QColor(cls.LIGHT["bg"]))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor(cls.LIGHT["text"]))
+        palette.setColor(QPalette.ColorRole.Base, QColor(cls.LIGHT["surface"]))
+        palette.setColor(QPalette.ColorRole.Text, QColor(cls.LIGHT["text"]))
+        palette.setColor(QPalette.ColorRole.Button, QColor(cls.LIGHT["border"]))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor(cls.LIGHT["text"]))
         app.setPalette(palette)
 
         qss = """
-        QWidget { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 14px; }
         QMainWindow, QWidget#sidebar { background-color: #F2F3F5; }
         QWidget#card { background-color: #FFFFFF; border-radius: 8px; border: 1px solid #E3E5E8; }
         QWidget#toolbar_flat { background-color: #FFFFFF; border-radius: 6px; border: 1px solid #E3E5E8; }
         QWidget#controls_panel, QWidget#bottom_btns, QWidget#multi_slider_panel { background-color: #FFFFFF; border-top: 1px solid #E3E5E8; }
-        QWidget#video_bg { background-color: #E3E5E8; }
+        QWidget#video_bg { background-color: #FFFFFF; }
         
         QPushButton { background-color: #E3E5E8; color: #313338; border: none; border-radius: 6px; padding: 4px 10px; font-weight: 500; }
         QPushButton:hover { background-color: #D4D7DC; }
         QPushButton:pressed { background-color: #B5BAC1; }
         QPushButton:disabled { background-color: #E3E5E8; color: #949BA4; }
         
-        QPushButton#primary { background-color: #23A559; color: white; font-weight: bold; font-size: 15px; }
+        QPushButton#primary { background-color: #23A559; color: white; font-weight: bold; }
         QPushButton#primary:hover { background-color: #1D8A4A; }
-        QPushButton#action { background-color: #5865F2; color: white; font-size: 14px; }
+        QPushButton#action { background-color: #5865F2; color: white; }
         QPushButton#action:hover { background-color: #4752C4; }
         
         QPushButton#secondary { 
@@ -143,7 +333,7 @@ class ThemeManager:
         QPushButton#collapser { background-color: transparent; color: #5C5E66; padding: 4px 8px; }
         QPushButton#collapser:hover { background-color: #E3E5E8; color: #313338; }
         
-        QPushButton#player_btn { background-color: transparent; color: #313338; font-size: 18px; font-weight: bold; padding: 0px; }
+        QPushButton#player_btn { background-color: transparent; color: #313338; font-weight: bold; padding: 0px; }
         QPushButton#player_btn:hover { color: #5865F2; }
         
         QLineEdit { 
@@ -163,28 +353,50 @@ class ThemeManager:
         QTreeWidget::item:selected { background-color: #E3E5E8; color: #000000; }
         QHeaderView::section { background-color: #F2F3F5; color: #5C5E66; border: none; padding: 4px 8px; font-weight: bold; border-bottom: 1px solid #E3E5E8; }
         
-        QComboBox { 
-            background-color: transparent; color: #313338; 
-            border: 1px solid #D4D7DC; border-radius: 6px; 
-            padding: 4px 8px 4px 8px; 
+        /* combobox-popup: 0 forces the non-native dropdown list so item metrics
+           come from QSS (not the macOS popup delegate); without it the highlight
+           rect and the click hitbox desync on macOS/Retina. */
+        QComboBox {
+            background-color: transparent; color: #313338;
+            border: 1px solid #D4D7DC; border-radius: 6px;
+            padding: 4px 6px 4px 6px;
+            combobox-popup: 0;
+            outline: none;
         }
         QComboBox:hover { background-color: #F2F3F5; border: 1px solid #5865F2; }
-        QComboBox:focus { border: 1px solid #5865F2; }
-        QComboBox::drop-down { border: none; width: 14px; }
-        QComboBox::down-arrow { image: none; }
-        
-        QComboBox QAbstractItemView { 
-            background-color: #FFFFFF; color: #313338; 
-            border-radius: 6px; border: 1px solid #D4D7DC; 
-            selection-background-color: #5865F2; selection-color: white; outline: none;
+        QComboBox:focus, QComboBox:on { border: 1px solid #5865F2; }
+        QComboBox::drop-down {
+            subcontrol-origin: padding; subcontrol-position: center right;
+            width: 20px; border: none; background: transparent;
         }
+        QComboBox::down-arrow { width: 12px; height: 12px; }
+        QComboBox::down-arrow:on { top: 1px; }
+
+        QComboBox QAbstractItemView {
+            background-color: #FFFFFF; color: #313338;
+            border: 1px solid #D4D7DC; border-radius: 6px;
+            padding: 4px; outline: none;
+            selection-background-color: #5865F2; selection-color: #FFFFFF;
+        }
+        QComboBox QAbstractItemView::item {
+            min-height: 26px; padding: 4px 10px;
+            border: none; border-radius: 4px;
+        }
+        QComboBox QAbstractItemView::item:hover { background-color: #F2F3F5; color: #313338; }
+        QComboBox QAbstractItemView::item:selected { background-color: #5865F2; color: #FFFFFF; }
         
         QLabel { color: #313338; }
-        QLabel#status, QLabel#elide_label { color: #5C5E66; font-size: 13px; }
+        QLabel#status, QLabel#elide_label { color: #5C5E66; }
         QLabel#stat_val { color: #23A559; font-weight: bold; }
-        QLabel#player_time { color: #313338; font-size: 12px; font-weight: bold; }
+        QLabel#player_time { color: #313338; font-weight: bold; }
         
-        QSplitter::handle { background-color: #E3E5E8; }
+        /* Crisp 1px hairline divider (handleWidth is 1px in code). A flat tone
+           keeps it minimal; it lights up with the accent only on hover/drag so
+           the splitter never reads as a thick native macOS bar. */
+        QSplitter::handle:horizontal { width: 1px; background-color: #E3E5E8; }
+        QSplitter::handle:vertical { height: 1px; background-color: #E3E5E8; }
+        QSplitter::handle:hover { background-color: #5865F2; }
+        QSplitter::handle:pressed { background-color: #4752C4; }
         QProgressBar { border: none; background-color: #E3E5E8; border-radius: 2px; }
         QProgressBar::chunk { background-color: #5865F2; border-radius: 2px; }
         
@@ -192,12 +404,18 @@ class ThemeManager:
         QSlider::groove:horizontal { border: none; height: 4px; background: #E3E5E8; border-radius: 2px; }
         QSlider::sub-page:horizontal { background: #5865F2; border-radius: 2px; }
         QSlider::handle:horizontal { background: #FFFFFF; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; border: 1px solid #D4D7DC; }
-        QSlider::handle:horizontal:hover { background: #F2F3F5; transform: scale(1.1); }
+        QSlider::handle:horizontal:hover { background: #F2F3F5; }
         """
-        app.setStyleSheet(qss)
+        app.setStyleSheet(cls._load_stylesheet("light", qss) + cls._typography_qss())
 
-    @staticmethod
-    def apply_system_theme(app: QApplication):
+    @classmethod
+    def apply_system_theme(cls, app: QApplication):
         app.setStyle("Fusion")
-        app.setPalette(app.style().standardPalette())
-        app.setStyleSheet("")
+        std = app.style().standardPalette()
+        app.setPalette(std)
+        app.setStyleSheet(cls._typography_qss())
+        # Keep colors() coherent with whatever the OS handed us: pick the
+        # semantic map whose brightness matches the system window background,
+        # so a video letterbox (and anything else reading colors()) blends in.
+        window = std.color(QPalette.ColorRole.Window)
+        cls._active = cls.DARK if window.lightnessF() < 0.5 else cls.LIGHT

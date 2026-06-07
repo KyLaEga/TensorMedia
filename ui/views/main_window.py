@@ -9,20 +9,124 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QProgressBar, QComboBox, QLineEdit, QRadioButton, 
                              QButtonGroup, QHeaderView, QSplitter, QScrollArea, 
                              QApplication, QCheckBox, QFrame, QStackedWidget, QGridLayout, 
-                             QSizePolicy, QAbstractItemView, QMessageBox)
+                             QSizePolicy, QSpacerItem, QAbstractItemView, QMessageBox,
+                             QStyle, QStyleOptionComboBox, QStylePainter)
 from PySide6.QtCore import Qt, QSettings, Signal, QSortFilterProxyModel, QModelIndex
-from PySide6.QtGui import QStandardItemModel
+from PySide6.QtGui import QStandardItemModel, QKeySequence, QAction, QFontMetrics
 
 from utils.theme_manager import ThemeManager
 from utils.i18n import translator
-from utils.env_config import get_data_dir
 from utils.logger import auditor
 from core.db.vector_cache import VectorCache
 from core.ml.faiss_manager import FaissManager
 
+from ui.workers import MaintenanceWorker, PurgeWorker
 from ui.components.video_player import BuiltInVideoPlayer, JumpSlider
 from ui.components.media_tree import MediaTreeView, LazyClusterModel
 from ui.components.image_label import ScalableImageLabel
+from ui.views.multi_compare import MultiCompareWidget
+
+class ElidingLabel(QLabel):
+    """QLabel that truncates with an ellipsis instead of clipping or forcing
+    its parent wider. Stores the full string and re-elides on every resize, so
+    it has a *defined* shrink behaviour (unlike setWordWrap, which converts
+    horizontal pressure into vertical overlap). SizePolicy is Ignored on the
+    horizontal axis so the layout is free to take it below its sizeHint."""
+
+    def __init__(self, text="", parent=None, mode=Qt.TextElideMode.ElideRight):
+        super().__init__(text, parent)
+        self._mode = mode
+        self._full_text = text
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+
+    def setText(self, text):
+        self._full_text = text or ""
+        self._apply_elision()
+
+    def text(self):
+        return self._full_text
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_elision()
+
+    def _apply_elision(self):
+        fm = QFontMetrics(self.font())
+        # contentsRect() respects margins; fall back to width() if unset.
+        avail = max(0, self.contentsRect().width() or self.width())
+        super().setText(fm.elidedText(self._full_text, self._mode, avail))
+        self.setToolTip(self._full_text if super().text() != self._full_text else "")
+
+
+class FluidComboBox(QComboBox):
+    """A combo whose CLOSED body is free to shrink with its container, while
+    its DROPDOWN popup always opens wide enough to show the full text of the
+    widest item — overflowing neighbouring widgets instead of forcing the whole
+    row (and the sidebar) wider.
+
+    Stock QComboBox keeps these two widths coupled, which is what produced the
+    competing requirements before (a hard sidebar floor just so the closed box
+    could paint its text). Here they are decoupled:
+
+      * closed box  -> Ignored horizontal policy + AdjustToMinimumContentsLength:
+                       the layout may take it below its content width and the
+                       visible label is ELIDED with "…" (no mid-glyph clipping).
+      * popup view  -> minimum width recomputed on every showPopup() from the
+                       widest item, so the list itself never clips.
+
+    Height stays on the design-system rhythm via setFixedHeight() at the call
+    site (a fixed HEIGHT does not break horizontal fluidity)."""
+
+    _POPUP_PADDING = 44  # item h-padding (20) + frame + scrollbar headroom
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Body yields to the layout; only the popup honours content width.
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.setMinimumContentsLength(0)
+
+    def _widest_item_px(self) -> int:
+        fm = self.view().fontMetrics()
+        widest = 0
+        for i in range(self.count()):
+            widest = max(widest, fm.horizontalAdvance(self.itemText(i)))
+        return widest
+
+    def showPopup(self):
+        # ОТВЯЗКА POPUP от свёрнутого тела. Только setMinimumWidth(view) ненадёжно:
+        # к моменту showPopup геометрия контейнера (QComboBoxPrivateContainer) уже
+        # вычислена по ширине свёрнутого селектора, поэтому список оставался зажат
+        # шириной QComboBox. Чиним в два такта:
+        #   1) до показа задаём минимум самому view (виджету списка);
+        #   2) после показа — ПРИНУДИТЕЛЬНО расширяем окно-контейнер popup до
+        #      ширины самого широкого пункта, игнорируя ширину тела.
+        target = self._widest_item_px() + self._POPUP_PADDING
+        self.view().setMinimumWidth(target)
+        super().showPopup()
+        container = self.view().window()  # QComboBoxPrivateContainer (top-level)
+        if container is not None and container.width() < target:
+            container.setMinimumWidth(target)
+            container.resize(target, container.height())
+
+    def paintEvent(self, event):
+        # Replicate QComboBox::paintEvent but with an ELIDED label so a shrunk
+        # box reads "Визуаль…" instead of clipping a glyph in half.
+        painter = QStylePainter(self)
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        field = self.style().subControlRect(
+            QStyle.ComplexControl.CC_ComboBox, opt,
+            QStyle.SubControl.SC_ComboBoxEditField, self,
+        )
+        opt.currentText = self.fontMetrics().elidedText(
+            opt.currentText, Qt.TextElideMode.ElideRight, field.width()
+        )
+        painter.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, opt)
+        painter.drawControl(QStyle.ControlElement.CE_ComboBoxLabel, opt)
+
 
 class ArbitrageSortFilterProxyModel(QSortFilterProxyModel):
     def __init__(self, parent=None):
@@ -110,10 +214,12 @@ class ArbitrageSortFilterProxyModel(QSortFilterProxyModel):
                     except (ValueError, TypeError): 
                         return 0
                 return get_area(left_data.get('res', '')) < get_area(right_data.get('res', ''))
-            elif col == 5: 
+            elif col == 5:
                 return float(left_data.get('mtime', 0.0)) < float(right_data.get('mtime', 0.0))
-        except Exception:
-            pass
+        except (ValueError, TypeError, KeyError, AttributeError) as e:
+            # Fall back to the base comparator on malformed row data; log at
+            # debug so the silent swallow is at least diagnosable.
+            auditor.debug(f"Sort comparator fallback (col {col}): {e}", exc_info=True)
 
         return super().lessThan(left, right)
 
@@ -126,13 +232,14 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Tensor Media Arbitrage v1.0")
         self.resize(1450, 900)
-        self.settings = QSettings("TensorMedia", "ArbitrageConfig")
+        self.settings = QSettings("TensorMedia", "Arbitrage")
         
         self._setup_ui()
-        ThemeManager.apply_modern_dark(QApplication.instance()) 
-        self._restore_state() 
+        self._setup_menubar()
+        ThemeManager.apply_modern_dark(QApplication.instance())
+        self._restore_state()
         self.setAcceptDrops(True)
-        
+
         translator.language_changed.connect(self._retranslate_ui)
         self._retranslate_ui()
 
@@ -161,10 +268,34 @@ class MainWindow(QMainWindow):
             self.directory_dropped.emit(urls[0].toLocalFile())
 
     def closeEvent(self, event):
-        self.settings.setValue("master_splitter", self.master_splitter.saveState())
-        self.settings.setValue("inner_splitter", self.inner_splitter.saveState())
-        self.window_closed.emit()
-        super().closeEvent(event)
+        # Cmd-Q / закрытие окна. ПОРЯДОК ВАЖЕН:
+        # 1) window_closed.emit() синхронно (DirectConnection в GUI-потоке)
+        #    прогоняет MainController._on_window_closed и MLOrchestrator.stop_all —
+        #    они глушат QThread-воркеры и КОРРЕКТНО гасят multiprocessing-пул
+        #    (terminate/join), освобождая семафоры; иначе в консоль падает
+        #    'leaked semaphore objects'.
+        # 2) ТОЛЬКО ПОСЛЕ этого валим процесс os._exit(0) — немедленный выход без
+        #    C++-деструкторов живого Qt-дерева (иначе Abort trap: 6 / SIGABRT на
+        #    висящих фоновых пулах и потоках).
+        #
+        # ВНИМАНИЕ: здесь НЕЛЬЗЯ слать SIGKILL. Сигнал 9 заставляет zsh печатать
+        # "zsh: killed" и прилетает АСИНХРОННО — он обгоняет resource_tracker и
+        # оставляет 'leaked semaphore objects'. Семафоры пула/Value снимаются
+        # синхронно внутри stop_all (terminate/join + gc.collect → sem_unlink),
+        # после чего процесс штатно завершается os._exit(0): код возврата 0 (нет
+        # "zsh: killed") и никаких C++-деструкторов (нет SIGABRT).
+        # STATE PERSISTENCE. saveGeometry() кодирует позицию/размер/экран/режим
+        # окна; saveState() — пропорции сплиттеров. КРИТИЧНО вызвать sync() ЯВНО:
+        # ниже мы валим процесс os._exit(0), который пропускает Qt-деструкторы и
+        # штатный flush QSettings в конце event-loop. Без sync() значения остаются
+        # только в памяти процесса и теряются — именно поэтому окно «не помнило»
+        # пропорции между сессиями, хотя setValue вызывался.
+        self.settings.setValue('geometry', self.saveGeometry())
+        self.settings.setValue('master_splitter', self.master_splitter.saveState())
+        self.settings.setValue('inner_splitter', self.inner_splitter.saveState())
+        self.settings.sync()  # синхронный сброс на диск ДО os._exit
+        self.window_closed.emit()  # Синхронно вызывает stop_all и освобождает семафоры
+        os._exit(0)
 
     def _switch_tab(self, index: int):
         self.tabs.setCurrentIndex(index)
@@ -172,8 +303,27 @@ class MainWindow(QMainWindow):
         self.btn_tab_analytics.setChecked(index == 1)
 
     def _setup_ui(self):
+        # Корневой QStackedWidget центрального виджета:
+        #   index 0 — основной интерфейс (дерево + инспектор);
+        #   index 1 — встроенная страница сравнения (MultiCompareWidget).
+        # Сравнение — НЕ диалог: это обычная страница стека, переключаемая через
+        # setCurrentIndex(1). Так macOS не создаёт второго NSWindow и не уводит
+        # приложение на другой Space ("Spaces Jump").
+        self.root_stack = QStackedWidget()
+        self.setCentralWidget(self.root_stack)
+
         central = QWidget()
-        self.setCentralWidget(central)
+        self.root_stack.addWidget(central)  # index 0
+
+        # ПОСТОЯННАЯ страница сравнения создаётся один раз при старте и живёт
+        # под index 1 стека (отказ от паттерна Destroy & Rebuild). Резкое
+        # удаление/пересоздание виджета и скрытие QVideoWidget в полноэкранном
+        # режиме вызывало панику macOS WindowServer ("Spaces Jump"). Теперь
+        # виджет переиспользуется: контроллер вызывает load(file_paths) перед
+        # каждым показом, а тяжёлые медиа-декодеры поднимаются отложенно из
+        # showEvent — уже в активном Space. См. MultiCompareWidget.
+        self.compare_widget = MultiCompareWidget(self)
+        self.root_stack.addWidget(self.compare_widget)  # index 1
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
@@ -184,10 +334,61 @@ class MainWindow(QMainWindow):
 
         self.sidebar_widget = QWidget()
         self.sidebar_widget.setObjectName("sidebar")
-        self.sidebar_widget.setFixedWidth(310) 
-        
-        sidebar_layout = QVBoxLayout(self.sidebar_widget)
-        sidebar_layout.setContentsMargins(10, 10, 10, 10) 
+        # HARD minimum width — НЕ fluid-подсказка. Это абсолютный физический пол,
+        # который QSplitter не имеет права нарушить ни перетаскиванием ручки, ни
+        # перераспределением места под давлением правой панели (см. RCA).
+        # Связующее ограничение — ряд движка ("Режим:" + "Визуальный (SigLIP)") в
+        # cal_card:
+        #   label 64 + spacing 6 + combo.sizeHint 190 = 260 (содержимое ряда)
+        #   + поля cal_card (14+14)               =  28
+        #   + поля sidebar_layout (12+12)         =  24
+        #   ----------------------------------------------------
+        #   = 312px ровно; SIDEBAR_MIN_WIDTH=350 даёт ~38px запаса. Этого хватает,
+        #   чтобы поглотить даже непрозрачный 17px-скроллбар (Win/Linux) БЕЗ
+        #   резерва правого поля — на macOS скроллбар overlay (ширина 0), поэтому
+        #   поля симметричны. RU — худшая локаль ("Режим:"=64 > EN "Engine:"=60;
+        #   оба пункта движка ≈159px), поэтому 350 покрывает и EN.
+        #   Ниже этого порога QComboBox перестаёт вмещать текст и обрезался до
+        #   "Визуальный (Sig…", а фиксированные по высоте ряды HUD/кнопок
+        #   наслаивались (Z-collision). Пол гарантирует, что текст всегда влезает.
+        self.SIDEBAR_MIN_WIDTH = 350
+        self.sidebar_widget.setMinimumWidth(self.SIDEBAR_MIN_WIDTH)
+
+        # Overflow protection. The shell added to the splitter holds ONLY a
+        # QScrollArea; the real content lives inside it. Horizontal fit is now
+        # guaranteed by the hard minimum width above (the splitter cannot make
+        # the panel narrower than the widest control row), so horizontal scroll
+        # stays OFF — it would only hide controls off-screen. The scroll area
+        # exists for the VERTICAL axis: short windows shed height as scroll
+        # instead of letting blocks overlap.
+        _sidebar_shell = QVBoxLayout(self.sidebar_widget)
+        _sidebar_shell.setContentsMargins(0, 0, 0, 0)
+        _sidebar_shell.setSpacing(0)
+
+        self.sidebar_scroll = QScrollArea()
+        self.sidebar_scroll.setObjectName("sidebar_scroll")
+        self.sidebar_scroll.setWidgetResizable(True)
+        self.sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.sidebar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # Let the panel's "sidebar" background show through the viewport.
+        self.sidebar_scroll.setStyleSheet(
+            "QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }"
+        )
+        _sidebar_shell.addWidget(self.sidebar_scroll)
+
+        sidebar_content = QWidget()
+        self.sidebar_scroll.setWidget(sidebar_content)
+
+        sidebar_layout = QVBoxLayout(sidebar_content)
+        # СИММЕТРИЧНЫЕ поля — карточки центрируются по оси панели. Резерв под
+        # скроллбар убран: на macOS вертикальный скроллбар overlay (рисуется
+        # поверх, ширины в раскладке не занимает), а на Win/Linux непрозрачный
+        # скроллбар сжимает viewport QScrollArea — Qt сам уводит контент левее,
+        # ничего не перекрывая. Горизонтальный запас уже гарантирован жёстким
+        # SIDEBAR_MIN_WIDTH=350 (~38px форы). Асимметричный правый отступ лишь
+        # дублировал эту защиту и ломал центральную ось карточек.
+        sidebar_layout.setContentsMargins(12, 12, 12, 12)
         sidebar_layout.setSpacing(12)
 
         top_bar = QHBoxLayout()
@@ -228,11 +429,11 @@ class MainWindow(QMainWindow):
         tab_css = """
         QPushButton {
             background-color: transparent; color: #949BA4;
-            border: 1px solid #4E5058; border-radius: 6px; 
-            font-size: 14px; font-weight: bold;
+            border: 1px solid #4E5058; border-radius: 6px;
+            font-weight: bold;
         }
         QPushButton:checked {
-            background-color: #5865F2; color: white; border: none;
+            background-color: #5865F2; color: white; border: 1px solid #5865F2;
         }
         QPushButton:hover:!checked { background-color: #3F4147; color: #DBDEE1; }
         """
@@ -269,10 +470,14 @@ class MainWindow(QMainWindow):
         dir_l.setContentsMargins(14, 14, 14, 14) 
         dir_l.setSpacing(12) 
         
-        mode_l = QHBoxLayout()
-        mode_l.setSpacing(15) 
+        mode_l = QVBoxLayout()
+        mode_l.setSpacing(6)
         self.rb_single = QRadioButton()
         self.rb_dual = QRadioButton()
+        for rb in (self.rb_single, self.rb_dual):
+            # Expand horizontally so each radio gets its share of the row and the
+            # (translated) label is never clipped — no brittle fixed minimum width.
+            rb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.rb_single.setChecked(True)
         mode_l.addWidget(self.rb_single)
         mode_l.addWidget(self.rb_dual)
@@ -281,11 +486,13 @@ class MainWindow(QMainWindow):
         dir_a_l = QHBoxLayout()
         self.btn_select_a = QPushButton()
         self.btn_select_a.setObjectName("secondary")
-        self.btn_select_a.setMinimumWidth(110) 
-        self.btn_select_a.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        # Fluid: size to its own label, let the elided path label take the slack.
+        self.btn_select_a.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         dir_a_l.addWidget(self.btn_select_a)
         self.lbl_path_a = QLabel()
         self.lbl_path_a.setObjectName("elide_label")
+        self.lbl_path_a.setWordWrap(True)
+        self.lbl_path_a.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         dir_a_l.addWidget(self.lbl_path_a, stretch=1)
         dir_l.addLayout(dir_a_l)
 
@@ -294,26 +501,38 @@ class MainWindow(QMainWindow):
         dir_b_l.setContentsMargins(0, 0, 0, 0)
         self.btn_select_b = QPushButton()
         self.btn_select_b.setObjectName("secondary")
-        self.btn_select_b.setMinimumWidth(110) 
-        self.btn_select_b.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        # Fluid: size to its own label, let the elided path label take the slack.
+        self.btn_select_b.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         dir_b_l.addWidget(self.btn_select_b)
         self.lbl_path_b = QLabel()
         self.lbl_path_b.setObjectName("elide_label")
+        self.lbl_path_b.setWordWrap(True)
+        self.lbl_path_b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         dir_b_l.addWidget(self.lbl_path_b, stretch=1)
         dir_l.addWidget(self.dir_b_widget)
         self.dir_b_widget.hide()
         
-        type_l = QHBoxLayout()
-        type_l.setSpacing(15) 
+        # Сетка вместо одного ряда: при фиксированной ширине сайдбара (310px)
+        # три чекбокса в одну строку не помещались и "Документы" обрезались.
+        # Раскладываем 2 колонки x 2 строки: Фото/Видео сверху, Документы снизу.
+        # Колонки тянутся равномерно, а сами чекбоксы расширяются, поэтому текст
+        # любой длины гарантированно влезает.
+        type_l = QGridLayout()
+        type_l.setSpacing(8)
+        type_l.setContentsMargins(0, 0, 0, 0)
+        type_l.setColumnStretch(0, 1)
+        type_l.setColumnStretch(1, 1)
         self.chk_img = QCheckBox()
         self.chk_img.setChecked(True)
         self.chk_vid = QCheckBox()
         self.chk_vid.setChecked(True)
         self.chk_doc = QCheckBox()
         self.chk_doc.setChecked(True)
-        type_l.addWidget(self.chk_img)
-        type_l.addWidget(self.chk_vid)
-        type_l.addWidget(self.chk_doc)
+        for _chk in (self.chk_img, self.chk_vid, self.chk_doc):
+            _chk.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        type_l.addWidget(self.chk_img, 0, 0)
+        type_l.addWidget(self.chk_vid, 0, 1)
+        type_l.addWidget(self.chk_doc, 1, 0, 1, 2)  # на всю ширину второй строки
         dir_l.addLayout(type_l)
         config_l.addWidget(dir_card)
 
@@ -324,18 +543,37 @@ class MainWindow(QMainWindow):
         cal_l.setSpacing(12) 
         
         engine_mode_l = QHBoxLayout()
+        # Нулевые поля + детерминированный зазор: ряд не наследует никаких
+        # неявных отступов под-раскладки, гэп между меткой и селектором фиксирован.
+        engine_mode_l.setContentsMargins(0, 0, 0, 0)
+        # Плотный зазор метка↔селектор: 6px вместо 8px отдаёт 2px обратно combo.
+        engine_mode_l.setSpacing(6)
+
         self.lbl_engine_mode = QLabel()
-        engine_mode_l.addWidget(self.lbl_engine_mode)
-        
-        self.combo_engine = QComboBox()
-        self.combo_engine.setMinimumWidth(180) 
+        # МЕТКА = РОВНО ШИРИНА ТЕКСТА. Fixed по горизонтали + stretch 0: метка
+        # резервирует только пиксели своего слова ("Режим:"), а не долю ряда.
+        # Так исчезает искусственная пустая зона, из-за которой жёсткая пропорция
+        # 1:2 отдавала метке треть контейнера и сжимала селектор.
+        self.lbl_engine_mode.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred
+        )
+        engine_mode_l.addWidget(self.lbl_engine_mode, 0)
+
+        self.combo_engine = FluidComboBox()
         self.combo_engine.setFixedHeight(34)
-        self.combo_engine.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.combo_engine.addItems(["", ""]) 
-        engine_mode_l.addWidget(self.combo_engine)
+        # СЕЛЕКТОР ЗАБИРАЕТ ВСЁ ОСТАВШЕЕСЯ. Expanding + stretch 1: combo вплотную
+        # прижимается к метке и тянется до правого края карточки, поэтому
+        # "Визуальный (SigLIP)" помещается целиком (elide из FluidComboBox
+        # остаётся лишь страховкой на экстремально узких окнах).
+        self.combo_engine.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.combo_engine.addItems(["", ""])
+        engine_mode_l.addWidget(self.combo_engine, 1)
         cal_l.addLayout(engine_mode_l)
 
         self.lbl_threshold_title = QLabel()
+        self.lbl_threshold_title.setProperty("txt", "h2")
         cal_l.addWidget(self.lbl_threshold_title)
         
         self.mode_btn_group = QButtonGroup(self)
@@ -367,14 +605,29 @@ class MainWindow(QMainWindow):
         cal_l.addWidget(modes_grid_widget)
         
         slider_l = QHBoxLayout()
+        # Симметрия ряда: нулевые поля под-раскладки → левый край ползунка и
+        # правый край пина упираются ровно в поля cal_l (14 слева / 14 справа).
+        # Никаких QSpacerItem справа от пина: пин — последний элемент ряда.
+        slider_l.setContentsMargins(0, 0, 0, 0)
+        slider_l.setSpacing(8)
         self.slider_threshold = JumpSlider(Qt.Orientation.Horizontal)
         self.slider_threshold.setRange(50, 100)
         self.slider_threshold.setValue(88)
         self.lbl_threshold = QLabel("88%")
-        self.lbl_threshold.setFixedWidth(40)
-        self.lbl_threshold.setAlignment(Qt.AlignmentFlag.AlignRight)
-        slider_l.addWidget(self.slider_threshold)
-        slider_l.addWidget(self.lbl_threshold)
+        # СТАТИЧНЫЙ ОТСТУП. Ширину пина жёстко фиксируем по самому широкому
+        # значению ("100%"), а НЕ по живому тексту. Иначе при 88% ↔ 100% (и при
+        # смене локали, меняющей метрики шрифта) ширина пина плавала, и правый
+        # зазор от ползунка до края карточки «дышал». Фикс-ширина изолирует
+        # геометрию ряда от длины подписи: правый край ползунка теперь
+        # детерминирован и одинаков в EN и RU.
+        _thr_fm = QFontMetrics(self.lbl_threshold.font())
+        self.lbl_threshold.setFixedWidth(_thr_fm.horizontalAdvance("100%") + 6)
+        self.lbl_threshold.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.lbl_threshold.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        # stretch=1 ползунку, 0 пину: весь свободный ход забирает ползунок, пин
+        # держит свою фикс-ширину как жёсткую распорку у правого края карточки.
+        slider_l.addWidget(self.slider_threshold, 1)
+        slider_l.addWidget(self.lbl_threshold, 0)
         cal_l.addLayout(slider_l)
         config_l.addWidget(cal_card)
 
@@ -382,6 +635,12 @@ class MainWindow(QMainWindow):
         self.btn_toggle_db.setObjectName("secondary")
         self.btn_toggle_db.setCheckable(True)
         self.btn_toggle_db.setFixedHeight(34)
+        # Тянем на всю ширину config_l (поля 0): левый/правый края кнопки
+        # совпадают с внешними краями dir_card/cal_card — ровный прямоугольник
+        # контента без визуальных выступов.
+        self.btn_toggle_db.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         config_l.addWidget(self.btn_toggle_db)
 
         self.db_card = QWidget()
@@ -392,7 +651,7 @@ class MainWindow(QMainWindow):
         
         self.lbl_db_info = QLabel()
         self.lbl_db_info.setWordWrap(True)
-        self.lbl_db_info.setStyleSheet("color: #949BA4; font-size: 11px;")
+        self.lbl_db_info.setStyleSheet("color: #949BA4;")
         db_l.addWidget(self.lbl_db_info)
         
         db_btns_l = QHBoxLayout()
@@ -415,8 +674,16 @@ class MainWindow(QMainWindow):
             }
             QPushButton:hover { background-color: #f33a37; }
         """)
-        self.btn_purge_db.setFixedHeight(34) 
-        
+        self.btn_purge_db.setFixedHeight(34)
+
+        # TASK 3 — Paired buttons in one row must shrink in lockstep, never one
+        # truncating before the other. Equal stretch (1/1) splits width evenly;
+        # MinimumExpanding keeps both growable. The shared min-width floor is
+        # derived from the longest *localized* label and applied in
+        # _retranslate_ui (text is empty here), so it also re-fits on lang switch.
+        for _btn in (self.btn_clear_faiss, self.btn_purge_db):
+            _btn.setSizePolicy(QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed)
+
         db_btns_l.addWidget(self.btn_clear_faiss, 1)
         db_btns_l.addWidget(self.btn_purge_db, 1)
         db_l.addLayout(db_btns_l)
@@ -443,6 +710,7 @@ class MainWindow(QMainWindow):
         stat_l.setSpacing(8)
         
         self.lbl_stat_title = QLabel()
+        self.lbl_stat_title.setProperty("txt", "h2")
         self.lbl_stat_title_time = QLabel()
         self.lbl_stat_title_files = QLabel()
         self.lbl_stat_title_dups = QLabel()
@@ -505,23 +773,32 @@ class MainWindow(QMainWindow):
             c.setFixedSize(10, 10)
             c.setStyleSheet(f"background-color: {color}; border-radius: 2px;")
             lbl_title = QLabel()
-            lbl_title.setStyleSheet("font-size: 11px; font-weight: bold; color: #DCDDDE;")
+            lbl_title.setStyleSheet("font-weight: bold; color: #DCDDDE;")
             hdr_l.addWidget(c)
             hdr_l.addWidget(lbl_title)
             hdr_l.addStretch()
             
             lbl_pct = QLabel("0%")
-            lbl_pct.setStyleSheet("font-size: 11px; color: #949BA4;")
+            lbl_pct.setStyleSheet("color: #949BA4;")
             lbl_dup = QLabel("0")
-            lbl_dup.setStyleSheet("font-size: 11px; color: #949BA4;")
+            lbl_dup.setStyleSheet("color: #949BA4;")
             lbl_sz = QLabel("0.0 MB")
-            lbl_sz.setStyleSheet("font-size: 11px; color: #949BA4;")
-            
+            lbl_sz.setStyleSheet("color: #949BA4;")
+
+            # The "Total files: N" text is long and lives in a narrow column of
+            # the fixed-width sidebar. Let the value labels wrap and expand to
+            # fill their cell instead of being clipped — no hard width caps.
+            for lbl in (lbl_title, lbl_pct, lbl_dup, lbl_sz):
+                lbl.setWordWrap(True)
+                lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
             legend_l.addWidget(hdr_w, 0, col_idx)
             legend_l.addWidget(lbl_pct, 1, col_idx)
             legend_l.addWidget(lbl_dup, 2, col_idx)
             legend_l.addWidget(lbl_sz, 3, col_idx)
-            
+            # Give every legend column an equal share of the available width.
+            legend_l.setColumnStretch(col_idx, 1)
+
             return lbl_title, lbl_pct, lbl_dup, lbl_sz
 
         self.leg_img_title, self.leg_img_pct, self.leg_img_dup, self.leg_img_sz = make_legend_column("#5865F2", 0)
@@ -537,6 +814,7 @@ class MainWindow(QMainWindow):
         filter_l.setContentsMargins(14, 14, 14, 14)
         filter_l.setSpacing(10)
         self.lbl_filter_title = QLabel()
+        self.lbl_filter_title.setProperty("txt", "h2")
         filter_l.addWidget(self.lbl_filter_title)
         
         self.search_input = QLineEdit()
@@ -546,8 +824,9 @@ class MainWindow(QMainWindow):
         f_box = QHBoxLayout()
         self.lbl_filter_type = QLabel()
         f_box.addWidget(self.lbl_filter_type)
-        self.combo_view_filter = QComboBox()
+        self.combo_view_filter = FluidComboBox()
         self.combo_view_filter.setFixedHeight(34)
+        # Fluid: closed box shrinks/elides, popup opens to the widest filter name.
         self.combo_view_filter.addItems(["", "", "", ""])
         f_box.addWidget(self.combo_view_filter)
         filter_l.addLayout(f_box)
@@ -559,10 +838,12 @@ class MainWindow(QMainWindow):
         mark_l.setContentsMargins(14, 14, 14, 14)
         mark_l.setSpacing(10)
         self.lbl_mark_title = QLabel()
+        self.lbl_mark_title.setProperty("txt", "h2")
         mark_l.addWidget(self.lbl_mark_title)
         
-        self.combo_strategy = QComboBox()
+        self.combo_strategy = FluidComboBox()
         self.combo_strategy.setFixedHeight(34)
+        # Fluid: closed box shrinks/elides, popup opens to "Самые старые (По дате)".
         self.combo_strategy.addItems(["", "", "", ""])
         self.chk_keep_clean = QCheckBox()
         self.chk_keep_clean.setChecked(True)
@@ -577,6 +858,9 @@ class MainWindow(QMainWindow):
         self.btn_clear_select = QPushButton()
         self.btn_clear_select.setObjectName("secondary")
         self.btn_clear_select.setFixedHeight(34)
+        # Ctrl/Cmd+D больше НЕ висит на этой кнопке: шорткат переехал в нативный
+        # QMenuBar ("Правка" → "Снять выделение", см. _setup_menubar), чтобы не
+        # было двойного срабатывания. Кнопка остаётся как обычный сброс галочек.
         auto_tools_l.addWidget(self.btn_auto_select)
         auto_tools_l.addWidget(self.btn_clear_select)
         mark_l.addLayout(auto_tools_l)
@@ -590,17 +874,29 @@ class MainWindow(QMainWindow):
         scan_status_layout.setSpacing(6)
         
         status_hud = QHBoxLayout()
-        self.lbl_status = QLabel()
+        status_hud.setSpacing(8)
+        # TASK 2 — Status text now elides (ElideRight) instead of word-wrapping.
+        # Word-wrap kept full width then overlapped the right-aligned telemetry
+        # ("Done" over "[NPU: 0.00s]"); elision gives a defined truncation and a
+        # tooltip with the full string. Ignored h-policy lets it shrink first.
+        self.lbl_status = ElidingLabel()
         self.lbl_status.setObjectName("status")
-        self.lbl_status.setWordWrap(True)
-        
+
         self.lbl_telemetry = QLabel()
         self.lbl_telemetry.setObjectName("telemetry_hud")
-        self.lbl_telemetry.setStyleSheet("color: #5865F2; font-size: 11px; font-weight: bold;")
+        self.lbl_telemetry.setStyleSheet("color: #5865F2; font-weight: bold;")
         self.lbl_telemetry.setAlignment(Qt.AlignmentFlag.AlignRight)
-        
+        # NPU/RAM peak is a fixed-format readout: it must win the width race and
+        # never be clipped. Maximum/Fixed pins it to its sizeHint.
+        self.lbl_telemetry.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+
+        # Expanding spacer guarantees a non-negative gap between the two labels
+        # so they can never paint over one another, even mid-transition.
         status_hud.addWidget(self.lbl_status, stretch=1)
-        status_hud.addWidget(self.lbl_telemetry)
+        status_hud.addSpacerItem(
+            QSpacerItem(0, 0, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        )
+        status_hud.addWidget(self.lbl_telemetry, stretch=0)
         
         self.progress_bar = QProgressBar()
         self.progress_bar.setFixedHeight(6) 
@@ -612,20 +908,32 @@ class MainWindow(QMainWindow):
         
         scan_controls = QHBoxLayout()
         scan_controls.setSpacing(10)
+
+        # Крупная верхняя панель управления: увеличенная высота + жирный шрифт и
+        # щедрые отступы, чтобы 'Сканировать'/'Пауза'/'Стоп' читались как основные
+        # действия. Размер шрифта НЕ задаём — он наследуется из глобального
+        # app-шрифта; локально оставляем только вес и отступы.
+        big_btn_qss = "QPushButton { font-weight: bold; padding: 12px 22px; }"
+
         self.btn_scan = QPushButton()
         self.btn_scan.setObjectName("primary")
-        self.btn_scan.setMinimumHeight(46)
+        self.btn_scan.setMinimumHeight(ThemeManager.BUTTON_HEIGHT_PRIMARY)
+        self.btn_scan.setStyleSheet(big_btn_qss)
         self.btn_scan.setEnabled(False)
-        
+
         self.btn_pause = QPushButton()
         self.btn_pause.setObjectName("secondary")
-        self.btn_pause.setMinimumHeight(46)
+        self.btn_pause.setMinimumHeight(ThemeManager.BUTTON_HEIGHT_PRIMARY)
+        self.btn_pause.setStyleSheet(big_btn_qss)
         self.btn_pause.hide()
-        
+
         self.btn_stop = QPushButton()
         self.btn_stop.setObjectName("secondary")
-        self.btn_stop.setMinimumHeight(46)
-        self.btn_stop.setStyleSheet("QPushButton { background-color: #DA3633; border: none; color: white; }") 
+        self.btn_stop.setMinimumHeight(ThemeManager.BUTTON_HEIGHT_PRIMARY)
+        self.btn_stop.setStyleSheet(
+            "QPushButton { background-color: #DA3633; border: none; color: white; "
+            "font-weight: bold; padding: 12px 22px; }"
+        )
         self.btn_stop.hide()
         
         self.scan_controls_layout = scan_controls
@@ -692,7 +1000,9 @@ class MainWindow(QMainWindow):
                 
         self.inspector_frame = QWidget()
         self.inspector_frame.setObjectName("inspector")
-        self.inspector_frame.setMinimumWidth(300) 
+        # Fluid: width is driven by the inner_splitter's stretch (4:6) and its
+        # initial setSizes(), not a hard 300px floor.
+        self.inspector_frame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         inspector_layout = QVBoxLayout(self.inspector_frame)
         inspector_layout.setContentsMargins(0, 0, 0, 0)
         inspector_layout.setSpacing(0)
@@ -735,7 +1045,6 @@ class MainWindow(QMainWindow):
         self.multi_sync_slider.setRange(0, 100)
         self.multi_sync_slider.setValue(25)
         self.multi_sync_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        ms_layout.addWidget(QLabel("[Sync]"))
         ms_layout.addWidget(self.multi_sync_slider)
         multi_layout.addWidget(self.multi_slider_panel)
         self.multi_slider_panel.hide()
@@ -751,21 +1060,28 @@ class MainWindow(QMainWindow):
         bb_layout.setSpacing(10)
         
         self.btn_grid = QPushButton()
-        self.btn_grid.setMinimumHeight(40)
+        self.btn_grid.setMinimumHeight(ThemeManager.BUTTON_HEIGHT_PRIMARY)
         self.btn_grid.setObjectName("secondary")
-        
+
         self.btn_move = QPushButton()
-        self.btn_move.setMinimumHeight(40)
+        self.btn_move.setMinimumHeight(ThemeManager.BUTTON_HEIGHT_PRIMARY)
         self.btn_move.setObjectName("action")
-        
-        self.btn_delete = QPushButton()
-        self.btn_delete.setMinimumHeight(40)
+
+        # Кнопка удаления — только иконка корзины (без текстовой подписи "Удалить").
+        # Идеальный квадрат BUTTON_HEIGHT_ICON × BUTTON_HEIGHT_ICON: выравнивается
+        # по горизонтальной оси с Compare/Move и не растягивается.
+        self.btn_delete = QPushButton("🗑")
+        self.btn_delete.setFixedSize(
+            ThemeManager.BUTTON_HEIGHT_ICON, ThemeManager.BUTTON_HEIGHT_ICON
+        )
         self.btn_delete.setObjectName("primary")
-        self.btn_delete.setStyleSheet("QPushButton { background-color: #DA3633; }") 
-        
-        bb_layout.addWidget(self.btn_grid)
-        bb_layout.addWidget(self.btn_move)
-        bb_layout.addWidget(self.btn_delete)
+        self.btn_delete.setStyleSheet("QPushButton { background-color: #DA3633; }")
+
+        # Compare и Move делят доступную ширину поровну (равный stretch=1); корзина
+        # — фиксированный квадрат (stretch=0), чтобы не было оптического перевеса.
+        bb_layout.addWidget(self.btn_grid, 1)
+        bb_layout.addWidget(self.btn_move, 1)
+        bb_layout.addWidget(self.btn_delete, 0)
         inspector_layout.addWidget(bottom_btns)
 
         self.inner_splitter.addWidget(tree_container)
@@ -776,9 +1092,67 @@ class MainWindow(QMainWindow):
         self.master_splitter.addWidget(content_widget)
         self.master_splitter.setStretchFactor(0, 0)
         self.master_splitter.setStretchFactor(1, 1)
+        # Двойная защита сайдбара: stretch=0 отдаёт ВСЁ лишнее место правой панели
+        # (сайдбар не растёт при расширении окна), а setCollapsible(0, False) +
+        # minimumWidth не дают ручке утащить его в ноль. Под любым давлением правой
+        # панели уступает индекс 1, а не сайдбар (см. RCA: кто несёт пол, тот не
+        # сжимается). Правый пейн остаётся collapsible — это легитимный layout.
+        self.master_splitter.setCollapsible(0, False)
+        self.master_splitter.setCollapsible(1, True)
 
         self.master_splitter.splitterMoved.connect(lambda: self.tree._trigger_stretch())
         self.inner_splitter.splitterMoved.connect(lambda: self.tree._trigger_stretch())
+
+    def _setup_menubar(self):
+        # Cmd+D живёт в нативном меню macOS как единственный владелец шортката.
+        # QKeySequence("Ctrl+D") на macOS автоматически маппится Qt в Cmd-D.
+        # Это снимает конфликт двойного срабатывания: раньше тот же шорткат
+        # дублировался на кнопке btn_clear_select / eventFilter'ах — теперь его
+        # держит ровно один QAction в системном QMenuBar.
+        self.menu_edit = self.menuBar().addMenu(translator.tr("menu_edit"))
+
+        # "Выбрать дубликаты" (Cmd/Ctrl+A) — авто-выбор дубликатов по текущей
+        # стратегии. Живёт в нативном QMenuBar единственным владельцем шортката.
+        # Маршрутизируем через клик btn_auto_select (та же логика, что у
+        # action_deselect → btn_clear_select), чтобы не дублировать привязку.
+        self.action_select_dups = QAction(translator.tr("action_select_dups"), self)
+        self.action_select_dups.setShortcut(QKeySequence.StandardKey.SelectAll)
+        self.action_select_dups.triggered.connect(self.btn_auto_select.click)
+        self.menu_edit.addAction(self.action_select_dups)
+
+        # "Выбрать все" (Cmd/Ctrl+R) — обычное выделение всех строк дерева.
+        # Намеренно НЕ на Cmd+A (его держит "Выбрать дубликаты") и НЕ на Cmd+C
+        # (исторически висел тут, но переехал на Cmd+R, чтобы освободить Cmd+C
+        # и убрать любую путаницу с системным «копировать»).
+        self.action_select_all = QAction(translator.tr("action_select_all"), self)
+        self.action_select_all.setShortcut(QKeySequence("Ctrl+R"))
+        self.action_select_all.triggered.connect(self.tree.selectAll)
+        self.menu_edit.addAction(self.action_select_all)
+
+        self.action_deselect = QAction(translator.tr("action_deselect"), self)
+        self.action_deselect.setShortcut(QKeySequence("Ctrl+D"))
+        # Cmd-D должен снимать галочки (checkmarks) с файлов, а не фокус строки.
+        # btn_clear_select подключена в контроллере к selection_controller.clear_selection,
+        # поэтому маршрутизируем сигнал через клик этой кнопки.
+        self.action_deselect.triggered.connect(self.btn_clear_select.click)
+        self.menu_edit.addAction(self.action_deselect)
+
+        # Cmd+F / Cmd+O / Cmd+P переехали из QShortcut в нативный QMenuBar.
+        # На macOS QShortcut ненадёжен и не отображается в меню/строке статуса;
+        # QAction в системном меню — единственный надёжный владелец шортката
+        # (QKeySequence("Ctrl+...") Qt маппит в Cmd). Сигналы подключает
+        # контроллер в _bind_signals, чтобы не дублировать привязку.
+        self.action_clear_sel = QAction(translator.tr("btn_clear"), self)
+        self.action_clear_sel.setShortcut(QKeySequence("Ctrl+F"))
+        self.menu_edit.addAction(self.action_clear_sel)
+
+        self.action_move = QAction(translator.tr("btn_move"), self)
+        self.action_move.setShortcut(QKeySequence("Ctrl+O"))
+        self.menu_edit.addAction(self.action_move)
+
+        self.action_compare = QAction(translator.tr("btn_compare"), self)
+        self.action_compare.setShortcut(QKeySequence("Ctrl+P"))
+        self.menu_edit.addAction(self.action_compare)
 
     def _toggle_sidebar(self):
         is_visible = self.sidebar_widget.isVisible()
@@ -786,7 +1160,7 @@ class MainWindow(QMainWindow):
         if is_visible:
             self.btn_toggle_sidebar.setText(translator.tr("btn_sidebar_show"))
         else:
-            self.master_splitter.setSizes([310, self.width() - 310])
+            self.master_splitter.setSizes([290, self.width() - 290])
             self.btn_toggle_sidebar.setText(translator.tr("btn_sidebar_hide"))
         self.tree._trigger_stretch()
 
@@ -802,12 +1176,38 @@ class MainWindow(QMainWindow):
         self.tree._trigger_stretch()
 
     def _restore_state(self):
+        # Геометрия окна восстанавливается ПЕРВОЙ: задаёт реальную self.width(),
+        # от которой считаются дефолтные setSizes() сплиттеров ниже.
+        geom = self.settings.value("geometry")
+        if geom is not None:
+            self.restoreGeometry(geom)
+
         sp_state = self.settings.value("master_splitter")
-        if sp_state: self.master_splitter.restoreState(sp_state)
+        if sp_state:
+            self.master_splitter.restoreState(sp_state)
+        else:
+            # Дефолт первого запуска: сайдбар на своём полу + остаток правой панели.
+            # minimumWidth всё равно не даст уйти ниже SIDEBAR_MIN_WIDTH.
+            self.master_splitter.setSizes(
+                [self.SIDEBAR_MIN_WIDTH, max(1, self.width() - self.SIDEBAR_MIN_WIDTH)]
+            )
+
         isp_state = self.settings.value("inner_splitter")
-        if isp_state: self.inner_splitter.restoreState(isp_state)
+        if isp_state:
+            self.inner_splitter.restoreState(isp_state)
+        else:
+            w = self.width()
+            self.inner_splitter.setSizes([int(w * 0.4), int(w * 0.6)])
 
     def _retranslate_ui(self):
+        if hasattr(self, 'menu_edit'):
+            self.menu_edit.setTitle(translator.tr("menu_edit"))
+            self.action_select_all.setText(translator.tr("action_select_all"))
+            self.action_select_dups.setText(translator.tr("action_select_dups"))
+            self.action_deselect.setText(translator.tr("action_deselect"))
+            self.action_clear_sel.setText(translator.tr("btn_clear"))
+            self.action_move.setText(translator.tr("btn_move"))
+            self.action_compare.setText(translator.tr("btn_compare"))
         self.btn_help.setText(translator.tr("help"))
         self.btn_tab_scan.setText(translator.tr("tab_scan"))
         self.btn_tab_analytics.setText(translator.tr("tab_analytics"))
@@ -872,7 +1272,9 @@ class MainWindow(QMainWindow):
         self.combo_strategy.blockSignals(False)
         self.chk_keep_clean.setText(translator.tr("chk_clean"))
         self.btn_auto_select.setText(translator.tr("btn_auto"))
-        self.btn_clear_select.setText(translator.tr("btn_clear"))
+        # Метла-иконка делает кнопку "Сброс" визуально явной (и это же — носитель
+        # нативного шортката Ctrl/Cmd+D).
+        self.btn_clear_select.setText(f"🧹 {translator.tr('btn_clear')}")
         
         if self.sidebar_widget.isVisible(): self.btn_toggle_sidebar.setText(translator.tr("btn_sidebar_hide"))
         else: self.btn_toggle_sidebar.setText(translator.tr("btn_sidebar_show"))
@@ -885,7 +1287,8 @@ class MainWindow(QMainWindow):
         
         self.btn_grid.setText(translator.tr("btn_compare"))
         self.btn_move.setText(translator.tr("btn_move"))
-        self.btn_delete.setText(translator.tr("btn_del"))
+        # Иконка-корзина: текст не задаём, переводим только всплывающую подсказку
+        self.btn_delete.setToolTip(translator.tr("btn_del"))
 
         self.model.setHorizontalHeaderLabels([
             translator.tr("col_file"), translator.tr("col_fmt"), 
@@ -903,21 +1306,24 @@ class MainWindow(QMainWindow):
         lang = getattr(translator, 'current_lang', 'en')
         is_ru = (lang == 'ru')
 
-        self.btn_toggle_db.setText("Управление ядром данных" if is_ru else "Data Core Management")
+        self.btn_toggle_db.setText("Управление данными" if is_ru else "Data Management")
         self.lbl_db_info.setText(
-            "Очистка матриц FAISS и SQLite-векторов. Потребуется полный рескан файлов." if is_ru 
+            "Очистка матриц FAISS и SQLite-векторов. Потребуется полный рескан файлов." if is_ru
             else "Clears FAISS matrices and SQLite vectors. Requires full rescan."
         )
-        self.btn_clear_faiss.setText("Очистить FAISS" if is_ru else "Clear FAISS")
+        self.btn_clear_faiss.setText("Очистить кэш" if is_ru else "Clear cache")
         self.btn_clear_faiss.setToolTip(
-            "Удаляет только матрицы связей на диске" if is_ru 
-            else "Deletes only relationship matrices on disk"
+            "Очищает индекс быстрого поиска (кэш FAISS) на диске" if is_ru
+            else "Clears the fast-search index (FAISS cache) on disk"
         )
-        self.btn_purge_db.setText("Сброс SQLite" if is_ru else "Purge SQLite")
+        self.btn_purge_db.setText("Сбросить БД" if is_ru else "Purge DB")
         self.btn_purge_db.setToolTip(
-            "Физическое удаление всех файлов БД и журналов" if is_ru 
-            else "Physical deletion of all DB files and logs"
+            "Внимание: безвозвратно удаляет все проиндексированные данные (векторы, журналы, кэш FAISS). Потребуется полный рескан." if is_ru
+            else "Warning: permanently deletes all indexed data (vectors, logs, FAISS cache). A full rescan is required."
         )
+        # Fluid: the paired DB buttons already share MinimumExpanding policy, so
+        # the layout gives them equal width from the available row space — no
+        # per-locale hard floor needed (that was the old setMinimumWidth hack).
 
         self.tree._trigger_stretch()
         self.single_preview_label.update()
@@ -937,33 +1343,41 @@ class MainWindow(QMainWindow):
         auditor.info("UI: FAISS cache manually purged")
 
     def _purge_all_data(self):
-        lang = getattr(translator, 'current_lang', 'en')
-        is_ru = (lang == 'ru')
-        
-        title = "Критическое действие" if is_ru else "Critical Action"
-        msg = "Это удалит ВСЕ вычисленные векторы SQLite и графы FAISS. Продолжить?" if is_ru else "This will delete ALL computed SQLite vectors and FAISS graphs. Continue?"
-        
-        reply = QMessageBox.warning(
-            self, title, msg, 
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        # DESTRUCTIVE: wipes every indexed record (SQLite vectors + FAISS graphs)
+        # off disk. Guarded by a strict warning dialog so it can never fire on a
+        # stray click.
+        is_ru = (getattr(translator, 'current_lang', 'en') == 'ru')
+        title = "Сбросить базу данных" if is_ru else "Purge Database"
+        question = (
+            "Вы уверены, что хотите удалить все проиндексированные данные?" if is_ru
+            else "Are you sure you want to delete all indexed data?"
         )
-        
-        if reply == QMessageBox.StandardButton.Yes:
-            self._purge_faiss() 
-            try:
-                cache_dir = get_data_dir()
-                for mode in ["visual", "faces"]:
-                    base_name = f"meta_v2_{mode}.db"
-                    for ext in ["", "-wal", "-shm"]:
-                        db_file = cache_dir / f"{base_name}{ext}"
-                        if db_file.exists():
-                            db_file.unlink() 
-                
-                auditor.info("UI: Physical DB purge executed.")
-                self.lbl_status.setText("Ядро данных физически уничтожено" if is_ru else "Data Core physically destroyed")
-            except Exception as e:
-                auditor.error(f"UI DB File Delete error: {e}")
-                self.lbl_status.setText(f"Ошибка удаления БД: {e}" if is_ru else f"DB Deletion Error: {e}")
+        reply = QMessageBox.warning(
+            self, title, question,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.btn_purge_db.setEnabled(False)
+        self.lbl_status.setText(
+            "Сброс базы данных..." if is_ru else "Purging database..."
+        )
+        auditor.warning("UI: FULL data purge confirmed by user.")
+
+        self._purge_worker = PurgeWorker()
+        self._purge_worker.finished.connect(self._on_purge_done)
+        self._purge_worker.finished.connect(self._purge_worker.deleteLater)
+        self._purge_worker.start()
+
+    def _on_purge_done(self):
+        is_ru = (getattr(translator, 'current_lang', 'en') == 'ru')
+        self.btn_purge_db.setEnabled(True)
+        self.lbl_status.setText(
+            "База данных сброшена" if is_ru else "Database purged"
+        )
+        auditor.info("UI: Full data purge completed.")
 
     def update_telemetry_hud(self, elapsed_seconds: float, ram_mb: float):
         try:

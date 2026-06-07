@@ -9,10 +9,9 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QTimer, QThread, Signal, QModelIndex
 from PySide6.QtGui import QShortcut, QKeySequence, QPixmap, QImageReader
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QDialog, QMenu
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QMenu
 
 from utils.i18n import translator
-from ui.views.multi_compare import MultiCompareDialog 
 from ui.workers import MultiVideoWorker
 from core.events import bus
 from ui.components.dialogs import VisualDeleteDialog
@@ -36,6 +35,12 @@ class MainController(QObject):
         self.is_paused = False
         self.is_stopped_requested = False
         self.engine = None
+
+        # True только на recluster, который запущен СРАЗУ после завершённого
+        # скана (см. _on_scan_finished). Нужен, чтобы алерт «файлы не найдены»
+        # не выскакивал при холостом дёрганье ползунка порога до первого скана,
+        # когда current_file_data пуст просто потому, что скан ещё не запускался.
+        self._scan_just_completed = False
         
         self.current_status_key = "status_wait"
         self.current_status_args = []
@@ -97,6 +102,9 @@ class MainController(QObject):
         
         v.btn_auto_select.clicked.connect(self.selection_controller.apply_auto_selection)
         v.btn_clear_select.clicked.connect(self.selection_controller.clear_selection)
+        # Cmd+D / Ctrl+D больше не привязан к этой кнопке: шорткат живёт в
+        # нативном QMenuBar ("Правка" → "Снять выделение") и вызывает
+        # tree.clearSelection. Кнопка btn_clear_select — отдельный сброс галочек.
         v.btn_scan.clicked.connect(self._start_scan)
         v.btn_pause.clicked.connect(self._toggle_pause)
         v.btn_stop.clicked.connect(self._stop_scan)
@@ -109,6 +117,20 @@ class MainController(QObject):
         v.tree.customContextMenuRequested.connect(self._on_context_menu)
         
         v.btn_grid.clicked.connect(self._trigger_grid_compare)
+        # Страница сравнения ПОСТОЯННА (создаётся один раз в MainWindow._setup_ui,
+        # index 1 стека). Сигналы подключаются здесь ровно один раз: «Назад»/Esc →
+        # стек на index 0; «Применить» → читаем выбор и удаляем файлы. Виджет
+        # больше НЕ пересоздаётся (отказ от Destroy & Rebuild ради macOS).
+        v.compare_widget.compare_cancelled.connect(lambda: v.root_stack.setCurrentIndex(0))
+        v.compare_widget.compare_confirmed.connect(self._on_compare_confirmed)
+
+        # Нативные шорткаты Правки (Cmd+F/O/P) живут как QAction в QMenuBar
+        # (MainWindow._setup_menubar). Подключаем их триггеры здесь:
+        #   Cmd+F — снять синее выделение строк дерева (НЕ трогая чекбоксы);
+        #   Cmd+O — перенос отмеченных файлов; Cmd+P — сравнение выбранных.
+        v.action_clear_sel.triggered.connect(self.view.tree.clearSelection)
+        v.action_move.triggered.connect(self.selection_controller.move_trigger)
+        v.action_compare.triggered.connect(self._trigger_grid_compare)
         v.btn_move.clicked.connect(self.selection_controller.move_trigger)
         v.btn_delete.clicked.connect(lambda: self.selection_controller.process_delete(False))
         v.multi_sync_slider.sliderReleased.connect(self._execute_multi_video_frames)
@@ -142,15 +164,23 @@ class MainController(QObject):
         
         self.sc_shift_delete = QShortcut(QKeySequence("Shift+Delete"), self.view, context=Qt.ShortcutContext.ApplicationShortcut)
         self.sc_shift_delete.activated.connect(lambda: self.selection_controller.process_delete(True))
-        
-        self.sc_select_all = QShortcut(QKeySequence.StandardKey.SelectAll, self.view, context=Qt.ShortcutContext.ApplicationShortcut)
-        self.sc_select_all.activated.connect(self.selection_controller.apply_auto_selection)
-        
-        self.sc_clear_d = QShortcut(QKeySequence("Ctrl+D"), self.view, context=Qt.ShortcutContext.ApplicationShortcut)
-        self.sc_clear_d.activated.connect(self.selection_controller.clear_selection)
-        
-        self.sc_clear_meta = QShortcut(QKeySequence("Meta+D"), self.view, context=Qt.ShortcutContext.ApplicationShortcut)
-        self.sc_clear_meta.activated.connect(self.selection_controller.clear_selection)
+
+        # Cmd+F / Cmd+O / Cmd+P БОЛЬШЕ НЕ висят на QShortcut: на macOS QShortcut
+        # ненадёжен и не отображается в меню/строке статуса. Теперь это QAction
+        # в нативном QMenuBar (MainWindow._setup_menubar), а их сигналы подключены
+        # в _bind_signals (Cmd+F → tree.clearSelection, Cmd+O → move_trigger,
+        # Cmd+P → _trigger_grid_compare). Держать второй QShortcut на тех же
+        # клавишах нельзя — Qt сделал бы привязку ambiguous и не сработал бы ни один.
+
+        # Шорткаты выделения НЕ занимаем здесь во избежание ambiguous-привязок:
+        # у каждого ровно один владелец — QAction в нативном меню (MainWindow).
+        # Cmd+A → "Выбрать дубликаты" (apply_auto_selection через btn_auto_select),
+        # Cmd+V → "Выбрать все" (tree.selectAll). Раньше тут висел второй QShortcut
+        # на Cmd+A, из-за чего Qt срабатывал неотличимо.
+        #
+        # Ctrl/Cmd+D is owned by MainWindow (clears the tree's row selection).
+        # Keeping a second Ctrl+D here would make the shortcut ambiguous and Qt
+        # would fire neither reliably, so it lives in exactly one place.
 
     def _set_status(self, key, *args):
         self.current_status_key = key
@@ -182,10 +212,14 @@ class MainController(QObject):
         if idx == 0: ThemeManager.apply_modern_dark(app)
         elif idx == 1: ThemeManager.apply_modern_light(app)
         else: ThemeManager.apply_system_theme(app)
+        # Палитра уже сменилась — перекрасим леттербокс плеера под новую тему,
+        # иначе видеовиджет останется с фоном предыдущей темы.
+        if hasattr(self.view, 'video_player'):
+            self.view.video_player.apply_theme()
 
     def _show_help_dialog(self):
         title = translator.tr("help_title") if translator.tr("help_title") else "Справка"
-        text = translator.tr("help_text") if translator.tr("help_text") else "Горячие клавиши:\nF1 - Справка\nSpace/Enter - Выбрать файл\nDel/Backspace - Удалить\nShift+Del - Удалить безвозвратно"
+        text = translator.tr("help_text") if translator.tr("help_text") else "Горячие клавиши:\nF1 - Справка\nSpace/Enter - Выбрать файл\nCmd+F - Снять выделение строк\nCmd+O - Перенос файлов\nCmd+P - Сравнить выбранные\nDel/Backspace - Удалить\nShift+Del - Удалить безвозвратно"
         QMessageBox.information(self.view, title, text)
 
     def _on_telemetry_update(self, data):
@@ -324,19 +358,21 @@ class MainController(QObject):
             self.view.dist_container.layout().setStretch(1, 0)
             self.view.dist_container.layout().setStretch(2, 0)
             
+        total_label = "Файлов" if translator.current_lang == "ru" else "Files"
+
         self.view.leg_img_title.setText(translator.tr('chk_img'))
         self.view.leg_img_pct.setText(f"{int(p_img)}%")
-        self.view.leg_img_dup.setText(f"+ {img_stat[2]}")
+        self.view.leg_img_dup.setText(f"{total_label}: {img_stat[0]}")
         self.view.leg_img_sz.setText(f"{img_stat[1] / (1024*1024):.1f} MB")
 
         self.view.leg_vid_title.setText(translator.tr('chk_vid'))
         self.view.leg_vid_pct.setText(f"{int(p_vid)}%")
-        self.view.leg_vid_dup.setText(f"+ {vid_stat[2]}")
+        self.view.leg_vid_dup.setText(f"{total_label}: {vid_stat[0]}")
         self.view.leg_vid_sz.setText(f"{vid_stat[1] / (1024*1024):.1f} MB")
 
         self.view.leg_doc_title.setText(translator.tr('chk_doc'))
         self.view.leg_doc_pct.setText(f"{int(p_doc)}%")
-        self.view.leg_doc_dup.setText(f"+ {doc_stat[2]}")
+        self.view.leg_doc_dup.setText(f"{total_label}: {doc_stat[0]}")
         self.view.leg_doc_sz.setText(f"{doc_stat[1] / (1024*1024):.1f} MB")
         
         pcs = "шт." if translator.current_lang == "ru" else "pcs"
@@ -489,25 +525,49 @@ class MainController(QObject):
         bus.cmd_recluster.emit(threshold)
 
     def _on_clustering_finished(self, clusters):
+        # Снимаем флаг сразу: этот вызов «съедает» отметку о завершённом скане,
+        # чтобы последующие холостые recluster'ы по ползунку её уже не видели.
+        just_scanned = self._scan_just_completed
+        self._scan_just_completed = False
+
         self.view.tree.setUpdatesEnabled(False)
-        
+
         if hasattr(self.view.model, 'clear_data'):
             self.view.model.clear_data()
         else:
             self.view.model.clear()
-            
+
         if not clusters:
             self.view.tree.setUpdatesEnabled(True)
             self._set_status("status_npu_ready")
             self.view.btn_scan.setEnabled(True)
             self.view.progress_bar.setValue(100)
             from PySide6.QtWidgets import QApplication, QMessageBox
+            from utils.i18n import translator
             QApplication.restoreOverrideCursor()
-            
-            if hasattr(self, 'engine') and self.engine and len(getattr(self.engine, 'current_file_data', [])) > 0:
-                from utils.i18n import translator
-                title = "Сканирование завершено" if translator.current_lang == "ru" else "Scan Complete"
-                msg = "Дубликаты не найдены. Попробуйте снизить порог чувствительности (Ползунок %) или выбрать другие директории." if translator.current_lang == "ru" else "No duplicates found. Try lowering the matching threshold (%) or selecting different directories."
+
+            is_ru = translator.current_lang == "ru"
+            title = "Сканирование завершено" if is_ru else "Scan Complete"
+            scanned_count = len(getattr(self.engine, 'current_file_data', [])) if getattr(self, 'engine', None) else 0
+
+            if scanned_count > 0:
+                # Файлы есть, но при текущем пороге совпадений нет.
+                msg = ("Дубликаты не найдены. Попробуйте снизить порог чувствительности "
+                       "(Ползунок %) или выбрать другие директории." if is_ru else
+                       "No duplicates found. Try lowering the matching threshold (%) "
+                       "or selecting different directories.")
+                QMessageBox.information(self.view, title, msg)
+            elif just_scanned:
+                # Скан реально отработал, но не нашёл НИ ОДНОГО подходящего файла
+                # (пустая папка, не те форматы, либо все файлы битые/нечитаемы).
+                # Без этого алерта экран оставался пустым и было непонятно,
+                # выполнился ли процесс вообще.
+                self._set_status("status_done")
+                msg = ("Подходящие файлы не найдены в выбранных директориях.\n"
+                       "Проверьте путь и отмеченные форматы (Фото / Видео / Документы)."
+                       if is_ru else
+                       "No suitable files were found in the selected directories.\n"
+                       "Check the path and the selected formats (Images / Videos / Documents).")
                 QMessageBox.information(self.view, title, msg)
             return
 
@@ -660,6 +720,10 @@ class MainController(QObject):
             self.view.progress_bar.setValue(0)
             self.is_stopped_requested = False
         else:
+            # Кластеризация после скана: помечаем, что следующий
+            # evt_clustering_completed пришёл из реального прохода, а не из
+            # холостого recluster по ползунку.
+            self._scan_just_completed = True
             self._trigger_recluster()
 
     def _start_render_tree(self, clusters):
@@ -742,7 +806,16 @@ class MainController(QObject):
                 from core.services.fs_service import reveal_in_os
                 menu.addAction(translator.tr("ctx_reveal"), lambda p=path: reveal_in_os(p))
             
-        menu.setStyleSheet("QMenu { background-color: #2B2D31; color: white; border: 1px solid #4E5058; } QMenu::item:selected { background-color: #5865F2; }")
+        # Тянем цвета из активной темы, а не хардкодим тёмную палитру — иначе в
+        # светлой теме меню оставалось тёмным. Акцент выделения — фирменный
+        # blurple (#5865F2), он читаем на обоих фонах.
+        from utils.theme_manager import ThemeManager
+        c = ThemeManager.colors()
+        menu.setStyleSheet(
+            f"QMenu {{ background-color: {c['surface']}; color: {c['text']}; "
+            f"border: 1px solid {c['border']}; }} "
+            f"QMenu::item:selected {{ background-color: #5865F2; color: #FFFFFF; }}"
+        )
         menu.exec(self.view.tree.viewport().mapToGlobal(pos))
 
     def _execute_multi_video_frames(self):
@@ -771,29 +844,77 @@ class MainController(QObject):
             for i in range(gr.childCount()):
                 data = gr.child(i).data(Qt.ItemDataRole.UserRole)
                 if data and isinstance(data, dict):
-                    pts.append(data['path'])
+                    path = data.get('path', data.get('file_path', str(data)))
+                    pts.append((path, bool(data.get('is_ref', False))))
         else:
             pts = []
             for idx in sel:
                 data = self.view.model.itemFromIndex(idx.siblingAtColumn(0)).data(Qt.ItemDataRole.UserRole)
                 if data and isinstance(data, dict):
-                    pts.append(data['path'])
+                    path = data.get('path', data.get('file_path', str(data)))
+                    pts.append((path, bool(data.get('is_ref', False))))
             
         if len(pts) < 2: return
-        dlg = MultiCompareDialog(pts, self.view)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if dlg.files_to_delete:
-                res = None
-                if dlg.delete_hard: 
-                    res = SafeFSExecutor.hard_delete(dlg.files_to_delete)
-                else: 
-                    res = SafeFSExecutor.safe_delete(dlg.files_to_delete)
-                
-                if res and res.get("error") == "send2trash_missing":
-                    QMessageBox.critical(
-                        self.view, 
-                        translator.tr("dialog_del_report_title"),
-                        "Ошибка: Модуль 'send2trash' не найден. Удаление в корзину невозможно."
-                    )
-                
-                self._prune_dead_nodes(dlg.files_to_delete)
+
+        v = self.view
+        # ОТКАЗ ОТ Destroy & Rebuild. Виджет сравнения ПОСТОЯНЕН (создан один раз
+        # в MainWindow._setup_ui, index 1) и переиспользуется. Резкое удаление/
+        # пересоздание виджета вместе с рывковым скрытием QVideoWidget в
+        # полноэкранном режиме провоцировало панику macOS WindowServer
+        # (Spaces Jump). Теперь последовательность строго мягкая:
+
+        # 1. МЯГКО прячем QVideoWidget, переключая инспектор на страницу одиночного
+        #    превью (index 0). QVideoWidget НЕ скрывается рывком вместе со сменой
+        #    root_stack — это предотвращает краш AVPlayerLayer в Fullscreen.
+        v.preview_stack.setCurrentIndex(0)
+        if hasattr(v, 'video_player'):
+            # Полностью валим нативный медиа-конвейер и прячем sink-виджет ДО
+            # переключения root_stack: живой AVFoundation/Metal-контекст в момент
+            # смены активного слоя провоцировал raise окна и Spaces Jump.
+            try:
+                v.video_player.stop()
+                v.video_player.video_widget.hide()
+                v.video_player.hide()
+            except Exception as e:
+                auditor.warning(f"video_player teardown before compare failed: {e}", exc_info=True)
+
+        # 2. Загружаем новый набор в УЖЕ существующий виджет (карточки/декодеры
+        #    пересобираются внутри load(); тяжёлое медиа поднимается отложенно
+        #    из showEvent — уже в активном Space).
+        v.compare_widget.load(pts)
+
+        # 3. Переключаем стек на постоянную страницу сравнения.
+        v.root_stack.setCurrentIndex(1)
+
+    def _on_compare_confirmed(self):
+        # «Применить» на странице сравнения: считываем выбор, возвращаем стек на
+        # главную страницу и удаляем отмеченные файлы.
+        files_to_delete = list(self.view.compare_widget.files_to_delete)
+        delete_hard = self.view.compare_widget.delete_hard
+        self.view.root_stack.setCurrentIndex(0)
+        self._apply_compare_deletion(files_to_delete, delete_hard)
+
+    def _apply_compare_deletion(self, files_to_delete, delete_hard):
+        # Удаляем файлы, отмеченные в окне сравнения («Применить») — В ФОНОВОМ
+        # ПОТОКЕ. Раньше safe_delete/hard_delete вызывались синхронно прямо здесь,
+        # в GUI-потоке, а на macOS safe_delete делает time.sleep(0.1..0.3) на
+        # КАЖДЫЙ файл (каскад NSWorkspace→send2trash→AppleScript) — это вешало
+        # интерфейс на секунды. Тот же путь, что и process_delete: BatchOpWorker.
+        files_to_delete = list(files_to_delete)
+        if not files_to_delete:
+            return
+
+        func = SafeFSExecutor.hard_delete if delete_hard else SafeFSExecutor.safe_delete
+        self._compare_del_worker = BatchOpWorker(func, files_to_delete)
+
+        def _on_compare_del_done(res):
+            if isinstance(res, dict) and res.get("error") == "send2trash_missing":
+                QMessageBox.critical(
+                    self.view,
+                    translator.tr("dialog_del_report_title"),
+                    "Ошибка: Модуль 'send2trash' не найден. Удаление в корзину невозможно."
+                )
+            self._prune_dead_nodes(files_to_delete)
+
+        self._compare_del_worker.finished.connect(_on_compare_del_done)
+        self._compare_del_worker.start()

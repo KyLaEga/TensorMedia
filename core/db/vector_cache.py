@@ -7,6 +7,7 @@ import atexit
 import signal
 import sys
 from pathlib import Path
+from contextlib import closing
 
 from utils.env_config import get_data_dir
 from utils.logger import auditor
@@ -41,7 +42,7 @@ class VectorCache:
     def _init_db(self):
         with self.db_lock:
             try:
-                with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+                with closing(sqlite3.connect(str(self.db_path), timeout=30.0)) as conn:
                     conn.execute("PRAGMA journal_mode = WAL")
                     conn.execute("PRAGMA synchronous = NORMAL")
                     conn.execute("PRAGMA cache_size = -10000") 
@@ -102,6 +103,21 @@ class VectorCache:
                         transaction_counter = 0
                         continue
 
+                    # Barrier handshake for sync(): flush everything enqueued
+                    # before this marker and commit, then release the waiter.
+                    # Records are 12-tuples, so a 2-tuple ('__BARRIER__', event)
+                    # is unambiguous.
+                    if isinstance(item, tuple) and len(item) == 2 and item[0] == "__BARRIER__":
+                        if batch:
+                            self._execute_batch(conn, batch)
+                            transaction_counter += len(batch)
+                            batch.clear()
+                        try:
+                            item[1].set()
+                        except Exception as e:
+                            auditor.debug(f"Failed to release sync barrier: {e}", exc_info=True)
+                        continue
+
                     batch.append(item)
                     if len(batch) >= 10 or self.write_queue.empty():
                         self._execute_batch(conn, batch)
@@ -156,8 +172,18 @@ class VectorCache:
         with self.db_lock:
             try:
                 conn.execute("DELETE FROM metadata")
-                conn.execute("VACUUM")
+                # Close the implicit transaction opened by the DELETE above —
+                # SQLite refuses to VACUUM while a transaction is active.
                 conn.commit()
+                # VACUUM must run in autocommit mode; the sqlite3 module would
+                # otherwise wrap it in an implicit transaction and raise
+                # "cannot VACUUM from within a transaction".
+                old_isolation = conn.isolation_level
+                conn.isolation_level = None
+                try:
+                    conn.execute("VACUUM")
+                finally:
+                    conn.isolation_level = old_isolation
                 auditor.info(f"SQLite database {self.db_path.name} physically purged and vacuumed.")
             except sqlite3.Error as e:
                 auditor.error(f"SQLite purge error: {e}")
@@ -208,7 +234,7 @@ class VectorCache:
         if not paths: return meta
         with self.db_lock:
             try:
-                with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+                with closing(sqlite3.connect(str(self.db_path), timeout=30.0)) as conn:
                     cursor = conn.cursor()
                     chunk_size = 900
                     for i in range(0, len(paths), chunk_size):
@@ -225,11 +251,39 @@ class VectorCache:
                 auditor.error(f"Failed to read metadata from cache: {e}")
         return meta
 
+    def get_vectors_for_paths(self, paths: list):
+        """Батч-выборка векторов: ОДИН sync + ОДНО соединение + чанкованные
+        IN-запросы. Заменяет поштучный get_vector() в горячем пути ре-скана,
+        где на N кэшированных файлов приходилось N барьеров sync() и N свежих
+        sqlite-соединений (главный тормоз повторного сканирования)."""
+        self.sync()
+        vectors = {}
+        if not paths:
+            return vectors
+        with self.db_lock:
+            try:
+                with closing(sqlite3.connect(str(self.db_path), timeout=30.0)) as conn:
+                    cursor = conn.cursor()
+                    chunk_size = 900
+                    for i in range(0, len(paths), chunk_size):
+                        chunk = paths[i:i+chunk_size]
+                        placeholders = ','.join(['?'] * len(chunk))
+                        cursor.execute(
+                            f"SELECT path, vector FROM metadata WHERE vector IS NOT NULL AND path IN ({placeholders})",
+                            chunk,
+                        )
+                        for row in cursor.fetchall():
+                            if row[1]:
+                                vectors[row[0]] = np.frombuffer(row[1], dtype=np.float32)
+            except Exception as e:
+                auditor.error(f"Failed to batch-read vectors from cache: {e}", exc_info=True)
+        return vectors
+
     def get_vector(self, path: str):
         self.sync()
         with self.db_lock:
             try:
-                with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+                with closing(sqlite3.connect(str(self.db_path), timeout=30.0)) as conn:
                     cursor = conn.cursor()
                     cursor.execute("SELECT vector FROM metadata WHERE path = ? AND vector IS NOT NULL", (path,))
                     row = cursor.fetchone()
@@ -239,9 +293,24 @@ class VectorCache:
                 auditor.error(f"Critical failure in get_vector for {path}: {e}", exc_info=True)
         return None
 
-    def sync(self):
-        while not self.write_queue.empty():
-            time.sleep(0.01)
+    def sync(self, timeout: float = 30.0):
+        # Block until every record enqueued *before* this call has been
+        # committed by the writer thread. A bare queue.empty() poll is racy:
+        # the writer pops an item before it commits, so empty() can report
+        # True while the last row is still uncommitted. We push a barrier and
+        # wait for the writer to flush+commit and signal it.
+        if not self.is_running:
+            return
+        worker = self.worker_thread
+        if worker is None or not worker.is_alive():
+            # Dead writer would make the old empty()-poll spin forever.
+            return
+        ev = threading.Event()
+        try:
+            self.write_queue.put(("__BARRIER__", ev), timeout=timeout)
+        except queue.Full:
+            return
+        ev.wait(timeout)
 
     def delete_paths(self, paths: list[str]):
         self.sync()
@@ -249,7 +318,7 @@ class VectorCache:
             return
         with self.db_lock:
             try:
-                with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+                with closing(sqlite3.connect(str(self.db_path), timeout=30.0)) as conn:
                     cursor = conn.cursor()
                     cursor.executemany(
                         "DELETE FROM metadata WHERE path = ?",
@@ -265,7 +334,7 @@ class VectorCache:
             return
         with self.db_lock:
             try:
-                with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+                with closing(sqlite3.connect(str(self.db_path), timeout=30.0)) as conn:
                     cursor = conn.cursor()
                     cursor.executemany(
                         "UPDATE metadata SET path = ? WHERE path = ?",
@@ -284,7 +353,7 @@ class VectorCache:
         orphans = []
         with self.db_lock:
             try:
-                with sqlite3.connect(str(self.db_path), timeout=60.0) as conn:
+                with closing(sqlite3.connect(str(self.db_path), timeout=60.0)) as conn:
                     cursor = conn.cursor()
                     cursor.execute("SELECT path FROM metadata")
                     all_paths = [row[0] for row in cursor.fetchall()]
@@ -298,11 +367,35 @@ class VectorCache:
                         auditor.info(f"Maintenance: Found {len(orphans)} orphaned records. Deleting...")
                         cursor.executemany("DELETE FROM metadata WHERE path = ?", orphans)
                         conn.commit()
-                    
-                    auditor.info("Maintenance: Running VACUUM...")
-                    conn.execute("VACUUM")
-                    conn.commit()
-                    
+
+                    # VACUUM is a full DB rewrite — it was firing unconditionally
+                    # on every launch (once per mode), pure disk I/O even when
+                    # there was nothing to reclaim (empty DBs logged it twice).
+                    # Only rewrite when the freelist is large enough to matter:
+                    # >5% of pages freed AND at least 256 free pages. Skips the
+                    # no-op rewrite on a freshly-compacted or empty database.
+                    free_pages = cursor.execute("PRAGMA freelist_count").fetchone()[0]
+                    total_pages = cursor.execute("PRAGMA page_count").fetchone()[0] or 1
+                    free_ratio = free_pages / total_pages
+                    if free_pages >= 256 and free_ratio >= 0.05:
+                        auditor.info(
+                            f"Maintenance: Running VACUUM "
+                            f"({free_pages} free / {total_pages} pages, {free_ratio:.0%})..."
+                        )
+                        # VACUUM cannot run inside a transaction; switch the
+                        # connection to autocommit so sqlite3 doesn't wrap it in one.
+                        old_isolation = conn.isolation_level
+                        conn.isolation_level = None
+                        try:
+                            conn.execute("VACUUM")
+                        finally:
+                            conn.isolation_level = old_isolation
+                    else:
+                        auditor.debug(
+                            f"Maintenance: VACUUM skipped "
+                            f"({free_pages} free / {total_pages} pages, {free_ratio:.0%})."
+                        )
+
             except Exception as e:
                 auditor.error(f"Database maintenance failed: {e}")
                 return

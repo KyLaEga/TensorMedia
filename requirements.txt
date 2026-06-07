@@ -4,9 +4,17 @@
 torch>=2.2.0
 transformers>=4.38.0
 faiss-cpu>=1.8.0
-numpy>=1.26.4
+# Pinned <2: PySide6 6.6.3.1 / shiboken6 (and the prebuilt faiss/torch wheels)
+# are compiled against the NumPy 1.x C-ABI. Allowing numpy 2.x makes the C
+# extensions emit "compiled using NumPy 1.x cannot be run in NumPy 2.x ... may
+# crash" at import. Keep both bounds so pip resolves a single ABI plane.
+numpy>=1.26.4,<2
 Pillow>=10.2.0
-opencv-python-headless>=4.9.0
+# Capped <4.10: opencv-python 4.10+ wheels require numpy>=2, which clashes with
+# the numpy<2 pin above (PySide6/shiboken ABI). 4.9.0.80 is the last numpy-1.x
+# build. Lift both this cap and the numpy cap together if PySide6 is upgraded
+# to a numpy-2 build.
+opencv-python-headless>=4.9.0,<4.10
 PySide6==6.6.3.1
 huggingface-hub>=0.20.3
 facenet-pytorch>=2.5.3
