@@ -2,7 +2,13 @@
 # TensorMedia Dependencies
 # ============================================================
 torch>=2.2.0
-transformers>=4.38.0
+# Pinned <5: transformers 5.x's is_torch_available() HARD-requires torch>=2.4 and
+# silently DISABLES a torch below that → "SiglipVisionModel requires the PyTorch
+# library but it was not found" at scan time (even though torch is bundled and
+# FaceNet works). Our torch resolves to 2.2.2 (numpy<2 → old torchvision → old
+# torch), so transformers must stay on the 4.x line — it supports SigLIP and has
+# no torch>=2.4 gate. Lift this cap only together with the numpy<2 / torch bump.
+transformers>=4.38.0,<5
 faiss-cpu>=1.8.0
 # Pinned <2: PySide6 6.6.3.1 / shiboken6 (and the prebuilt faiss/torch wheels)
 # are compiled against the NumPy 1.x C-ABI. Allowing numpy 2.x makes the C

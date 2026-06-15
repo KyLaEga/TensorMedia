@@ -1,6 +1,6 @@
 # TensorMedia
 
-**Version 1.2.2** · 🌍 Language: [English](#english) | [Русский](#русский)
+**Version 1.2.3** · 🌍 Language: [English](#english) | [Русский](#русский)
 
 ---
 
