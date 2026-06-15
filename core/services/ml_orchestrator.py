@@ -4,7 +4,6 @@ import psutil
 import multiprocessing
 from PySide6.QtCore import QObject, QTimer
 from core.events import bus
-from core.ml.cluster_engine import SmartClusterEngine
 from ui.workers import ScannerBridge, ClusterWorker, EngineWarmupWorker, MaintenanceWorker
 from utils.logger import auditor
 

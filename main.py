@@ -119,8 +119,24 @@ class ApplicationBootstrap:
         # .setFont()/font-family/font-size в виджетах и QSS — всё наследуется
         # отсюда, чтобы шрифт был консистентным. Базовый размер берётся из
         # дизайн-системы (ThemeManager.FONT_BASE), а не из «магического» числа.
+        #
+        # КРОССПЛАТФОРМЕННОСТЬ (RCA «пережатых шрифтов» на Windows): семейство
+        # ".AppleSystemUIFont" существует ТОЛЬКО в CoreText. На Windows Qt не
+        # находил его и подставлял суррогат с чужими метриками (DirectWrite),
+        # из-за чего ломались ширины строк, ряды наслаивались и элементы
+        # пробивали границы карточек. Семейство выбирается по платформе:
+        # macOS — системный San Francisco, Windows — Segoe UI (родная
+        # ClearType-гарнитура), прочее (Linux) — системный GeneralFont Qt.
         from utils.theme_manager import ThemeManager
-        app.setFont(QFont(".AppleSystemUIFont", ThemeManager.FONT_BASE))
+        if sys.platform == "darwin":
+            _font = QFont(".AppleSystemUIFont", ThemeManager.FONT_BASE)
+        elif sys.platform == "win32":
+            _font = QFont("Segoe UI", ThemeManager.FONT_BASE)
+        else:
+            from PySide6.QtGui import QFontDatabase
+            _font = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont)
+            _font.setPointSize(ThemeManager.FONT_BASE)
+        app.setFont(_font)
 
         icon_name = "app.ico" if sys.platform == "win32" else "app.icns"
         app.setWindowIcon(ThemeManager.load_icon(icon_name))

@@ -13,12 +13,19 @@ def get_base_path() -> Path:
 def get_models_dir() -> Path:
     if getattr(sys, 'frozen', False):
         if hasattr(sys, '_MEIPASS'):
-            return Path(sys._MEIPASS) / "models"
-        
+            bundled = Path(sys._MEIPASS) / "models"
+            # Linux-CPU дистрибутив поставляется БЕЗ весов (лимит GitHub 2 ГБ):
+            # если в бандле их нет, веса живут в пользовательской app-data
+            # директории (туда их скачивает weight_manager при первом запуске).
+            # Бандл read-only — скачивать внутрь _internal нельзя в принципе.
+            if (bundled / "siglip-base-patch16-224").exists():
+                return bundled
+            return get_app_data_dir() / "models"
+
         base_path = Path(sys.executable).parent
         if sys.platform == "darwin":
             return base_path.parent / "Resources" / "models"
-    
+
     return get_base_path() / "models"
 
 def get_app_data_dir() -> Path:

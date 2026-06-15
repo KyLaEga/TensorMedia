@@ -3,7 +3,12 @@ import sys
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QPalette, QColor, QIcon
+from PySide6.QtGui import QPalette, QColor, QIcon, QPixmap
+from PySide6.QtCore import QByteArray
+# Импорт QtSvg регистрирует image-handler формата "SVG" — без него
+# QPixmap.loadFromData(..., "SVG") возвращает пустой пиксмап и все векторные
+# иконки (play/pause/mute) рендерятся пустой областью.
+from PySide6 import QtSvg  # noqa: F401
 
 class ThemeManager:
     # Subdirectories (relative to the resolved asset root) for bundled files.
@@ -69,6 +74,59 @@ class ThemeManager:
     # ----------------------------------------------------------------------
     BUTTON_HEIGHT_PRIMARY = 40
     BUTTON_HEIGHT_ICON = 40
+
+    # ----------------------------------------------------------------------
+    # Icon glyph registry — единый реестр векторных глифов приложения.
+    #
+    # Inline-SVG path-data (Material-style, viewBox 0 0 24 24) вместо emoji или
+    # PNG-ассетов: вектор не мылится на Retina, не зависит от шрифтов ОС и
+    # красится под активную тему в момент сборки иконки (make_icon).
+    # Здесь живут ВСЕ глифы UI: плеер (play/pause/volume/volume_muted) и
+    # адаптивная панель сканирования (scan/stop). Виджеты не имеют права
+    # держать собственные SVG-литералы — только ссылаться на этот реестр.
+    # ----------------------------------------------------------------------
+    ICON_GLYPHS = {
+        "play": "M8 5v14l11-7z",
+        "pause": "M6 19h4V5H6v14zm8-14v14h4V5h-4z",
+        "stop": "M6 6h12v12H6z",
+        # Лупа — компактный режим кнопки «Сканировать»
+        "scan": ("M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 "
+                 "13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 "
+                 "4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 "
+                 "11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"),
+        # Звук включён (unmute)
+        "volume": ("M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05"
+                   "c1.48-.73 2.5-2.25 2.5-4.02z"),
+        # Звук выключен (mute) — динамик с перечёркиванием
+        "volume_muted": ("M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45"
+                         "c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64"
+                         "l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86"
+                         "-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3 3 4.27 "
+                         "7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 "
+                         "1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 "
+                         "19.73l-9-9L4.27 3zM12 4 9.91 6.09 12 8.18V4z"),
+    }
+
+    @classmethod
+    def make_icon(cls, glyph_name: str, color: str) -> QIcon:
+        """Собирает QIcon из глифа реестра: path-data оборачивается в <svg>,
+        заливка красится в `color`, растеризация через SVG image-handler.
+        Неизвестный глиф деградирует в пустую QIcon (не роняет UI)."""
+        path_d = cls.ICON_GLYPHS.get(glyph_name)
+        if not path_d:
+            try:
+                from utils.logger import auditor
+                auditor.warning(f"ThemeManager: unknown icon glyph '{glyph_name}'")
+            except Exception:
+                pass
+            return QIcon()
+        svg = (
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" '
+            f'width="48" height="48"><path fill="{color}" d="{path_d}"/></svg>'
+        )
+        pixmap = QPixmap()
+        pixmap.loadFromData(QByteArray(svg.encode("utf-8")), "SVG")
+        return QIcon(pixmap)
 
     # The palette currently applied to the app; widgets read it via colors().
     # Defaults to DARK because that is the theme MainWindow applies on startup.

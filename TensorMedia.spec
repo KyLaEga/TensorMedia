@@ -7,20 +7,68 @@
 # .app падает при старте (PyTorch JIT / FAISS память / отсутствующие модули).
 import sys
 import os
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_all, copy_metadata
 
 IS_DARWIN = sys.platform == "darwin"
 IS_WIN = sys.platform == "win32"
+IS_LINUX = sys.platform.startswith("linux")
 
 # --- Данные, попадающие внутрь бандла ---------------------------------------
 datas = [
     ("assets", "assets"),
-    ("models", "models"),
 ]
-# transformers/facenet тянут в рантайме свои json/конфиги — без них инференс
-# падает на отсутствующих файлах конфигурации.
-datas += collect_data_files("transformers")
+# Linux-CPU дистрибутив ОБЯЗАН укладываться в лимит GitHub Releases (2 ГБ):
+# веса моделей (~480 МБ SigLIP + FaceNet) в бандл НЕ кладём — они скачиваются
+# при первом запуске в ~/.local/share/TensorMedia/models (см. weight_manager /
+# env_config.get_models_dir). macOS/Windows остаются полностью офлайновыми.
+if not IS_LINUX and os.path.isdir("models"):
+    datas.append(("models", "models"))
+
+# --- transformers: ПОЛНЫЙ сбор (RCA фатального краша SigLIP в бандле) --------
+# Ленивый импорт transformers резолвит SiglipVisionModel через строковые имена
+# модулей (importlib), которые статический анализатор PyInstaller не видит, а
+# проверка is_torch_available() читает ВЕРСИЮ torch через importlib.metadata —
+# т.е. требует папку dist-info, которую PyInstaller по умолчанию не кладёт.
+# Без метаданных transformers считает, что torch «не установлен», и валит
+# рантайм с "SiglipVisionModel requires the PyTorch library but it was not
+# found..." при живом, физически присутствующем torch.
+_tf_datas, _tf_binaries, _tf_hidden = collect_all("transformers")
+datas += _tf_datas
+extra_binaries = list(_tf_binaries)
 datas += collect_data_files("facenet_pytorch")
+
+# --- certifi: bundle the CA store so the ML net contour can verify TLS --------
+# huggingface_hub/requests resolve the trust store via certifi.where(). Frozen,
+# that path must point INSIDE the bundle or weight download (Linux first-run,
+# weight_manager.snapshot_download) dies with CERTIFICATE_VERIFY_FAILED. The
+# stdlib `ssl` default verify-path is OpenSSL's compiled-in CApath
+# (/opt/homebrew/etc/openssl@3 on the build box) which is absent on end-user
+# machines — see runtime hook pyi_rth_ssl_certs.py which redirects SSL_CERT_FILE
+# to this bundled cacert.pem.
+datas += collect_data_files("certifi")
+
+# --- faiss: collect swig binary + libfaiss.dylib + SIMD-variant loader --------
+# faiss/loader.py selects a kernel via runtime try/except imports
+# (swigfaiss_avx512_spr/avx512/avx2/sve -> generic swigfaiss). PyInstaller's
+# static graph sees `import faiss` (core/ml/faiss_manager.py) but not those
+# string-conditional submodules nor the sibling libfaiss.dylib, so collect_all
+# pulls binaries+data+hidden explicitly (on arm64 only the generic kernel
+# exists; collect_all enumerates real files, so no phantom AVX hiddenimports).
+_fa_datas, _fa_binaries, _fa_hidden = collect_all("faiss")
+datas += _fa_datas
+extra_binaries += _fa_binaries
+
+# dist-info для всех пакетов, чьи версии transformers/huggingface_hub опрашивают
+# в рантайме через importlib.metadata (отсутствие любого -> ложный "not found").
+for _pkg in (
+    "torch", "transformers", "safetensors", "tokenizers", "huggingface-hub",
+    "numpy", "tqdm", "regex", "requests", "packaging", "filelock", "pyyaml",
+    "certifi",
+):
+    try:
+        datas += copy_metadata(_pkg)
+    except Exception:
+        pass  # пакет может называться иначе в конкретном окружении — не фатально
 
 # --- Модули, которые PyInstaller не видит статически -------------------------
 hiddenimports = [
@@ -29,8 +77,11 @@ hiddenimports = [
     "PySide6.QtWidgets",
     "PySide6.QtMultimedia",
     "PySide6.QtMultimediaWidgets",
+    "PySide6.QtSvg",        # SVG image-handler: без него иконки плеера (play/
+                            # pause/mute) рендерятся пустой областью в бандле
     "shiboken6",            # критично для инициализации PySide6 (особенно Windows)
     "torch",
+    "safetensors",
     "numpy",
     "cv2",
     "PIL.Image",
@@ -41,7 +92,9 @@ hiddenimports = [
     "psutil",
     "transformers.models.siglip",
     "facenet_pytorch",
-]
+    "faiss",
+    "certifi",
+] + _tf_hidden + _fa_hidden
 
 excludes = [
     "tkinter",
@@ -63,15 +116,45 @@ _exe_icon = "assets/icons/app.ico" if os.path.exists("assets/icons/app.ico") els
 _app_icon = "assets/icons/app.icns" if os.path.exists("assets/icons/app.icns") else None
 
 
+# --- App version: single source of truth = the git tag ----------------------
+# info_plist (macOS) and setup.iss (Windows) used to carry a hand-typed "1.0.0"
+# that silently drifted from the actual release (HEAD tag = v1.1.0). Derive it
+# instead, in priority order:
+#   1. $TENSORMEDIA_VERSION   — CI passes github.ref_name on a tag push (v*)
+#   2. `git describe --tags --abbrev=0`  — local builds inside the repo
+#   3. literal fallback       — source tarball with no git / no tags
+# The winner is stripped of a leading 'v' and MUST be a dotted number
+# (CFBundleVersion rejects anything else, e.g. a branch name from a manual run),
+# otherwise we fall through to the next candidate.
+def _app_version(_fallback="1.2.1"):
+    import re
+    import subprocess
+    candidates = [os.environ.get("TENSORMEDIA_VERSION", "")]
+    try:
+        candidates.append(subprocess.run(
+            ["git", "describe", "--tags", "--abbrev=0"],
+            capture_output=True, text=True, cwd=os.path.abspath("."),
+        ).stdout.strip())
+    except Exception:
+        pass
+    for _cand in candidates:
+        _cand = (_cand or "").strip().lstrip("v")
+        if re.fullmatch(r"\d+(\.\d+){0,3}", _cand):
+            return _cand
+    return _fallback
+
+APP_VERSION = _app_version()
+
+
 a = Analysis(
     ["main.py"],
     pathex=[os.path.abspath(".")],
-    binaries=[],
+    binaries=extra_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=["pyi_rth_ssl_certs.py"],
     excludes=excludes,
     noarchive=False,
     optimize=0,
@@ -199,7 +282,7 @@ if IS_DARWIN:
             "NSHighResolutionCapable": True,
             "LSBackgroundOnly": False,
             "NSRequiresAquaSystemAppearance": False,
-            "CFBundleShortVersionString": "1.0.0",
-            "CFBundleVersion": "1.0.0",
+            "CFBundleShortVersionString": APP_VERSION,
+            "CFBundleVersion": APP_VERSION,
         },
     )

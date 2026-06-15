@@ -2,8 +2,6 @@
 # MODULE: ui/views/main_window.py
 # ============================================================
 import os
-import shutil
-import time
 from pathlib import Path
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QProgressBar, QComboBox, QLineEdit, QRadioButton, 
@@ -11,17 +9,17 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QApplication, QCheckBox, QFrame, QStackedWidget, QGridLayout, 
                              QSizePolicy, QSpacerItem, QAbstractItemView, QMessageBox,
                              QStyle, QStyleOptionComboBox, QStylePainter)
-from PySide6.QtCore import Qt, QSettings, Signal, QSortFilterProxyModel, QModelIndex
-from PySide6.QtGui import QStandardItemModel, QKeySequence, QAction, QFontMetrics
+from PySide6.QtCore import Qt, QSettings, Signal, QSortFilterProxyModel, QModelIndex, QSize
+from PySide6.QtGui import (QKeySequence, QAction, QFontMetrics,
+                           QIntValidator, QIcon)
 
 from utils.theme_manager import ThemeManager
 from utils.i18n import translator
 from utils.logger import auditor
-from core.db.vector_cache import VectorCache
 from core.ml.faiss_manager import FaissManager
 
-from ui.workers import MaintenanceWorker, PurgeWorker
-from ui.components.video_player import BuiltInVideoPlayer, JumpSlider
+from ui.workers import PurgeWorker
+from ui.components.video_player import JumpSlider
 from ui.components.media_tree import MediaTreeView, LazyClusterModel
 from ui.components.image_label import ScalableImageLabel
 from ui.views.multi_compare import MultiCompareWidget
@@ -56,6 +54,72 @@ class ElidingLabel(QLabel):
         avail = max(0, self.contentsRect().width() or self.width())
         super().setText(fm.elidedText(self._full_text, self._mode, avail))
         self.setToolTip(self._full_text if super().text() != self._full_text else "")
+
+
+class ThresholdEdit(QLineEdit):
+    """Пин порога сходства: QLineEdit, мимикрирующий под текстовую метку.
+
+    Заменяет статичный QLabel "88%". Точное значение [0-100] вводится с
+    клавиатуры (строгий QIntValidator); НИКАКОЙ кнопки «Применить» — фиксация
+    идёт по сигнальной архитектуре фокуса: editingFinished (Enter или потеря
+    фокуса) → value_committed(int) → пересчёт FAISS-выборки в контроллере.
+    Вне режима редактирования показывает "NN%", в фокусе — голое число."""
+
+    value_committed = Signal(int)
+
+    def __init__(self, value: int = 88, parent=None):
+        super().__init__(parent)
+        self._value = max(0, min(100, int(value)))
+        self.setValidator(QIntValidator(0, 100, self))
+        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.setCursor(Qt.CursorShape.IBeamCursor)
+        # Визуально это всё ещё «метка»: без рамки и фона, цвет — из QLabel-палитры.
+        self.setFrame(False)
+        self.setStyleSheet(
+            "QLineEdit { background: transparent; border: none; padding: 0; }"
+            "QLineEdit:focus { background: transparent; border: none; }"
+        )
+        self.editingFinished.connect(self._commit)
+        self._refresh_display()
+
+    def value(self) -> int:
+        return self._value
+
+    def set_value(self, value: int):
+        """Программная установка (ползунок/пресеты): БЕЗ эмиссии value_committed,
+        чтобы не зациклить recluster."""
+        self._value = max(0, min(100, int(value)))
+        if not self.hasFocus():
+            self._refresh_display()
+        else:
+            self.setText(str(self._value))
+
+    def _refresh_display(self):
+        self.setText(f"{self._value}%")
+
+    def focusInEvent(self, event):
+        # В фокусе остаются только цифры — валидатор работает по чистому числу.
+        self.setText(str(self._value))
+        super().focusInEvent(event)
+        self.selectAll()
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self._refresh_display()
+
+    def _commit(self):
+        text = self.text().rstrip("%").strip()
+        try:
+            value = max(0, min(100, int(text)))
+        except ValueError:
+            self._refresh_display()
+            return
+        changed = value != self._value
+        self._value = value
+        self._refresh_display()
+        self.clearFocus()
+        if changed:
+            self.value_committed.emit(value)
 
 
 class FluidComboBox(QComboBox):
@@ -254,6 +318,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'tree'):
             self.tree._trigger_stretch()
         
+        if hasattr(self, 'scan_controls_layout'):
+            self._update_scan_controls_mode()
+
         margin = max(4, int(self.width() * 0.01))
         if hasattr(self, 'single_prev_layout'):
             self.single_prev_layout.setContentsMargins(margin, margin, margin, margin)
@@ -611,9 +678,14 @@ class MainWindow(QMainWindow):
         slider_l.setContentsMargins(0, 0, 0, 0)
         slider_l.setSpacing(8)
         self.slider_threshold = JumpSlider(Qt.Orientation.Horizontal)
-        self.slider_threshold.setRange(50, 100)
+        # Полный диапазон [0-100] — синхронно со строгим QIntValidator пина:
+        # клавиатурный ввод и ползунок обязаны принимать одно и то же множество.
+        self.slider_threshold.setRange(0, 100)
         self.slider_threshold.setValue(88)
-        self.lbl_threshold = QLabel("88%")
+        # ИНТЕРАКТИВНЫЙ ПИН (TASK 2): QLineEdit-мимикрия под метку. Точное
+        # значение (например, ровно 96%) вводится с клавиатуры; применение —
+        # по Enter/потере фокуса (editingFinished), без кнопки «Применить».
+        self.lbl_threshold = ThresholdEdit(88)
         # СТАТИЧНЫЙ ОТСТУП. Ширину пина жёстко фиксируем по самому широкому
         # значению ("100%"), а НЕ по живому тексту. Иначе при 88% ↔ 100% (и при
         # смене локали, меняющей метрики шрифта) ширина пина плавала, и правый
@@ -621,11 +693,17 @@ class MainWindow(QMainWindow):
         # геометрию ряда от длины подписи: правый край ползунка теперь
         # детерминирован и одинаков в EN и RU.
         _thr_fm = QFontMetrics(self.lbl_threshold.font())
-        self.lbl_threshold.setFixedWidth(_thr_fm.horizontalAdvance("100%") + 6)
+        self.lbl_threshold.setFixedWidth(_thr_fm.horizontalAdvance("100%") + 8)
         self.lbl_threshold.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.lbl_threshold.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         # stretch=1 ползунку, 0 пину: весь свободный ход забирает ползунок, пин
         # держит свою фикс-ширину как жёсткую распорку у правого края карточки.
+        # РАЗДЕЛЕНИЕ КОНТУРОВ (TASK 1): живой визуальный фидбек при движении мыши
+        # замкнут ВНУТРИ представления — valueChanged обновляет только текст пина.
+        # Эта связь НЕ касается контроллера, бэкенда и активного экрана: тяжёлый
+        # FAISS-пересчёт триггерит исключительно sliderReleased (см. контроллер).
+        # set_value не эмитит value_committed, поэтому цикла recluster не возникает.
+        self.slider_threshold.valueChanged.connect(self.lbl_threshold.set_value)
         slider_l.addWidget(self.slider_threshold, 1)
         slider_l.addWidget(self.lbl_threshold, 0)
         cal_l.addLayout(slider_l)
@@ -941,7 +1019,14 @@ class MainWindow(QMainWindow):
         self.scan_controls_layout.addWidget(self.btn_pause)
         self.scan_controls_layout.addWidget(self.btn_stop)
         sidebar_layout.addLayout(self.scan_controls_layout)
-        
+
+        # TASK 4 — адаптивная панель управления сканированием. Полные локализо-
+        # ванные подписи кнопок хранятся здесь (НЕ читаются обратно из text(),
+        # который в компактном режиме пуст); _update_scan_controls_mode решает,
+        # помещается ли текстовый ряд в текущую ширину сайдбара, и при нехватке
+        # места переводит кнопки в иконочный режим с QToolTip.
+        self._scan_labels = {"scan": "", "pause": "", "stop": ""}
+
         self.master_splitter.addWidget(self.sidebar_widget)
 
         content_widget = QWidget()
@@ -1015,9 +1100,20 @@ class MainWindow(QMainWindow):
         self.single_prev_layout.addWidget(self.single_preview_label)
         self.preview_stack.addWidget(single_prev_card)
         
-        self.video_player = BuiltInVideoPlayer()
-        self.preview_stack.addWidget(self.video_player)
-        
+        # LAZY INIT (страницы тяжёлых движков предпросмотра). При старте в стек
+        # кладутся ПУСТЫЕ хосты-страницы — индексы (0 single / 1 video / 2 multi /
+        # 3 discrete) стабильны, но сами движки (QMediaPlayer+QVideoSink с
+        # ffmpeg-плагином; PIL/fitz дискретного контура) конструируются ТОЛЬКО при
+        # первом реальном обращении пользователя через ensure_video_player() /
+        # ensure_discrete_preview(). Хост-страница создаётся с родителем сразу
+        # (никаких parentless show() — см. правило против Spaces Jump).
+        self.video_player = None
+        self._video_host = QWidget()
+        _vh_layout = QVBoxLayout(self._video_host)
+        _vh_layout.setContentsMargins(0, 0, 0, 0)
+        _vh_layout.setSpacing(0)
+        self.preview_stack.addWidget(self._video_host)
+
         multi_widget = QWidget()
         multi_layout = QVBoxLayout(multi_widget)
         multi_layout.setContentsMargins(0, 0, 0, 0)
@@ -1036,20 +1132,43 @@ class MainWindow(QMainWindow):
         scroll_multi.setWidget(self.multi_grid_container)
         multi_layout.addWidget(scroll_multi, stretch=1)
         
+        # Транспорт мультипревью — зеркально панели «Сравнения»: JumpSlider в
+        # ПЕРМИЛЛЕ (0..1000, как slider страницы сравнения) для точной адресации
+        # длинных роликов + индикатор позиции. Живой дросселированный скраб
+        # подключает контроллер (sliderMoved → троттл 33 мс → cv2-кадры).
         self.multi_slider_panel = QWidget()
         self.multi_slider_panel.setObjectName("multi_slider_panel")
         self.multi_slider_panel.setFixedHeight(45)
         ms_layout = QHBoxLayout(self.multi_slider_panel)
-        ms_layout.setContentsMargins(15, 0, 15, 0)
+        ms_layout.setContentsMargins(15, 0, 12, 0)
+        ms_layout.setSpacing(10)
         self.multi_sync_slider = JumpSlider(Qt.Orientation.Horizontal)
-        self.multi_sync_slider.setRange(0, 100)
-        self.multi_sync_slider.setValue(25)
+        self.multi_sync_slider.setRange(0, 1000)
+        self.multi_sync_slider.setValue(250)
         self.multi_sync_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        ms_layout.addWidget(self.multi_sync_slider)
+        ms_layout.addWidget(self.multi_sync_slider, stretch=1)
+        self.multi_pos_label = QLabel("25%")
+        self.multi_pos_label.setObjectName("multi_pos_label")
+        self.multi_pos_label.setStyleSheet(
+            f"color: {ThemeManager.colors()['text']}; border: none;"
+        )
+        self.multi_pos_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Фикс ширины метки: «100%» не должен толкать слайдер при скрабе.
+        self.multi_pos_label.setFixedWidth(44)
+        ms_layout.addWidget(self.multi_pos_label)
         multi_layout.addWidget(self.multi_slider_panel)
         self.multi_slider_panel.hide()
         
         self.preview_stack.addWidget(multi_widget)
+
+        # index 3 — дискретный контур (GIF/PDF/CBZ): пустой хост до первого вызова.
+        self.discrete_preview = None
+        self._discrete_host = QWidget()
+        _dh_layout = QVBoxLayout(self._discrete_host)
+        _dh_layout.setContentsMargins(0, 0, 0, 0)
+        _dh_layout.setSpacing(0)
+        self.preview_stack.addWidget(self._discrete_host)
+
         inspector_layout.addWidget(self.preview_stack, stretch=1)
 
         bottom_btns = QWidget()
@@ -1102,6 +1221,30 @@ class MainWindow(QMainWindow):
 
         self.master_splitter.splitterMoved.connect(lambda: self.tree._trigger_stretch())
         self.inner_splitter.splitterMoved.connect(lambda: self.tree._trigger_stretch())
+        # Перетаскивание ручки сплиттера меняет ширину сайдбара без resizeEvent
+        # окна — пересчитываем режим панели сканирования и здесь.
+        self.master_splitter.splitterMoved.connect(self._update_scan_controls_mode)
+
+    def ensure_video_player(self):
+        """Ленивая фабрика Контура А (видеопоток). BuiltInVideoPlayer тянет за
+        собой QMediaPlayer (прогрев ffmpeg-плагина) и cv2-воркер превью — при
+        старте приложения это мёртвый груз, поэтому плеер рождается только при
+        первом выборе видеофайла. Родитель задаётся при конструировании, виджет
+        добавляется в layout ДО показа страницы (анти-Spaces-Jump инвариант)."""
+        if self.video_player is None:
+            from ui.components.video_player import BuiltInVideoPlayer
+            self.video_player = BuiltInVideoPlayer(self._video_host)
+            self._video_host.layout().addWidget(self.video_player)
+        return self.video_player
+
+    def ensure_discrete_preview(self):
+        """Ленивая фабрика Контура Б (дискретный скрэббинг GIF/PDF/CBZ).
+        Модуль импортируется здесь же: PIL/fitz не грузятся при старте."""
+        if self.discrete_preview is None:
+            from ui.components.discrete_preview import DiscreteScrubbingWidget
+            self.discrete_preview = DiscreteScrubbingWidget(self._discrete_host)
+            self._discrete_host.layout().addWidget(self.discrete_preview)
+        return self.discrete_preview
 
     def _setup_menubar(self):
         # Cmd+D живёт в нативном меню macOS как единственный владелец шортката.
@@ -1153,6 +1296,57 @@ class MainWindow(QMainWindow):
         self.action_compare = QAction(translator.tr("btn_compare"), self)
         self.action_compare.setShortcut(QKeySequence("Ctrl+P"))
         self.menu_edit.addAction(self.action_compare)
+
+    def _scan_button_specs(self):
+        """(кнопка, полная подпись, глиф ThemeManager, цвет иконки|None=цвет темы)."""
+        return [
+            (self.btn_scan, self._scan_labels["scan"], "scan", "#FFFFFF"),
+            (self.btn_pause, self._scan_labels["pause"], "pause", None),
+            (self.btn_stop, self._scan_labels["stop"], "stop", "#FFFFFF"),
+        ]
+
+    def update_pause_label(self, text: str):
+        """Контроллер меняет подпись Пауза↔Продолжить через этот метод (прямой
+        setText сломал бы компактный иконочный режим, где text() пуст)."""
+        self._scan_labels["pause"] = text
+        self._update_scan_controls_mode()
+
+    def _update_scan_controls_mode(self):
+        """TASK 4: если видимый ряд кнопок управления сканированием не уклады-
+        вается в текущую ширину сайдбара (включая минимальные 350px на Windows-
+        метриках шрифта), кнопки сбрасывают текст и превращаются в компактный
+        ряд векторных иконок с подсказками — горизонтальный вылет за сплиттер
+        исключён по построению."""
+        if not hasattr(self, "scan_controls_layout") or not self._scan_labels["scan"]:
+            return
+
+        specs = self._scan_button_specs()
+        visible = [s for s in specs if s[0].isVisibleTo(self)]
+        if not visible:
+            return
+
+        fm = self.btn_scan.fontMetrics()
+        spacing = self.scan_controls_layout.spacing()
+        # 22px паддинги big_btn_qss с двух сторон + рамка/запас ≈ 48px на кнопку;
+        # 24 — поля sidebar_layout (12+12).
+        needed = (
+            sum(fm.horizontalAdvance(s[1]) + 48 for s in visible)
+            + spacing * (len(visible) - 1) + 24
+        )
+        available = self.sidebar_widget.width() or self.SIDEBAR_MIN_WIDTH
+        compact = needed > available
+
+        theme_text = ThemeManager.colors()["text"]
+        for btn, label, glyph, color in specs:
+            if compact:
+                btn.setText("")
+                btn.setIcon(ThemeManager.make_icon(glyph, color or theme_text))
+                btn.setIconSize(QSize(20, 20))
+                btn.setToolTip(label)
+            else:
+                btn.setIcon(QIcon())
+                btn.setText(label)
+                btn.setToolTip("")
 
     def _toggle_sidebar(self):
         is_visible = self.sidebar_widget.isVisible()
@@ -1241,9 +1435,12 @@ class MainWindow(QMainWindow):
         self.rb_semantic.setText(translator.tr("mode_semantic"))
         self.radio_custom.setText(translator.tr("mode_custom"))
         
-        self.btn_scan.setText(translator.tr("btn_scan"))
-        self.btn_pause.setText(translator.tr("btn_pause"))
-        self.btn_stop.setText(translator.tr("btn_stop"))
+        # Подписи панели сканирования идут через адаптивный слой (TASK 4):
+        # в широком сайдбаре — текст, в сжатом — иконки с QToolTip.
+        self._scan_labels["scan"] = translator.tr("btn_scan")
+        self._scan_labels["pause"] = translator.tr("btn_pause")
+        self._scan_labels["stop"] = translator.tr("btn_stop")
+        self._update_scan_controls_mode()
         
         self.lbl_stat_title.setText(translator.tr("telemetry"))
         self.lbl_stat_title_time.setText(translator.tr("stat_time"))

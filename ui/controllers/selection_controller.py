@@ -1,9 +1,6 @@
-import os
-from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QModelIndex
 from PySide6.QtWidgets import QApplication, QMessageBox, QFileDialog, QDialog
 from utils.i18n import translator
-from utils.logger import auditor
 from core.services.auto_selector import AutoSelectWorker
 from core.services.fs_service import SafeFSExecutor, BatchOpWorker
 from ui.components.dialogs import VisualDeleteDialog

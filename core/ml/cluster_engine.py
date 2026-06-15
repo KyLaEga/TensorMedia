@@ -150,6 +150,21 @@ def process_single_file_io(task_data: tuple) -> dict:
 
     def _allocate_shm(img_obj):
         arr = np.array(img_obj)
+        # WINDOWS (NT): именованная shared memory — это file-mapping без
+        # персистентности: сегмент живёт, ПОКА открыт хотя бы один хэндл.
+        # Воркер делает shm.close() и завершает задачу ДО того, как родитель
+        # откроет сегмент по имени → ядро освобождает мэппинг, родитель ловит
+        # FileNotFoundError ("SHM Read Fault"), изображение теряется и файл
+        # не векторизуется (нулевые совпадения FaceNet/SigLIP на Windows).
+        # На NT всегда передаём пиксели inline-байтами через pickle пула.
+        if os.name == "nt":
+            shm_blocks.append({
+                "shape": arr.shape,
+                "dtype": str(arr.dtype),
+                "data": arr.tobytes(),
+                "is_shm": False
+            })
+            return
         try:
             import uuid
             shm_name = f"tm_shm_{uuid.uuid4().hex[:20]}"
@@ -418,6 +433,8 @@ class SmartClusterEngine:
         self._io_pool = None
         self._scan_cancel_flag = None
         self.faiss_manager = FaissManager(scan_mode="visual")
+        # Кэш 64-битных dHash для Stage 3 (попиксельное подтверждение пар).
+        self._dhash_cache = {}
 
     def request_scan_abort(self):
         # Called from the GUI/orchestrator thread. Only flip cooperative flags
@@ -632,7 +649,8 @@ class SmartClusterEngine:
         self.is_paused = False
         self.is_stopped = False
         self.current_file_data = []
-        
+        self._dhash_cache.clear()
+
         if self._scan_cancel_flag is not None:
             self._scan_cancel_flag.value = 0
         
@@ -648,13 +666,21 @@ class SmartClusterEngine:
                     elif entry.is_file(follow_symlinks=False) and not entry.name.startswith('.'):
                         ext = os.path.splitext(entry.name)[1].lower()
                         if allowed_exts and ext not in allowed_exts: continue
-                        discovered.append(Path(entry.path))
+                        # normpath: на Windows os.scandir может вернуть смешанные
+                        # разделители ('C:/dir\\file'), а путь — это ПЕРВИЧНЫЙ
+                        # КЛЮЧ SQLite-кэша и FAISS-подписи. Без канонизации один
+                        # файл живёт в кэше под двумя ключами ('/' и '\\') и
+                        # инвалидация при удалении промахивается.
+                        discovered.append(Path(os.path.normpath(entry.path)))
             except PermissionError as e:
                 auditor.warning(f"Permission denied while scanning directory {directory}: {e}")
             return discovered
 
         files = []
         for d in target_dirs:
+            # Канонизация корня скана (UTF-8 строки Python безопасны для NTFS;
+            # критичен только единый разделитель — см. комментарий в fast_scandir).
+            d = os.path.normpath(os.path.abspath(str(d)))
             p_dir = Path(d)
             if p_dir.is_dir():
                 files.extend(fast_scandir(d))
@@ -901,9 +927,206 @@ class SmartClusterEngine:
 
         return self.current_file_data
 
+    # ------------------------------------------------------------------
+    # КАСКАДНЫЙ ГИБРИДНЫЙ ФИЛЬТР (Stage 0-3)
+    #
+    # Stage 0 — «мёртвые души»: каждый кандидат, который FAISS способен
+    #   вернуть при смене порога, валидируется по физическому существованию
+    #   файла (os.path.exists) И по наличию живой записи в SQLite-кэше
+    #   (запись вычищается в момент удаления через _invalidate_cache_paths,
+    #   т.е. её отсутствие == статус 'deleted'). Без этого in-memory список
+    #   current_file_data и дисковый .npy-кэш FAISS «воскрешали» удалённые
+    #   файлы при каждом recluster по ползунку.
+    # Stage 1 — семантическое сито: kNN-выборка FAISS по косинусной близости
+    #   (см. FaissManager.build_clusters; векторы L2-нормированы, IP==cosine).
+    # Stage 2 — геометрия: сравнение площади в пикселях и соотношения сторон.
+    #   Совпавшая композиция при разном разрешении → 'quality' («дубликаты
+    #   разного качества»); элемент с максимальным разрешением получает
+    #   keep_priority=True (приоритет сохранения).
+    # Stage 3 — детерминированное попиксельное подтверждение: пограничные по
+    #   similarity пары проверяются 64-битным градиентным dHash (OpenCV/PIL).
+    #   Это отсекает ложные срабатывания эмбеддингов, инвариантных к мелким
+    #   деталям (однородные текстуры, схожая композиция разных кадров).
+    # ------------------------------------------------------------------
+    BORDERLINE_BAND = 0.05    # зона similarity над порогом, требующая dHash-подтверждения
+    DHASH_MAX_DISTANCE = 16   # Хэмминг-порог (из 64 бит): выше — пара отклоняется
+    ASPECT_TOLERANCE = 0.03   # относительный допуск соотношения сторон (Stage 2)
+    _DHASH_CACHE_MAX = 4096   # потолок кэша dHash (защита RAM на больших библиотеках)
+
+    _VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v'}
+    _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.heic', '.gif'}
+
+    def _filter_dead_entries(self) -> list:
+        """Stage 0: выбрасывает из current_file_data записи удалённых файлов."""
+        data = self.current_file_data
+        if not data:
+            return []
+
+        alive = [it for it in data if os.path.exists(it["path"])]
+
+        # Перекрёстная проверка по SQLite: путь, удалённый из кэша (момент
+        # удаления в UI), считается деактивированным, даже если на диске
+        # успел появиться одноимённый файл другого содержания.
+        if alive:
+            try:
+                db_name = f"meta_v2_{self.scan_mode or 'visual'}.db"
+                cache_db = DBConnectionPool.get_connection(db_name)
+                known = cache_db.get_metadata_for_paths([it["path"] for it in alive])
+                alive = [it for it in alive if it["path"] in known]
+            except Exception as e:
+                auditor.warning(f"Stage 0: SQLite liveness check skipped: {e}")
+
+        if len(alive) != len(data):
+            auditor.info(
+                f"Stage 0: filtered {len(data) - len(alive)} dead entr(ies) "
+                f"before FAISS re-clustering"
+            )
+            # In-place обновление: меняется и подпись состояния FAISS-кэша,
+            # поэтому устаревшая kNN-матрица с дисковым .npy не переиспользуется.
+            self.current_file_data = alive
+        return alive
+
+    @staticmethod
+    def _parse_resolution(res_str):
+        try:
+            w, h = str(res_str).lower().split("x")
+            w, h = int(w), int(h)
+            return (w, h) if w > 0 and h > 0 else None
+        except (ValueError, AttributeError):
+            return None
+
+    def _load_gray_small(self, path: str):
+        """Серый кадр-миниатюра для dHash. Видео — средний кадр; изображения —
+        через PIL (unicode-безопасно на NTFS, в отличие от cv2.imread)."""
+        ext = Path(path).suffix.lower()
+        try:
+            if ext in self._VIDEO_EXTS:
+                cap = cv2.VideoCapture(str(path))
+                try:
+                    if not cap.isOpened():
+                        return None
+                    total = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                    if total > 0:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * 0.5))
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        return None
+                    return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                finally:
+                    cap.release()
+            if ext in self._IMAGE_EXTS:
+                with Image.open(path) as img:
+                    img.thumbnail((128, 128))
+                    return np.array(img.convert("L"))
+        except Exception as e:
+            auditor.debug(f"Stage 3: dHash source load failed for {path}: {e}")
+        # .pdf/.cbz и прочие контейнеры: попиксельное подтверждение неприменимо.
+        return None
+
+    def _dhash64(self, path: str):
+        """64-битный градиентный dHash (9x8, сравнение соседних пикселей)."""
+        cached = self._dhash_cache.get(path)
+        if cached is not None:
+            return None if cached == -1 else cached
+
+        gray = self._load_gray_small(path)
+        if gray is None or gray.size == 0:
+            value = -1
+        else:
+            small = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA)
+            bits = (small[:, 1:] > small[:, :-1]).flatten()
+            value = int.from_bytes(np.packbits(bits).tobytes(), "big")
+
+        if len(self._dhash_cache) >= self._DHASH_CACHE_MAX:
+            self._dhash_cache.clear()
+        self._dhash_cache[path] = value
+        return None if value == -1 else value
+
+    def _annotate_geometry(self, cluster: list) -> None:
+        """Stage 2: маркировка пар по разрешению/соотношению сторон."""
+        base = cluster[0]  # FaissManager сортирует кластер по similarity desc
+        base_res = self._parse_resolution(base.get("resolution"))
+
+        def _area(item):
+            r = self._parse_resolution(item.get("resolution"))
+            return (r[0] * r[1]) if r else 0
+
+        for item in cluster:
+            item.setdefault("dup_kind", "reference" if item is base else "semantic")
+            if item is not base and item.get("phash") and item["phash"] == base.get("phash"):
+                item["dup_kind"] = "exact"
+
+        if base_res:
+            base_area = base_res[0] * base_res[1]
+            base_ar = base_res[0] / base_res[1]
+            for item in cluster[1:]:
+                r = self._parse_resolution(item.get("resolution"))
+                if not r:
+                    continue
+                ar = r[0] / r[1]
+                # Та же композиция (вектор сошёлся) и те же пропорции, но другая
+                # площадь → «дубликат разного качества».
+                if abs(ar - base_ar) <= self.ASPECT_TOLERANCE * base_ar and r[0] * r[1] != base_area:
+                    item["dup_kind"] = "quality"
+
+        # Приоритет сохранения: максимум пикселей, при равенстве — больший файл.
+        best = max(cluster, key=lambda it: (_area(it), it.get("size", 0)))
+        for item in cluster:
+            item["keep_priority"] = item is best
+
+    def _pixel_confirm(self, cluster: list, sim_floor: float) -> list:
+        """Stage 3: dHash-подтверждение пограничных пар против базы кластера."""
+        base = cluster[0]
+        confirmed = [base]
+        base_hash_loaded = False
+        base_hash = None
+
+        for item in cluster[1:]:
+            # Бинарно идентичные файлы (blake3) не нуждаются в подтверждении.
+            if item.get("phash") and item["phash"] == base.get("phash"):
+                confirmed.append(item)
+                continue
+            sim = float(item.get("similarity", 1.0))
+            if sim >= sim_floor + self.BORDERLINE_BAND:
+                confirmed.append(item)
+                continue
+
+            if not base_hash_loaded:
+                base_hash = self._dhash64(base["path"])
+                base_hash_loaded = True
+            item_hash = self._dhash64(item["path"])
+            if base_hash is None or item_hash is None:
+                # Нет попиксельных данных для опровержения (PDF/CBZ/битый файл) —
+                # семантический вердикт Stage 1 остаётся в силе.
+                confirmed.append(item)
+                continue
+
+            distance = bin(base_hash ^ item_hash).count("1")
+            if distance <= self.DHASH_MAX_DISTANCE:
+                confirmed.append(item)
+            else:
+                auditor.debug(
+                    f"Stage 3: rejected borderline pair (sim={sim:.3f}, "
+                    f"dHash dist={distance}): {item['path']}"
+                )
+        return confirmed
+
     def build_clusters(self, threshold: float) -> list:
-        return self.faiss_manager.build_clusters(
-            self.current_file_data.copy(),
-            threshold,
-            self.scan_mode,
+        active = self._filter_dead_entries()                       # Stage 0
+        clusters = self.faiss_manager.build_clusters(              # Stage 1
+            list(active), threshold, self.scan_mode,
         )
+
+        # FaceNet-эмбеддинги описывают ЛИЦО, а не кадр: геометрия файла и
+        # попиксельный dHash для них не имеют смысла и дали бы ложные отказы.
+        if self.scan_mode == "faces":
+            return clusters
+
+        sim_floor = 1.0 - threshold
+        refined = []
+        for cluster in clusters:
+            self._annotate_geometry(cluster)                       # Stage 2
+            cluster = self._pixel_confirm(cluster, sim_floor)      # Stage 3
+            if len(cluster) > 1:
+                refined.append(cluster)
+        return refined

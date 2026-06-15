@@ -19,7 +19,8 @@ dist/
 .pyinstaller_cache/
 *.log
 logs/
-*.spec
+# NB: TensorMedia.spec is hand-maintained and load-bearing — it is intentionally
+# NOT ignored (do not add *.spec here; the autogen spec must never overwrite it).
 
 # OS Generated
 .DS_Store
@@ -32,8 +33,3 @@ models/
 *.bin
 *.onnx
 *.safetensors
-venv/
-models/
-*.pt
-*.safetensors
-*.bin

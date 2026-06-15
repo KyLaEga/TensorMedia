@@ -1,0 +1,71 @@
+# ==========================================
+# .claudeignore - Token Economy Manifest
+# Project: TensorMedia (macOS/Cross-platform)
+# ==========================================
+
+# 1. Version Control & IDE
+.git/
+.idea/
+.vscode/
+.trae/
+
+# 2. Python Core & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+.pytest_cache/
+
+# 3. macOS Environment
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+
+# 4. Build Artifacts (PyInstaller & GitHub Actions)
+build/
+dist/
+.pyinstaller_cache/
+*.spec
+*.exe
+*.dmg
+*.zip
+*.tar.gz
+dmg_root/
+TensorMedia.app/
+
+# 5. Heavy ML Models & Tensors (Критический вектор экономии)
+models/
+*.pt
+*.pth
+*.bin
+*.onnx
+*.safetensors
+*.h5
+
+# 6. Local Databases, Caches & State
+faiss_cache/
+app_data/
+cache/
+*.db
+*.db-wal
+*.db-shm
+fs_transactions.journal
+
+# 7. Logs & Telemetry
+logs/
+*.log
+
+# 8. Media Datasets (Предотвращает чтение бинарных медиа-файлов при RAG-поиске)
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.cbz
+*.pdf

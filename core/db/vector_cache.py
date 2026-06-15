@@ -6,7 +6,6 @@ import time
 import atexit
 import signal
 import sys
-from pathlib import Path
 from contextlib import closing
 
 from utils.env_config import get_data_dir

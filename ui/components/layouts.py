@@ -65,7 +65,6 @@ class FlowLayout(QLayout):
         x, y = rect.x(), rect.y()
         lineHeight = 0
         for item in self.itemList:
-            wid = item.widget()
             spaceX = self.horizontalSpacing()
             spaceY = self.verticalSpacing()
             nextX = x + item.sizeHint().width() + spaceX

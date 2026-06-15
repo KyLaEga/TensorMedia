@@ -4,33 +4,39 @@
 import os
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QComboBox, QSlider, QSizePolicy)
-from PySide6.QtCore import Qt, QUrl, QTimer, QSize, QByteArray
-from PySide6.QtGui import QColor, QIcon, QPixmap, QPainter
+from PySide6.QtCore import Qt, QUrl, QTimer, QSize, QElapsedTimer
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink
-# Импорт QtSvg регистрирует image-handler формата "SVG", без которого
-# QPixmap.loadFromData(..., "SVG") вернул бы пустой пиксмап.
-from PySide6 import QtSvg  # noqa: F401
 
+# Регистрацию SVG image-handler'а (QtSvg) и сборку иконок выполняет
+# ThemeManager.make_icon — см. utils/theme_manager.py.
 from utils.theme_manager import ThemeManager
 
-# Inline-SVG глифы плеера (Material-style path data, viewBox 0 0 24 24). Вектор
-# вместо emoji/системного шрифта: не мылится, не зависит от шрифта ОС и красится
-# под активную тему.
-SVG_PLAY = "M8 5v14l11-7z"
-SVG_PAUSE = "M6 19h4V5H6v14zm8-14v14h4V5h-4z"
-SVG_VOLUME = "M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"
+# Все векторные глифы плеера (play/pause/volume/volume_muted) живут в едином
+# реестре дизайн-системы — ThemeManager.ICON_GLYPHS — и собираются в QIcon
+# через ThemeManager.make_icon(name, color). Локальных SVG-литералов здесь нет.
 
 
-def create_svg_icon(svg_path_d: str, color: str) -> QIcon:
-    """Собирает QIcon из inline-SVG: оборачивает path-data `d` в <svg>, красит
-    заливку в `color`, растеризует через QPixmap.loadFromData(..., "SVG")."""
-    svg = (
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
-        f'<path fill="{color}" d="{svg_path_d}"/></svg>'
-    )
-    pixmap = QPixmap()
-    pixmap.loadFromData(QByteArray(svg.encode("utf-8")), "SVG")
-    return QIcon(pixmap)
+def paint_corrupted_placeholder(painter, rect):
+    """Рисует центрированную заглушку «⚠️ Битый файл / Corrupted» поверх уже
+    залитого фоном холста.
+
+    Закрывает UX-зазор «слепого квадрата»: когда декодер не отдал валидный растр
+    (битый кадр/страница/видео), контур предпросмотра иначе оставался пустой
+    заливкой темы, и пользователь не отличал сбой от пустоты. Единый источник
+    отрисовки для всех контуров — _RasterView (discrete_preview) импортирует эту
+    же функцию, поэтому вид заглушки одинаков для видео и дискретных форматов."""
+    painter.save()
+    painter.setPen(QColor("#DA3633"))
+    font = painter.font()
+    # Кегль масштабируем по высоте холста (мелкая карточка сравнения ↔ полноэкранный
+    # одиночный просмотр), но в разумных рамках, чтобы текст не вылезал за края.
+    font.setPointSize(max(11, min(20, rect.height() // 18)))
+    font.setBold(True)
+    painter.setFont(font)
+    painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "⚠️  Битый файл / Corrupted")
+    painter.restore()
+
 
 class JumpSlider(QSlider):
     def __init__(self, *args, **kwargs):
@@ -72,6 +78,12 @@ class VideoSinkWidget(QWidget):
         # прогрева QMediaPlayer. Как только пойдут живые кадры из синка (нажат Play),
         # превью сбрасывается и его место занимает реальное воспроизведение.
         self._preview_image = None
+        # Гард «битый файл»: ставится mark_corrupted() при known-сбое (отсутствует/
+        # не читается файл) и гасится любым валидным кадром/превью. paintEvent
+        # рисует заглушку только по этому флагу, а НЕ на каждом «нет кадра» —
+        # иначе плейсхолдер мигал бы во время штатной загрузки (cv2-превью ещё в
+        # пути), что было бы ложной тревогой.
+        self._broken = False
         self._sink = QVideoSink(self)
         self._sink.videoFrameChanged.connect(self._on_frame)
         # Фон рисуем сами в paintEvent на весь rect(), поэтому системную заливку
@@ -88,11 +100,23 @@ class VideoSinkWidget(QWidget):
         self._preview_image = image
         # Сбрасываем возможный устаревший живой кадр от прошлого видео.
         self._current_frame = None
+        self._broken = False   # пришёл валидный растр — снимаем гард «битый файл»
         self.update()
 
     def clear_preview(self):
         self._preview_image = None
         self._current_frame = None
+        self._broken = False
+        self.update()
+
+    def mark_corrupted(self):
+        """Пометить контур как «битый файл»: гасит кадр/превью и просит перерисовку,
+        чтобы paintEvent нарисовал заглушку «⚠️ Битый файл / Corrupted» вместо
+        слепого квадрата заливки. Зовётся на known-сбое декодирования (например,
+        отсутствующий/нечитаемый файл в load_video)."""
+        self._preview_image = None
+        self._current_frame = None
+        self._broken = True
         self.update()
 
     def _on_frame(self, frame):
@@ -101,6 +125,7 @@ class VideoSinkWidget(QWidget):
         # Первый же валидный живой кадр делает статичное превью неактуальным.
         if frame is not None and frame.isValid():
             self._preview_image = None
+            self._broken = False
         self.update()
 
     def _bg_color(self) -> QColor:
@@ -139,6 +164,10 @@ class VideoSinkWidget(QWidget):
             self._draw_image(painter, rect, frame.toImage())
         elif self._preview_image is not None:
             self._draw_image(painter, rect, self._preview_image)
+        elif self._broken:
+            # 3) Нет ни живого кадра, ни превью, и контур помечен битым — рисуем
+            #    заглушку вместо слепого квадрата заливки (Corrupted File UX).
+            paint_corrupted_placeholder(painter, rect)
 
 
 class BuiltInVideoPlayer(QWidget):
@@ -150,6 +179,30 @@ class BuiltInVideoPlayer(QWidget):
         self.audio_output.setVolume(0.5)
         self.player.setAudioOutput(self.audio_output)
         self._pending_seek = False
+        # Optimistic-UI playback intent: the icon и наши решения следуют ЭТОМУ
+        # локальному флагу, а НЕ блокирующему чтению QMediaPlayer.playbackState()
+        # — оно сидит за тем же мьютексом libffmpegmediaplugin, что заморозил
+        # GUI-поток в stackshot. Источник правды для кнопки Play/Pause.
+        self._is_playing_intent = False
+        # Drop-to-Seek scrub state.
+        #   _scrubbing         — ползунок сейчас тянут (между sliderMoved и Released);
+        #   _resume_after_seek — вернуть воспроизведение, когда seek закоммитится;
+        #   _seek_in_flight    — затвор конвейера: тяжёлый seek коммитится, нельзя
+        #                        стопкой слать play()/pause() на парализованный декодер;
+        #   _intent_dirty      — пользователь успел дёрнуть Play/Pause во время затвора;
+        #                        отложенный intent применим по снятию блокировки.
+        self._scrubbing = False
+        self._resume_after_seek = False
+        self._seek_in_flight = False
+        self._intent_dirty = False
+        # Затвор дросселирования живого скраба — паритет с панелью сравнения
+        # (multi_compare._SEEK_MIN_INTERVAL). QElapsedTimer вместо time.monotonic:
+        # монотонные мс без аллокаций, стартует один раз и переиспользуется.
+        # 33 мс ≈ 30 Гц — выше частоты обновления декодера; чаще слать setPosition/
+        # cv2-запросы бессмысленно (переполняем нативную очередь seek'ов → фриз).
+        self._scrub_clock = QElapsedTimer()
+        self._scrub_clock.start()
+        self._last_scrub_ms = 0
         # Путь текущего видео — чтобы отбросить запоздавший превью-кадр от
         # предыдущего выбора (cv2-воркер асинхронный).
         self._current_path = None
@@ -229,10 +282,10 @@ class BuiltInVideoPlayer(QWidget):
         
         self.slider = JumpSlider(Qt.Orientation.Horizontal)
         self.slider.sliderMoved.connect(self._on_slider_moved)
-        self.slider.sliderReleased.connect(self._execute_seek)
+        self.slider.sliderReleased.connect(self._on_slider_released)
         cp_layout.addWidget(self.slider)
         
-        self.lbl_time = QLabel("00:00")
+        self.lbl_time = QLabel("00:00 / 00:00")
         self.lbl_time.setObjectName("player_time")
         cp_layout.addWidget(self.lbl_time)
         
@@ -262,11 +315,10 @@ class BuiltInVideoPlayer(QWidget):
     def apply_theme(self):
         """Перекрашивает леттербокс и SVG-иконки под новую тему после живой смены."""
         self._apply_video_background()
-        # Глифы пересобираем под новый цвет: Play/Pause — по текущему состоянию.
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self._set_pause_icon()
-        else:
-            self._set_play_icon()
+        # Глиф Play/Pause пересобираем по ЛОКАЛЬНОМУ intent, а не по
+        # playbackState() — чтобы перекраска темы не блокировалась на мьютексе
+        # медиаплагина (тот же конечный автомат, что завис в stackshot).
+        self._sync_play_icon()
         self._set_volume_icon()
 
     def _icon_color(self) -> str:
@@ -275,16 +327,34 @@ class BuiltInVideoPlayer(QWidget):
         return "#F5F5F7" if ThemeManager.colors() is ThemeManager.DARK else "#1D1D1F"
 
     def _set_play_icon(self):
-        self.btn_play.setIcon(create_svg_icon(SVG_PLAY, self._icon_color()))
+        self.btn_play.setIcon(ThemeManager.make_icon("play", self._icon_color()))
 
     def _set_pause_icon(self):
-        self.btn_play.setIcon(create_svg_icon(SVG_PAUSE, self._icon_color()))
+        self.btn_play.setIcon(ThemeManager.make_icon("pause", self._icon_color()))
 
     def _set_volume_icon(self):
-        self.btn_mute.setIcon(create_svg_icon(SVG_VOLUME, self._icon_color()))
+        # Глиф отражает СОСТОЯНИЕ аудиовыхода: перечёркнутый динамик в mute,
+        # обычный — при активном звуке. Также учитываем нулевую громкость.
+        muted = self.audio_output.isMuted() or self.audio_output.volume() <= 0.0
+        glyph = "volume_muted" if muted else "volume"
+        self.btn_mute.setIcon(ThemeManager.make_icon(glyph, self._icon_color()))
+        is_ru = True
+        try:
+            from utils.i18n import translator
+            is_ru = getattr(translator, "current_lang", "ru") == "ru"
+        except Exception:
+            pass
+        if muted:
+            self.btn_mute.setToolTip("Включить звук" if is_ru else "Unmute")
+        else:
+            self.btn_mute.setToolTip("Выключить звук" if is_ru else "Mute")
 
     def load_video(self, path: str):
-        self.stop()
+        # БЫЛО self.stop() — синхронный нативный teardown живого источника, тот
+        # самый сайт встречного GIL-дедлока ~QAudioOutputWrapper из стекшота.
+        # Теперь только сброс флагов; реальный снос старого контекста идёт ниже
+        # через change_source_safe (отложенная C++ деструкция вне GIL-кванта).
+        self._reset_transport_flags()
 
         # Возврат из «Сравнения»: _trigger_grid_compare ЯВНО прячет и сам плеер,
         # и его сцену (video_player.hide() + video_widget.hide()), чтобы погасить
@@ -299,7 +369,9 @@ class BuiltInVideoPlayer(QWidget):
             from utils.logger import auditor
             auditor.error(f"Video file missing: {path}")
             self._current_path = None
-            self.video_widget.clear_preview()
+            # Файл отсутствует/нечитаем — это known-сбой: рисуем заглушку «битый
+            # файл» вместо пустого квадрата (раньше тут был молчаливый clear).
+            self.video_widget.mark_corrupted()
             return
 
         abs_path = os.path.abspath(path)
@@ -309,9 +381,16 @@ class BuiltInVideoPlayer(QWidget):
         # прилетит в _on_thumb_ready и нарисуется как статичный кадр.
         self._thumb_worker.request_frames([abs_path], 25)
 
-        # ОТВЯЗКА ОТ UI-ПОТОКА: тяжёлая инициализация ffmpegmediaplugin внутри
-        # QMediaPlayer::setSource блокирует главный поток. Откладываем установку
-        # источника, чтобы цикл событий UI успел отрисоваться до загрузки кодеков.
+        # ОТЛОЖЕННОЕ ПЕРЕСОЗДАНИЕ КОНТЕКСТА: старый QMediaPlayer уходит в
+        # deleteLater (его C++ деструктор, а с ним снос рендер-графа предыдущего
+        # видео, отработает в чистом C++-проходе event-loop — вне GIL-кванта,
+        # поэтому ~QAudioOutputWrapper не встаёт в дедлок). self.player при этом
+        # сразу становится ЧИСТЫМ пустым инстансом: старые живые кадры/звук гаснут
+        # немедленно, а на экране остаётся cv2-превью (запрошено выше).
+        self.change_source_safe(QUrl())
+
+        # ОТВЯЗКА ОТ UI-ПОТОКА: даже на ПУСТОМ свежем плеере setSource синхронно
+        # парсит контейнер. Откладываем, чтобы цикл событий UI успел отрисоваться.
         # Сам плеер НЕ запускаем — стартует только по кнопке Play (поверх превью).
         QTimer.singleShot(100, lambda: self._apply_source(abs_path))
 
@@ -322,49 +401,239 @@ class BuiltInVideoPlayer(QWidget):
         self.video_widget.set_preview_image(qimg)
 
     def _apply_source(self, abs_path: str):
-        # Готовим источник для РЕАЛЬНОГО воспроизведения, но не запускаем его —
-        # на экране уже виден статичный cv2-превью-кадр. На durationChanged
-        # выставим диапазон слайдера и позицию ~25%, чтобы Play стартовал с того
-        # же места, что показывает превью.
+        # self.player — ЧИСТЫЙ пустой инстанс (load_video пересоздал контекст через
+        # change_source_safe), поэтому setSource НЕ сносит живой рендер-граф
+        # in-place и не встаёт в QThread::wait под GIL. Источник готовим, но не
+        # запускаем — на экране уже cv2-превью; позицию ~25% выставит durationChanged.
         self.player.setSource(QUrl.fromLocalFile(abs_path))
         self._pending_seek = True
-        self._set_play_icon()
+        # Свежий источник стартует на паузе (Play стартует только по кнопке).
+        self._is_playing_intent = False
+        self._sync_play_icon()
+
+    def _reset_transport_flags(self):
+        """Сброс конвейера скраба/intent. Без него следующий load унаследовал бы
+        «битый» затвор (_seek_in_flight) или ложный «играю» (_is_playing_intent).
+        Решение всегда по ЛОКАЛЬНОМУ intent, а не по блокирующему
+        player.playbackState() (тот сидит за тем же мьютексом медиаплагина)."""
+        self._pending_seek = False
+        self._is_playing_intent = False
+        self._scrubbing = False
+        self._resume_after_seek = False
+        self._seek_in_flight = False
+        self._intent_dirty = False
+
+    def change_source_safe(self, url: QUrl):
+        """Отложенное ПЕРЕСОЗДАНИЕ контекста вместо in-place setSource/stop на
+        ЖИВОМ инстансе.
+
+        RCA дедлока: смена/снос активного источника заставляет главный поток ждать
+        QThread рендера (QFFmpeg::AudioRenderer) в QThread::wait, НЕ отпуская GIL;
+        в это же время AudioRenderer финализирует QAudioOutputWrapper и через
+        переопределённый PySide6 disconnectNotify → PyGILState_Ensure тянется за
+        тем же GIL. Встречный тупик. Связь QAudioOutput↔QAudioOutputWrapper
+        внутренняя (её рвёт сам деструктор) — руками disconnect её не разорвать,
+        поэтому единственный выход: увести C++ деструкцию в deleteLater, где она
+        отработает в чистом C++-проходе event-loop, вне GIL-удерживающего кванта.
+
+        setSource зовём ТОЛЬКО на свежем пустом инстансе — ему нечего ждать (живого
+        рендер-графа нет), значит блокирующего QThread::wait под GIL не возникает.
+
+        ВНИМАНИЕ: путь АСИНХРОННЫЙ — старый нативный контекст гаснет лишь на
+        следующем проходе event-loop. Перед СИНХРОННОЙ сменой Space используйте
+        release_source_safe(on_done=...), который дожидается деструкции по destroyed."""
+        old_player, old_audio = self.player, self.audio_output
+
+        # Снимаем НАШИ Python-слоты со старого плеера — их эхо (positionChanged/
+        # durationChanged) не должно дёрнуть слоты уже сносимого транспорта.
+        try:
+            old_player.positionChanged.disconnect(self._on_position_changed)
+            old_player.durationChanged.disconnect(self._on_duration_changed)
+        except (RuntimeError, TypeError):
+            pass
+        # Отвязываем синк ДО отложенного сноса: иначе деструктор старого плеера на
+        # следующем тике сбросил бы синк, уже занятый новым инстансом (чёрный кадр).
+        try:
+            old_player.setVideoSink(None)
+        except (RuntimeError, TypeError):
+            pass
+
+        # Состояние транспорта переносим на новый контекст: громкость/mute/скорость
+        # не должны «слетать» при пересоздании. Геттеры дешёвые (читают поле
+        # объекта, не лезут в мьютекс декодера) — безопасны и на сносимом плеере.
+        vol, muted = old_audio.volume(), old_audio.isMuted()
+        rate = old_player.playbackRate()
+
+        old_player.deleteLater()
+        old_audio.deleteLater()
+
+        self.audio_output = QAudioOutput(self)
+        self.audio_output.setVolume(vol)
+        self.audio_output.setMuted(muted)
+        self.player = QMediaPlayer(self)
+        self.player.setAudioOutput(self.audio_output)
+        self.player.setVideoSink(self.video_widget.videoSink())
+        self.player.setPlaybackRate(rate)
+        # playbackStateChanged НЕ подключаем НАМЕРЕННО: весь класс ведёт UI по
+        # ЛОКАЛЬНОМУ _is_playing_intent и не читает playbackState() (тот за мьютексом
+        # медиаплагина). Подключаем только реально используемое — позицию/длительность.
+        self.player.positionChanged.connect(self._on_position_changed)
+        self.player.durationChanged.connect(self._on_duration_changed)
+
+        if not url.isEmpty():
+            self.player.setSource(url)
+
+    def release_source_safe(self, on_done=None):
+        """Deadlock-safe снос нативного контекста ПЕРЕД переходом в полноэкранное
+        сравнение (зовётся из _trigger_grid_compare вместо синхронного stop()).
+
+        change_source_safe(QUrl()) уводит C++ деструкцию старого плеера/аудио в
+        event-loop вне GIL-кванта → дедлок ~QAudioOutputWrapper исключён. on_done
+        (если задан) вызывается СТРОГО ПОСЛЕ физической деструкции старого контекста
+        — по его сигналу destroyed (он эмитится в ~QObject, когда ~QMediaPlayer уже
+        отработал и освободил AVFoundation/Metal). Это и есть смещение смены Space
+        на квант ПОСЛЕ деструкции: к моменту on_done живого графического контекста
+        уже нет, поэтому root_stack.setCurrentIndex(1) не провоцирует Spaces Jump.
+        Оба инварианта (No-Deadlock + No-Spaces-Jump) держатся одновременно."""
+        old_player = self.player
+        self.change_source_safe(QUrl())
+        if on_done is not None:
+            old_player.destroyed.connect(lambda *_: on_done())
 
     def stop(self):
-        self._pending_seek = False
-        if self.player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
-            self.player.stop()
+        # СИНХРОННЫЙ нативный stop для ИНТЕРАКТИВНЫХ путей (preview_controller.
+        # _stop_video при смене превью; старт скана). Здесь смены Space нет, а halt
+        # playback живого источника дёшев. ПЕРЕД переходом в сравнение НЕ
+        # используется — там нужен deadlock-safe release_source_safe (отложенная
+        # деструкция контекста), т.к. синхронный снос живого источника = встречный
+        # GIL-дедлок ~QAudioOutputWrapper (см. change_source_safe).
+        self._reset_transport_flags()
+        self.player.stop()
 
     def pause(self):
         """Ставит воспроизведение на паузу, НЕ разрушая источник/декодер.
         Безопасная альтернатива release_source() при переходе в полноэкранное
         сравнение на macOS: уничтожение AVPlayerLayer в fullscreen фатально для
         WindowServer и вызывает сброс Space, тогда как спящий (paused) контекст
-        скрыть безопасно."""
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.player.pause()
+        скрыть безопасно.
+
+        ЗАДАЧА 2: решение принимаем по ЛОКАЛЬНОМУ intent, без блокирующего
+        playbackState(); сам нативный pause() делегируем в следующий квант."""
+        if not self._is_playing_intent:
+            return
+        self._is_playing_intent = False
+        self._sync_play_icon()
+        QTimer.singleShot(0, self._do_pause)
 
     def release_source(self):
         """Полностью отдаёт аппаратный медиа-контекст (AVFoundation/ffmpeg):
         останавливает воспроизведение И обнуляет источник QMediaPlayer, чтобы
-        нативный декодер освободил GPU/Space-контекст ДО того, как плеер скроют
-        (переход на страницу сравнения). Живой графический контекст в скрытом
-        видеовиджете на macOS способен заставить WindowServer сбросить fullscreen
-        Space — поэтому ресурсы отдаём заранее. Превью гасим: оно вернётся при
-        следующем выборе файла (PreviewController снова вызовет load_video)."""
-        self.stop()
+        нативный декодер освободил GPU/Space-контекст. Превью гасим: оно вернётся
+        при следующем выборе файла (PreviewController снова вызовет load_video).
+
+        BLOCK 1 (Asynchronous Teardown). Сам снос нативного контекста (stop +
+        setSource(QUrl())) выполняет _cleanup_players ВНЕ текущего кванта —
+        через QTimer.singleShot(0). На macOS setSource синхронно ждёт QThread
+        рендера Qt Multimedia, а тот для финализации Shiboken-оберток тянется за
+        GIL, удерживаемым этим же GUI-потоком → встречный GIL-дедлок. Откладывая
+        очистку на следующий тик, мы даём GUI-потоку отпустить GIL раньше, чем
+        поток мультимедиа попытается его захватить."""
         self._pending_seek = False
         self._current_path = None
-        self.player.setSource(QUrl())
+        QTimer.singleShot(0, self._cleanup_players)
+
+    def _cleanup_players(self):
+        """Изолированная гильотина медиа-контекста (BLOCK 1). Вызывается ТОЛЬКО
+        отложенно (через QTimer.singleShot из release_source), уже вне кванта,
+        инициировавшего закрытие.
+
+        Перед остановкой ЖЁСТКО глушим сигналы плеера (blockSignals(True)): иначе
+        stop()/setSource(QUrl()) эмитят positionChanged/mediaStatusChanged, чьи
+        слоты в этот момент тронули бы уже сносимый sink-виджет. Затем рвём
+        источник — нативный AVFoundation/ffmpeg-декодер освобождается без гонки
+        с GUI-потоком."""
+        self.player.blockSignals(True)
+        try:
+            self.player.stop()
+            self.player.setSource(QUrl())
+        finally:
+            self.player.blockSignals(False)
         self.video_widget.clear_preview()
 
-    def _toggle_play(self):
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.player.pause()
-            self._set_play_icon()
-        else:
-            self.player.play()
+    def shutdown(self):
+        """Синхронная остановка фонового cv2-воркера превью при закрытии окна.
+
+        _thumb_worker (CompareVideoWorker) — единственный СОБСТВЕННЫЙ поток
+        плеера: между запросами кадров он висит в cond.wait() и НЕ охвачен
+        release_source()/_cleanup_players (те рвут лишь нативный QMediaPlayer-
+        контекст). Его stop() уже инкапсулирует флаг остановки + cond.notify_all()
+        + ограниченный wait(2000), поэтому здесь просто зовём его. Идемпотентно:
+        повторный вызов на уже остановленном/незапущенном потоке безвреден.
+
+        Вызывается из MainController._on_window_closed — синхронно в GUI-потоке
+        (DirectConnection) ДО os._exit, поэтому bounded wait успевает отработать."""
+        worker = getattr(self, "_thumb_worker", None)
+        if worker is not None and worker.isRunning():
+            worker.stop()
+
+    def _sync_play_icon(self):
+        """Перерисовывает глиф кнопки строго по локальному intent."""
+        if self._is_playing_intent:
             self._set_pause_icon()
+        else:
+            self._set_play_icon()
+
+    # ─── BLOCK 2: Asynchronous Command Delegation ───────────────────────────
+    # Изолированные нативные команды QMediaPlayer. Их КАТЕГОРИЧЕСКИ нельзя звать
+    # из тела обработчиков напрямую: на тяжёлом файле декодер держит внутренний
+    # мьютекс (QBasicMutex), пока ищет ближайший I-фрейм/демультиплексирует
+    # контейнер, и синхронный setPosition/play/pause на GUI-потоке встаёт на этот
+    # мьютекс — цикл событий замерзает (stackshot: 65.92 с). Поэтому зовём их
+    # ТОЛЬКО отложенно — QTimer.singleShot(0, ...): текущий квант GUI завершается
+    # и отрисовывает оптимистичный UI, а нативный вызов выполняется в начале
+    # следующего кванта на чистом стеке (без реентерабельности из сигналов плеера).
+    def _do_seek(self, target):
+        self.player.setPosition(target)
+
+    def _do_play(self):
+        self.player.play()
+
+    def _do_pause(self):
+        self.player.pause()
+
+    def _apply_intent_to_player(self):
+        """Транслирует накопленный intent в одну команду плеера (play/pause),
+        делегируя нативный вызов в следующий квант (BLOCK 2)."""
+        self._intent_dirty = False
+        if self._is_playing_intent:
+            QTimer.singleShot(0, self._do_play)
+        else:
+            QTimer.singleShot(0, self._do_pause)
+
+    def _clear_seek_lock(self):
+        """Снимает затвор конвейера после посадки seek (positionChanged) или по
+        отложенному фолбэку. Если пользователь жал Play/Pause во время затвора —
+        досылаем отложенный intent одной командой."""
+        if not self._seek_in_flight:
+            return
+        self._seek_in_flight = False
+        if self._intent_dirty:
+            self._apply_intent_to_player()
+
+    def _toggle_play(self):
+        # OPTIMISTIC UI: переворачиваем intent и ПЕРЕРИСОВЫВАЕМ иконку НЕМЕДЛЕННО —
+        # до любой команды парализованному конечному автомату QMediaPlayer. Кнопка
+        # отвечает мгновенно, даже если медиаплагин висит на мьютексе.
+        self._is_playing_intent = not self._is_playing_intent
+        self._sync_play_icon()
+
+        if self._seek_in_flight:
+            # Тяжёлый seek коммитится — НЕ кладём play()/pause() поверх занятого
+            # декодера. Запоминаем, что intent сместился: применим по снятию затвора.
+            self._intent_dirty = True
+            return
+
+        self._apply_intent_to_player()
 
     def _toggle_mute(self):
         is_muted = not self.audio_output.isMuted()
@@ -383,6 +652,10 @@ class BuiltInVideoPlayer(QWidget):
         self.player.setPlaybackRate(speed)
 
     def _on_position_changed(self, position):
+        # Seek приземлился (плеер эмитит positionChanged с новой позицией) —
+        # снимаем затвор конвейера и досылаем отложенный Play/Pause, если был.
+        if self._seek_in_flight:
+            self._clear_seek_lock()
         if not self.slider.isSliderDown():
             self.slider.blockSignals(True)
             self.slider.setValue(position)
@@ -393,37 +666,105 @@ class BuiltInVideoPlayer(QWidget):
         self.slider.setRange(0, duration)
         if self._pending_seek and duration > 0:
             target = int(duration * 0.25)
-            self.player.setPosition(target)
+            # BLOCK 2: даже стартовый seek на 25% не зовём синхронно — на тяжёлом
+            # контейнере он так же встаёт на мьютекс демультиплексора.
+            QTimer.singleShot(0, lambda t=target: self._do_seek(t))
             self.slider.setValue(target)
             self._update_time_label(target)
             self._pending_seek = False
 
+    # Затвор живого скраба: ~33 мс ≈ 30 Гц (паритет с multi_compare).
+    _SCRUB_MIN_MS = 33
+
     def _on_slider_moved(self, position):
+        # DROP-TO-SEEK: ползунок НИКОГДА не зовёт player.setPosition() — именно
+        # синхронный setPosition на GUI-потоке висел 65.92 с на мьютексе
+        # libffmpegmediaplugin (stackshot). Здесь только локальный UI: пауза +
+        # cv2-кадр. Реальный setPosition — ровно один, по sliderReleased.
+
+        # Вход в скраб: запоминаем, играли ли мы, и ПЕРЕВОДИМ В ПАУЗУ (оптимистично,
+        # без чтения playbackState). Пауза один раз на входе, а не на каждый пиксель.
+        entering = not self._scrubbing
+        if entering:
+            self._scrubbing = True
+            self._resume_after_seek = self._is_playing_intent
+            if self._is_playing_intent:
+                self._is_playing_intent = False
+                self._sync_play_icon()
+                # BLOCK 2: пауза на входе в скраб — тоже отложенно, GUI не ждёт.
+                QTimer.singleShot(0, self._do_pause)
+
+        # Таймкод обновляем всегда (дёшево) — он должен идти за пальцем плавно.
         self._update_time_label(position)
 
-        # ВО ВРЕМЯ ВОСПРОИЗВЕДЕНИЯ перемотка идёт штатно через сам плеер.
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.player.setPosition(position)
+        # THROTTLE: cv2-запросы ограничиваем ~30 Гц, но ПЕРВЫЙ кадр свежего скраба
+        # пропускаем всегда — иначе одиночный клик по таймлайну не перерисовал бы
+        # целевой кадр. Затвор закрывает шторм запросов к декодеру.
+        now = self._scrub_clock.elapsed()
+        if not entering and (now - self._last_scrub_ms < self._SCRUB_MIN_MS):
             return
+        self._last_scrub_ms = now
 
-        # НА ПАУЗЕ — cv2-СКРАББИНГ. На macOS QMediaPlayer на паузе не
-        # перерисовывает кадр по setPosition (ползунок «мёртвый»), поэтому кадр
-        # нужного таймкода тащим через cv2 (тот же CompareVideoWorker, что и
-        # превью) и рисуем его как статичный preview. Никакого setPosition при
-        # скраббинге: реальную позицию плеера выставит _execute_seek по
-        # отпусканию ползунка, чтобы Play стартовал ровно отсюда.
+        # ВИЗУАЛЬНАЯ ОБРАТНАЯ СВЯЗЬ — ИСКЛЮЧИТЕЛЬНО через фоновый cv2-воркер
+        # (CompareVideoWorker с wall-clock лимитами, устойчив к долгим пробам).
+        # Кадр прилетит в _on_thumb_ready и нарисуется как статичный preview.
         duration = self.player.duration()
         if duration <= 0 or not self._current_path:
             return
         pct = max(0.0, min(100.0, position / duration * 100.0))
         self._thumb_worker.request_frames([self._current_path], pct)
 
-    def _execute_seek(self):
-        # По отпусканию ползунка синхронизируем РЕАЛЬНУЮ позицию плеера с тем
-        # таймкодом, который показал cv2-скраб, чтобы последующий Play стартовал
-        # ровно оттуда, куда домотал пользователь.
-        self.player.setPosition(self.slider.value())
+    def _on_slider_released(self):
+        # ЕДИНСТВЕННАЯ точка нативного setPosition за весь скраб (Drop-to-Seek
+        # commit). Синхронизирует реальную позицию плеера с тем таймкодом, что
+        # показал cv2-скраб, чтобы Play стартовал ровно оттуда, куда домотали.
+        self._scrubbing = False
+
+        # ЗАДАЧА 2 — ДВОЙНОЙ ЗАТВОР: пока предыдущий асинхронный seek НЕ приземлился,
+        # игнорируем новую попытку seek. Без этого клики по таймлайну копятся в
+        # очередь блокирующих setPosition — именно их СТОПКА (по одному на каждый
+        # пиксель/клик), сериализованная на мьютексе декодера, дала 65.92 с в
+        # stackshot. Висящий resume при этом не оставляем (иначе он сработает на
+        # следующем — уже валидном — отпускании).
+        if self._seek_in_flight:
+            self._resume_after_seek = False
+            return
+
+        target = self.slider.value()
+
+        # Затвор поднят: один seek «в полёте». _toggle_play теперь не кладёт play()
+        # поверх ещё не отработавшего декодера (intent копится в _intent_dirty).
+        self._seek_in_flight = True
+        # BLOCK 2: ЕДИНСТВЕННЫЙ нативный setPosition за скраб — и тот ОТЛОЖЕННЫЙ.
+        # GUI-поток освобождается немедленно; мьютекс декодера берётся в следующем
+        # кванте. Цикл отрисовки не замерзает на возврате из нативной функции.
+        QTimer.singleShot(0, lambda t=target: self._do_seek(t))
+        self._update_time_label(target)
+
+        # Возобновляем воспроизведение, если играли до начала скраба; иначе
+        # остаёмся на свежепромотанном кадре. Иконка уже отражает intent.
+        if self._resume_after_seek:
+            self._resume_after_seek = False
+            self._is_playing_intent = True
+            self._sync_play_icon()
+            QTimer.singleShot(0, self._do_play)
+
+        # Снимаем затвор по приземлению seek (positionChanged) либо, если события
+        # не будет (например, остались на паузе), по ограниченному фолбэку.
+        QTimer.singleShot(300, self._clear_seek_lock)
+
+    @staticmethod
+    def _fmt_clock(ms) -> str:
+        """ms → MM:SS (хронометраж). Отрицательное/мусор клампим в 0."""
+        s = max(0, int(ms)) // 1000
+        return f"{s // 60:02d}:{s % 60:02d}"
 
     def _update_time_label(self, ms_pos):
-        pos = ms_pos // 1000
-        self.lbl_time.setText(f"{pos//60:02d}:{pos%60:02d}")
+        # Унифицированная телеметрия: ВИДЕО показывает хронометраж
+        # [текущая / полная], а НЕ проценты — непрерывное время t имеет прямой
+        # физический смысл, в отличие от дискретного индекса кадра. Полную
+        # длительность берём у самого плеера (duration() валиден после
+        # durationChanged); на паузе/скрабе она не меняется.
+        self.lbl_time.setText(
+            f"{self._fmt_clock(ms_pos)} / {self._fmt_clock(self.player.duration())}"
+        )

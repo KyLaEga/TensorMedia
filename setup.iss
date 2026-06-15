@@ -1,6 +1,13 @@
+; Версия — единый источник = git-тег. CI передаёт её из тега:
+;   iscc /DMyAppVersion=1.2.1 setup.iss
+; Дефолт ниже держим равным текущему релизу, чтобы ручная сборка без /D была корректной.
+#ifndef MyAppVersion
+  #define MyAppVersion "1.2.1"
+#endif
+
 [Setup]
 AppName=TensorMedia
-AppVersion=1.0.0
+AppVersion={#MyAppVersion}
 DefaultDirName={commonpf}\TensorMedia
 DefaultGroupName=TensorMedia
 OutputDir=dist

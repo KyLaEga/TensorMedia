@@ -4,7 +4,7 @@ import shutil
 import platform
 import subprocess
 from pathlib import Path
-from PySide6.QtCore import QObject, Qt, QTimer, Signal, QMutex, QMutexLocker, QMetaObject, Q_ARG, QThread
+from PySide6.QtCore import QObject, Qt, QTimer, Signal, QMutex, QMutexLocker, QThread
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from utils.logger import auditor

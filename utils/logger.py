@@ -1,6 +1,5 @@
 import logging
 import sys
-from pathlib import Path
 from logging.handlers import RotatingFileHandler
 
 from utils.env_config import get_logs_dir
