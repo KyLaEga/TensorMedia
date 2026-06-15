@@ -131,7 +131,13 @@ class ApplicationBootstrap:
         if sys.platform == "darwin":
             _font = QFont(".AppleSystemUIFont", ThemeManager.FONT_BASE)
         elif sys.platform == "win32":
+            # Segoe UI carries no emoji glyphs; declare Segoe UI Emoji as an
+            # explicit fallback family so emoji used in labels/tabs (🔍 📊 🗑 🧹
+            # ⚖️ 📌 …) resolve via Qt's per-glyph fallback instead of rendering as
+            # tofu boxes. (Under CrossOver/Wine the emoji font is often absent —
+            # that is a Wine limitation, not reproducible on real Windows.)
             _font = QFont("Segoe UI", ThemeManager.FONT_BASE)
+            _font.setFamilies(["Segoe UI", "Segoe UI Emoji"])
         else:
             from PySide6.QtGui import QFontDatabase
             _font = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont)

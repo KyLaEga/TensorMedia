@@ -509,6 +509,23 @@ class SmartClusterEngine:
         # Imported lazily here (not at module level) so launching the app — or
         # importing this module for anything other than scanning — does not pull
         # the heavy `transformers` stack into memory until weights are needed.
+        #
+        # Frozen-bundle guard: transformers decides torch is "absent" purely from
+        # its importlib.metadata version, NOT from whether torch imports. If the
+        # dist-info wasn't bundled (copy_metadata("torch") in TensorMedia.spec), a
+        # physically present torch (FaceNet still works!) is ignored and
+        # SiglipVisionModel raises "requires the PyTorch library". Surface the
+        # real cause instead of that cryptic message.
+        import importlib.metadata as _ilm
+        try:
+            _ilm.version("torch")
+        except _ilm.PackageNotFoundError:
+            auditor.error(
+                "torch is importable but its package metadata is MISSING from this "
+                "build -> transformers will falsely report 'PyTorch not found'. "
+                "Rebuild with copy_metadata('torch') (TensorMedia.spec) or run the "
+                "published v1.2.1 build, which bundles it."
+            )
         from transformers import AutoProcessor, SiglipVisionModel
 
         self.scan_mode = mode

@@ -18,10 +18,13 @@ jobs:
         include:
           - os: macos-latest
             artifact_name: macOS
+            asset: dist/TensorMedia-macOS.dmg
           - os: windows-latest
             artifact_name: Windows
+            asset: dist/TensorMedia_Setup.exe
           - os: ubuntu-22.04
             artifact_name: Linux-CPU
+            asset: dist/TensorMedia-Linux-x86_64.tar.gz
 
     steps:
     - uses: actions/checkout@v4
@@ -83,7 +86,7 @@ jobs:
       shell: pwsh
       run: |
         $v = "${{ github.ref_name }}" -replace '^v', ''
-        if ($v -notmatch '^\d+(\.\d+){0,3}$') { $v = '1.2.1' }
+        if ($v -notmatch '^\d+(\.\d+){0,3}$') { $v = '1.2.2' }
         iscc /DMyAppVersion=$v setup.iss
 
     - name: Build macOS Image (.dmg)
@@ -100,26 +103,38 @@ jobs:
         cd dist
         tar -czvf TensorMedia-Linux-x86_64.tar.gz TensorMedia/
 
-    # Сохранение артефактов для ручного запуска (workflow_dispatch)
-    - name: Upload Artifacts (Manual Run)
-      if: startsWith(github.ref, 'refs/tags/') == false
+    # Каждая matrix-job выгружает ТОЛЬКО свой артефакт. Это обслуживает и ручной
+    # запуск (workflow_dispatch, retention-days), и передачу артефакта в job
+    # release при пуше тега — без гонки за один и тот же релиз.
+    - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: TensorMedia-${{ matrix.artifact_name }}
-        path: |
-          dist/TensorMedia_Setup.exe
-          dist/TensorMedia-macOS.dmg
-          dist/TensorMedia-Linux-x86_64.tar.gz
+        path: ${{ matrix.asset }}
         retention-days: 5
 
-    # Создание релиза ТОЛЬКО при пуше тега (v*)
+  # Единственный job, создающий релиз: ждёт все build-job, скачивает все
+  # артефакты и ОДИН раз публикует их в релиз. Это устраняет гонку, из-за
+  # которой Linux-ассет терялся (v1.1.0 / v1.2.1).
+  release:
+    name: Publish Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Download All Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
     - name: Upload to Release
-      if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          dist/TensorMedia_Setup.exe
-          dist/TensorMedia-macOS.dmg
-          dist/TensorMedia-Linux-x86_64.tar.gz
+          artifacts/**/TensorMedia_Setup.exe
+          artifacts/**/TensorMedia-macOS.dmg
+          artifacts/**/TensorMedia-Linux-x86_64.tar.gz
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

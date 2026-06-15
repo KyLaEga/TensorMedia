@@ -1,8 +1,8 @@
 ; Версия — единый источник = git-тег. CI передаёт её из тега:
-;   iscc /DMyAppVersion=1.2.1 setup.iss
+;   iscc /DMyAppVersion=1.2.2 setup.iss
 ; Дефолт ниже держим равным текущему релизу, чтобы ручная сборка без /D была корректной.
 #ifndef MyAppVersion
-  #define MyAppVersion "1.2.1"
+  #define MyAppVersion "1.2.2"
 #endif
 
 [Setup]
