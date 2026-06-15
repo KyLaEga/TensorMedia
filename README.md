@@ -1,6 +1,6 @@
 # TensorMedia
 
-**Version 1.2.3** · 🌍 Language: [English](#english) | [Русский](#русский)
+**Version 1.2.4** · 🌍 Language: [English](#english) | [Русский](#русский)
 
 ---
 
@@ -82,6 +82,9 @@ python main.py     # run from source
 python build.py    # produce a distributable bundle (PyInstaller -> dist/)
 ```
 
+### 📄 License
+TensorMedia is licensed under the **GNU AGPL-3.0** (see [LICENSE](LICENSE)) — required because the bundled PDF engine **PyMuPDF** is AGPL-3.0. Distributed builds also include third-party components under their own licenses: Qt/PySide6 (LGPL-3.0), PyTorch/NumPy (BSD-3), Transformers / OpenCV / Hugging Face libs (Apache-2.0), FAISS / FaceNet / Pillow (MIT/HPND) — all AGPL-3.0-compatible.
+
 ---
 
 <a id="русский"></a>
@@ -161,3 +164,6 @@ pip install -r requirements.txt
 python main.py     # запуск из исходников
 python build.py    # сборка дистрибутива (PyInstaller -> dist/)
 ```
+
+### 📄 Лицензия
+TensorMedia распространяется под **GNU AGPL-3.0** (см. [LICENSE](LICENSE)) — это обязательно, потому что вшитый PDF-движок **PyMuPDF** под AGPL-3.0. В сборки также входят сторонние компоненты под своими лицензиями: Qt/PySide6 (LGPL-3.0), PyTorch/NumPy (BSD-3), Transformers / OpenCV / Hugging Face (Apache-2.0), FAISS / FaceNet / Pillow (MIT/HPND) — все совместимы с AGPL-3.0.

@@ -16,6 +16,7 @@ IS_LINUX = sys.platform.startswith("linux")
 # --- Данные, попадающие внутрь бандла ---------------------------------------
 datas = [
     ("assets", "assets"),
+    ("LICENSE", "."),  # ship the AGPL-3.0 text inside the bundle (AGPL/LGPL compliance)
 ]
 # Linux-CPU дистрибутив ОБЯЗАН укладываться в лимит GitHub Releases (2 ГБ):
 # веса моделей (~480 МБ SigLIP + FaceNet) в бандл НЕ кладём — они скачиваются
@@ -126,7 +127,7 @@ _app_icon = "assets/icons/app.icns" if os.path.exists("assets/icons/app.icns") e
 # The winner is stripped of a leading 'v' and MUST be a dotted number
 # (CFBundleVersion rejects anything else, e.g. a branch name from a manual run),
 # otherwise we fall through to the next candidate.
-def _app_version(_fallback="1.2.3"):
+def _app_version(_fallback="1.2.4"):
     import re
     import subprocess
     candidates = [os.environ.get("TENSORMEDIA_VERSION", "")]
