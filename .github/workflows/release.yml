@@ -24,7 +24,7 @@ jobs:
             asset: dist/TensorMedia_Setup.exe
           - os: ubuntu-22.04
             artifact_name: Linux-CPU
-            asset: dist/TensorMedia-Linux-x86_64.tar.gz
+            asset: dist/TensorMedia-Linux-x86_64.tar.gz.part-*
 
     steps:
     - uses: actions/checkout@v4
@@ -97,11 +97,18 @@ jobs:
         ln -s /Applications dist/dmg_root/Applications
         hdiutil create -volname "TensorMedia" -srcfolder dist/dmg_root -ov -format UDZO dist/TensorMedia-macOS.dmg
 
-    - name: Build Linux Archive (.tar.gz)
+    - name: Build Linux Archive (.tar.gz, split into <2GiB volumes)
       if: startsWith(matrix.os, 'ubuntu')
       run: |
         cd dist
-        tar -czvf TensorMedia-Linux-x86_64.tar.gz TensorMedia/
+        tar -czf TensorMedia-Linux-x86_64.tar.gz TensorMedia/
+        # GitHub Releases HARD-caps a single asset at 2 GiB (2147483648 B); this
+        # CPU bundle (torch+Qt+opencv+faiss, no weights) is ~2.7 GiB. Split into
+        # 1900 MiB numbered volumes: TensorMedia-Linux-x86_64.tar.gz.part-00 / -01.
+        # Users reassemble with `cat ...part-* > ...tar.gz` (see README).
+        split -b 1900M -d TensorMedia-Linux-x86_64.tar.gz TensorMedia-Linux-x86_64.tar.gz.part-
+        rm -f TensorMedia-Linux-x86_64.tar.gz
+        ls -lh TensorMedia-Linux-x86_64.tar.gz.part-*
 
     # Каждая matrix-job выгружает ТОЛЬКО свой артефакт. Это обслуживает и ручной
     # запуск (workflow_dispatch, retention-days), и передачу артефакта в job
@@ -129,12 +136,26 @@ jobs:
       with:
         path: artifacts
 
-    - name: Upload to Release
-      uses: softprops/action-gh-release@v2
-      with:
-        files: |
-          artifacts/**/TensorMedia_Setup.exe
-          artifacts/**/TensorMedia-macOS.dmg
-          artifacts/**/TensorMedia-Linux-x86_64.tar.gz
+    # Fault-isolated publish: create the release ONCE, then upload each asset
+    # INDIVIDUALLY. A single failed/oversized file emits a ::warning:: and is
+    # skipped — it can no longer abort the other assets (the v1.2.2 monolithic
+    # all-or-nothing regression, where the >2GiB Linux file dropped mac+win too).
+    - name: Publish release assets (fault-isolated)
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_REPO: ${{ github.repository }}
+        TAG: ${{ github.ref_name }}
+      run: |
+        gh release create "$TAG" --title "$TAG" --notes "Automated release $TAG" \
+          || echo "release $TAG already exists — reusing"
+        shopt -s globstar nullglob
+        for f in artifacts/**/*; do
+          [ -f "$f" ] || continue
+          echo "::group::upload $(basename "$f")"
+          if gh release upload "$TAG" "$f" --clobber; then
+            echo "OK: $f"
+          else
+            echo "::warning::failed to upload $f (continuing)"
+          fi
+          echo "::endgroup::"
+        done
