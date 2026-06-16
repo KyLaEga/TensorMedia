@@ -27,8 +27,8 @@ jobs:
             asset: dist/TensorMedia-Linux-x86_64.tar.gz.part-*
 
     steps:
-    - uses: actions/checkout@v4
-    
+    - uses: actions/checkout@v6
+
     # Linux runner has ~14 GB free; the build (torch+models+dist) plus the
     # tar.gz + split parts coexisting at archive time tipped it to "No space
     # left on device" (v1.2.4). Reclaim ~12-15 GB of preinstalled SDKs we don't
@@ -43,7 +43,7 @@ jobs:
       if: matrix.os == 'windows-latest'
       run: git config --system core.longpaths true
     
-    - uses: actions/setup-python@v5
+    - uses: actions/setup-python@v6
       with:
         python-version: '3.12' # Исправлено: гибкая версия для предотвращения ошибки отсутствия патча
         cache: 'pip'
@@ -72,7 +72,7 @@ jobs:
 
     - name: Cache ML Models
       id: cache-models
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: models
         key: ml-models-${{ hashFiles('setup_models.py') }}
@@ -124,7 +124,7 @@ jobs:
     # запуск (workflow_dispatch, retention-days), и передачу артефакта в job
     # release при пуше тега — без гонки за один и тот же релиз.
     - name: Upload Artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: TensorMedia-${{ matrix.artifact_name }}
         path: ${{ matrix.asset }}
@@ -142,7 +142,7 @@ jobs:
       contents: write
     steps:
     - name: Download All Artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         path: artifacts
 
