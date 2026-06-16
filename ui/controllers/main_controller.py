@@ -93,7 +93,14 @@ class MainController(QObject):
         self.selection_timer = QTimer(self)
         self.selection_timer.setSingleShot(True)
         self.selection_timer.timeout.connect(self.preview_controller.process_selection)
-        
+
+        # Re-entrancy guard входа в сравнение: True от старта отложенного teardown
+        # (release_source_safe ждёт destroyed старого плеера) до фактической смены
+        # слоя в _finish_compare_switch. Без него пачка быстрых Enter/Cmd+P
+        # укладывала несколько циклов сноса-пересоздания медиа-контекста друг на
+        # друга → GIL/WindowServer-фриз при повторных заходах в сравнение.
+        self._compare_switch_pending = False
+
         self.scan_seconds = 0
         self.scan_timer = QTimer(self)
         self.scan_timer.timeout.connect(self._update_timer_label)
@@ -190,9 +197,9 @@ class MainController(QObject):
         self.sc_f1 = QShortcut(QKeySequence(Qt.Key.Key_F1), self.view, context=Qt.ShortcutContext.ApplicationShortcut)
         self.sc_f1.activated.connect(self._show_help_dialog)
         
-        # BLOCK 4 (эргономика навигации). Space ПЕРЕКЛЮЧАЕТ чекбокс удаления
-        # (с пакетным переключением по всему выделению — manual_check_selected),
-        # а Enter ОТКРЫВАЕТ сравнение (как двойной клик), а не дублирует Space.
+        # BLOCK 4 (эргономика навигации). Space И двойной клик ПЕРЕКЛЮЧАЮТ чекбокс
+        # удаления (пакетно по всему выделению — manual_check_selected), а Enter
+        # ОТКРЫВАЕТ сравнение (наравне с Cmd+P / кнопкой / контекстным меню).
         self.sc_space = QShortcut(QKeySequence(Qt.Key.Key_Space), self.view, context=Qt.ShortcutContext.ApplicationShortcut)
         self.sc_space.activated.connect(self.selection_controller.manual_check_selected)
 
@@ -640,19 +647,23 @@ class MainController(QObject):
             self.view._switch_tab(1)
 
     def _on_item_double_clicked(self, proxy_index):
-        # BLOCK 4: двойной клик ОТКРЫВАЕТ сравнение, а НЕ переключает чекбокс
-        # удаления (переключение делегировано Space → manual_check_selected).
-        # _trigger_grid_compare сам читает текущий выбор/строку под курсором —
-        # на dblclick Qt уже сделал кликнутую строку текущей, так что proxy_index
-        # здесь служит лишь стражем валидности.
+        # BLOCK 4: двойной клик ВЫБИРАЕТ файл — ставит/снимает чекбокс удаления
+        # (та же логика, что Space → manual_check_selected). РАНЬШЕ он открывал
+        # сравнение, но это сбивало с толку (двойной клик ожидаемо «выбирает»
+        # файл, а не уводит в полноэкранный режим) и накапливал медиа-контексты
+        # при повторных заходах → фриз. Сравнение теперь только по Enter / Cmd+P /
+        # кнопке / контекстному меню. На dblclick Qt уже сделал кликнутую строку
+        # текущей и выделенной, так что manual_check_selected переключит её галочку;
+        # proxy_index здесь служит лишь стражем валидности.
         if not proxy_index.isValid():
             return
-        self._trigger_grid_compare()
+        self.selection_controller.manual_check_selected()
 
     def _open_compare_shortcut(self):
-        # BLOCK 4: Enter открывает сравнение (зеркало двойного клика). Гасим,
-        # когда фокус в поле поиска, чтобы Enter подтверждал ввод запроса, а не
-        # прыгал в сравнение (паритет с гардами selection_controller).
+        # BLOCK 4: Enter открывает сравнение (двойной клик теперь переключает
+        # галочку, а не открывает сравнение). Гасим, когда фокус в поле поиска,
+        # чтобы Enter подтверждал ввод запроса, а не прыгал в сравнение (паритет
+        # с гардами selection_controller).
         if getattr(self.view, 'search_input', None) and self.view.search_input.hasFocus():
             return
         self._trigger_grid_compare()
@@ -963,6 +974,21 @@ class MainController(QObject):
         self._multi_grid_cols = cols
 
     def _trigger_grid_compare(self):
+        # RE-ENTRANCY GUARD. Уже на странице сравнения (index 1) либо ещё идёт
+        # отложенный teardown предыдущего входа — НЕ запускаем второй цикл сноса-
+        # пересоздания медиа-контекста. Без этого пачка быстрых Enter/Cmd+P (или
+        # прежний двойной клик) укладывала release_source_safe друг на друга и
+        # вешала WindowServer/GIL при повторных заходах в сравнение.
+        if self.view.root_stack.currentIndex() == 1 or self._compare_switch_pending:
+            return
+
+        # Гасим отложенный пересчёт превью (selection_timer, 150мс от клика). Иначе
+        # после ухода в полноэкранное сравнение всплывший process_selection поднял
+        # бы ВТОРОЙ медиа-контекст в скрытом одиночном плеере (load_video →
+        # setSource в фоновом Space, под fullscreen-сравнением). Эти осиротевшие
+        # AVFoundation/Metal-контексты копились при повторных заходах → фриз.
+        self.selection_timer.stop()
+
         proxy_indexes = [idx for idx in self.view.tree.selectionModel().selectedRows(0) if idx.isValid()]
         indexes = [self.view.proxy_model.mapToSource(idx) for idx in proxy_indexes]
         sel = [idx for idx in indexes if idx.parent().isValid()]
@@ -1012,13 +1038,16 @@ class MainController(QObject):
         # (вне GIL-кванта → дедлок исключён) И через сигнал destroyed снесённого
         # плеера вызывает on_done СТРОГО ПОСЛЕ деструкции — там и только там
         # переключаем root_stack. Оба инварианта держатся одновременно.
+        # Взводим guard ТОЛЬКО здесь — после всех ранних return (нет выбора /
+        # pts < 2), иначе застряли бы со взведённым флагом и заблокировали вход.
+        self._compare_switch_pending = True
         switched_via_teardown = False
         if v.video_player is not None:
             try:
                 v.video_player.video_widget.hide()
                 v.video_player.hide()
                 v.video_player.release_source_safe(
-                    on_done=lambda: v.root_stack.setCurrentIndex(1))
+                    on_done=self._finish_compare_switch)
                 switched_via_teardown = True
             except Exception as e:
                 auditor.warning(f"video_player deferred teardown before compare failed: {e}", exc_info=True)
@@ -1030,9 +1059,17 @@ class MainController(QObject):
 
         # 3. Смену Space выполняет on_done выше — ПОСЛЕ деструкции медиа-контекста.
         #    Фолбэк (плеера нет либо teardown бросил) — переключаем сразу, чтобы не
-        #    застрять на списке файлов.
+        #    застрять на списке файлов (и сбрасываем guard).
         if not switched_via_teardown:
-            v.root_stack.setCurrentIndex(1)
+            self._finish_compare_switch()
+
+    def _finish_compare_switch(self):
+        # Завершение отложенного входа в сравнение: снимаем re-entrancy guard и
+        # выводим страницу сравнения. Вызывается строго ПОСЛЕ деструкции старого
+        # медиа-контекста (по сигналу destroyed из release_source_safe) либо
+        # синхронно в фолбэке. Идемпотентно — повторный destroyed нас не сломает.
+        self._compare_switch_pending = False
+        self.view.root_stack.setCurrentIndex(1)
 
     def _on_compare_confirmed(self):
         # «Применить» на странице сравнения: считываем выбор, возвращаем стек на

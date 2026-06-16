@@ -29,6 +29,16 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
+    # Linux runner has ~14 GB free; the build (torch+models+dist) plus the
+    # tar.gz + split parts coexisting at archive time tipped it to "No space
+    # left on device" (v1.2.4). Reclaim ~12-15 GB of preinstalled SDKs we don't
+    # use. Do NOT touch the hosted tool cache (it holds the setup-python runtime).
+    - name: Free up disk space (Linux runner)
+      if: startsWith(matrix.os, 'ubuntu')
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost || true
+        df -h /
+
     - name: Enable Long Paths on Windows
       if: matrix.os == 'windows-latest'
       run: git config --system core.longpaths true
@@ -86,7 +96,7 @@ jobs:
       shell: pwsh
       run: |
         $v = "${{ github.ref_name }}" -replace '^v', ''
-        if ($v -notmatch '^\d+(\.\d+){0,3}$') { $v = '1.2.4' }
+        if ($v -notmatch '^\d+(\.\d+){0,3}$') { $v = '1.2.5' }
         iscc /DMyAppVersion=$v setup.iss
 
     - name: Build macOS Image (.dmg)
