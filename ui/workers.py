@@ -138,16 +138,17 @@ class MultiVideoWorker(QThread):
 
                         elif ext == '.pdf':
                             try:
-                                import fitz
-                                with fitz.open(p) as doc:
+                                from utils.pdf_render import open_document, render_page
+                                doc = open_document(p)
+                                try:
                                     tot_frames = len(doc)
                                     if tot_frames > 0:
                                         target_frame = min(max(0, int(tot_frames * (pct / 100.0))), tot_frames - 1)
-                                        page = doc.load_page(target_frame)
-                                        pix = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0))
-                                        with Image.frombytes("RGB", [pix.width, pix.height], pix.samples) as img:
+                                        with render_page(doc, target_frame, 1.0) as img:
                                             frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
                                             ret = True
+                                finally:
+                                    doc.close()
                             except Exception as e:
                                 auditor.warning(f"Failed to process PDF {p}: {e}")
                                 

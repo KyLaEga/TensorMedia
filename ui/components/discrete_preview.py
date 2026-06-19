@@ -51,7 +51,7 @@ def _pil_to_qimage(img) -> QImage:
 
 # ---- Поставщики кадров (Frame Providers) ----------------------------------
 # Единый контракт: .count (int >= 1) и .frame(index) -> QImage. Источник
-# (PIL/fitz/zip) держится открытым между обращениями, чтобы скраб по индексу
+# (PIL/pypdfium2/zip) держится открытым между обращениями, чтобы скраб по индексу
 # был O(адресация), а не O(переоткрытие файла). close() освобождает хэндл.
 
 class _GifProvider:
@@ -122,37 +122,36 @@ class _GifProvider:
 
 
 class _PdfProvider:
-    """Страницы PDF через PyMuPDF (fitz) — рендер по номеру страницы (High-DPI).
+    """Страницы PDF через pypdfium2 (движок PDFium) — рендер по номеру страницы.
 
     Растеризация Retina-aware: PDF — это ВЕКТОР, чёткость готового растра задаётся
-    зумом матрицы при get_pixmap, а не апскейлом QLabel постфактум. Базовый
-    логический зум _BASE_ZOOM умножаем на devicePixelRatio экрана (его прокидывает
-    виджет через render_scale): на 2x-дисплее плотный A4-текст рендерится в вдвое
-    большее число ФИЗИЧЕСКИХ пикселей и остаётся кристально чётким после вписывания
-    (downscale) в вьюпорт. _MAX_ZOOM — страховка от гигантских pixmap на 3x."""
+    зумом ПРИ растеризации (scale рендера), а не апскейлом QLabel постфактум.
+    Базовый логический зум _BASE_ZOOM умножаем на devicePixelRatio экрана (его
+    прокидывает виджет через render_scale): на 2x-дисплее плотный A4-текст
+    рендерится в вдвое большее число ФИЗИЧЕСКИХ пикселей и остаётся кристально
+    чётким после вписывания (downscale) в вьюпорт. _MAX_ZOOM — страховка от
+    гигантских растров на 3x. Рендер идёт через utils.pdf_render (см. модуль:
+    permissive-лицензия + надёжная упаковка взамен PyMuPDF/AGPL)."""
 
     _BASE_ZOOM = 2.0
     _MAX_ZOOM = 4.0
 
     def __init__(self, path, render_scale: float = 1.0):
-        import fitz
-        self._doc = fitz.open(path)
-        self.count = max(1, self._doc.page_count)
-        self._fitz = fitz
+        from utils.pdf_render import open_document
+        self._doc = open_document(path)
+        self.count = max(1, len(self._doc))
         # zoom = базовый логический масштаб × DPR экрана, с потолком.
         self._zoom = min(self._BASE_ZOOM * max(1.0, render_scale), self._MAX_ZOOM)
 
     def frame(self, index) -> QImage:
         index = max(0, min(int(index), self.count - 1))
         try:
-            page = self._doc.load_page(index)
-            # Матрица трансформации масштабирует страницу ПРИ растеризации.
-            matrix = self._fitz.Matrix(self._zoom, self._zoom)
-            # alpha=False — без альфа-канала (исторический патч против SegFault
-            # на некоторых PDF при прямом QImage из RGBA-самплов).
-            pix = page.get_pixmap(matrix=matrix, alpha=False)
-            return QImage(pix.samples, pix.width, pix.height, pix.stride,
-                          QImage.Format.Format_RGB888).copy()
+            from utils.pdf_render import render_page
+            # render_page отдаёт независимый PIL.Image('RGB') заданной плотности;
+            # строки RGB888 идут без паддинга, поэтому stride = width * 3.
+            img = render_page(self._doc, index, self._zoom)
+            return QImage(img.tobytes("raw", "RGB"), img.width, img.height,
+                          img.width * 3, QImage.Format.Format_RGB888).copy()
         except Exception as e:
             auditor.warning(f"[PdfProvider] page {index} failed: {e}")
             return QImage()
@@ -465,7 +464,7 @@ class DiscreteScrubbingWidget(QWidget):
     # ---- Очистка ------------------------------------------------------------
 
     def _teardown(self):
-        """Закрывает поставщиков (освобождает fitz/zip/PIL хэндлы) и рушит вьюхи."""
+        """Закрывает поставщиков (освобождает pypdfium2/zip/PIL хэндлы) и рушит вьюхи."""
         self._prefetch_timer.stop()
         for provider in self._providers:
             try:

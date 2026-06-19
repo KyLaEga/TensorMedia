@@ -349,40 +349,41 @@ def process_single_file_io(task_data: tuple) -> dict:
             if _scan_io_cancelled():
                 return _cancelled_io_result(file_path, size, mtime, file_hash, vector)
             try:
-                import fitz 
-                with fitz.open(str(file_path)) as doc:
+                from utils.pdf_render import open_document, render_page
+                doc = open_document(file_path)
+                try:
                     total_pages = len(doc)
                     if total_pages == 0:
                         return _cancelled_io_result(file_path, size, mtime, file_hash, vector)
-                    
+
                     check_points = [0.0, 0.30, 0.60] if total_pages > 3 else [0.0]
                     max_sharp = -1.0
                     best_img_for_model = None
-                    
+
                     for cp in check_points:
                         if _scan_io_cancelled():
                             break
                         page_num = int(total_pages * cp)
                         if page_num >= total_pages: page_num = total_pages - 1
-                        page = doc.load_page(page_num)
-                        pix = page.get_pixmap(matrix=fitz.Matrix(0.5, 0.5), alpha=False)
-                        with Image.frombytes("RGB", [pix.width, pix.height], pix.samples) as img:
+                        with render_page(doc, page_num, 0.5) as img:
                             if not res: res = f"{img.width}x{img.height}"
                             img_thumb = img.copy()
                             img_thumb.thumbnail((256, 256))
                             sharp = calculate_optical_sharpness(np.array(img_thumb.convert('L')))
-                            if sharp > max_sharp: 
+                            if sharp > max_sharp:
                                 max_sharp = sharp
                                 if scan_mode == "faces":
                                     img.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
                                     best_img_for_model = img
                                 else:
                                     best_img_for_model = img.resize((224, 224), Image.Resampling.BICUBIC)
-                    
+
                     if best_img_for_model and vector is None:
                         _allocate_shm(best_img_for_model)
                     sharpness = float(max_sharp)
-            except Exception as e: 
+                finally:
+                    doc.close()
+            except Exception as e:
                 auditor.warning(f"Worker PDF error {file_path}: {e}")
                 return {
                     "path": str(file_path), "size": size, "mtime": mtime, "phash": file_hash, 

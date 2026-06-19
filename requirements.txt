@@ -28,7 +28,7 @@ blake3>=1.0.0
 send2trash>=1.8.2
 psutil>=5.9.0
 sentencepiece>=0.2.0
-PyMuPDF>=1.23.0
+pypdfium2>=4.30.0
 protobuf>=4.25.0
 watchdog>=4.0.0
 # macOS specific for native trash support

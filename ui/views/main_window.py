@@ -1103,7 +1103,7 @@ class MainWindow(QMainWindow):
         # LAZY INIT (страницы тяжёлых движков предпросмотра). При старте в стек
         # кладутся ПУСТЫЕ хосты-страницы — индексы (0 single / 1 video / 2 multi /
         # 3 discrete) стабильны, но сами движки (QMediaPlayer+QVideoSink с
-        # ffmpeg-плагином; PIL/fitz дискретного контура) конструируются ТОЛЬКО при
+        # ffmpeg-плагином; PIL/pypdfium2 дискретного контура) конструируются ТОЛЬКО при
         # первом реальном обращении пользователя через ensure_video_player() /
         # ensure_discrete_preview(). Хост-страница создаётся с родителем сразу
         # (никаких parentless show() — см. правило против Spaces Jump).
@@ -1239,7 +1239,7 @@ class MainWindow(QMainWindow):
 
     def ensure_discrete_preview(self):
         """Ленивая фабрика Контура Б (дискретный скрэббинг GIF/PDF/CBZ).
-        Модуль импортируется здесь же: PIL/fitz не грузятся при старте."""
+        Модуль импортируется здесь же: PIL/pypdfium2 не грузятся при старте."""
         if self.discrete_preview is None:
             from ui.components.discrete_preview import DiscreteScrubbingWidget
             self.discrete_preview = DiscreteScrubbingWidget(self._discrete_host)

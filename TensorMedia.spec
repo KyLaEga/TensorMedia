@@ -59,6 +59,16 @@ _fa_datas, _fa_binaries, _fa_hidden = collect_all("faiss")
 datas += _fa_datas
 extra_binaries += _fa_binaries
 
+# --- pypdfium2: bundle the native PDFium binary -----------------------------
+# Замена PyMuPDF (AGPL + хрупкая упаковка нативных под-модулей mupdf/cppyy,
+# из-за чего превью PDF падало в бандле). pypdfium2_raw несёт компилированный
+# pdfium (.dylib/.so/.dll) как данные пакета: статический граф PyInstaller видит
+# `import pypdfium2`, но не сам нативный бинарь рядом — поэтому collect_all
+# вытягивает его явно (binaries + data + версия). См. utils/pdf_render.
+_pp_datas, _pp_binaries, _pp_hidden = collect_all("pypdfium2_raw")
+datas += _pp_datas
+extra_binaries += _pp_binaries
+
 # dist-info для всех пакетов, чьи версии transformers/huggingface_hub опрашивают
 # в рантайме через importlib.metadata (отсутствие любого -> ложный "not found").
 for _pkg in (
@@ -86,8 +96,6 @@ hiddenimports = [
     "numpy",
     "cv2",
     "PIL.Image",
-    "fitz",
-    "pymupdf",
     "blake3",
     "send2trash",
     "psutil",
@@ -95,7 +103,9 @@ hiddenimports = [
     "facenet_pytorch",
     "faiss",
     "certifi",
-] + _tf_hidden + _fa_hidden
+    "pypdfium2",
+    "pypdfium2_raw",
+] + _tf_hidden + _fa_hidden + _pp_hidden
 
 excludes = [
     "tkinter",
@@ -127,7 +137,7 @@ _app_icon = "assets/icons/app.icns" if os.path.exists("assets/icons/app.icns") e
 # The winner is stripped of a leading 'v' and MUST be a dotted number
 # (CFBundleVersion rejects anything else, e.g. a branch name from a manual run),
 # otherwise we fall through to the next candidate.
-def _app_version(_fallback="1.2.7"):
+def _app_version(_fallback="1.2.8"):
     import re
     import subprocess
     candidates = [os.environ.get("TENSORMEDIA_VERSION", "")]

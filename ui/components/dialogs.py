@@ -48,14 +48,15 @@ class ThumbnailWorker(QThread):
                             qim = QImage(frame.data, frame.shape[1], frame.shape[0], frame.shape[1] * 3, QImage.Format.Format_RGB888).copy()
                     cap.release()
                 elif ext == '.pdf':
-                    import fitz
-                    with fitz.open(p) as doc:
+                    from utils.pdf_render import open_document, render_page
+                    doc = open_document(p)
+                    try:
                         if len(doc) > 0:
-                            page = doc.load_page(0)
-                            pix = page.get_pixmap(matrix=fitz.Matrix(0.5, 0.5))
-                            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                            img = render_page(doc, 0, 0.5)
                             img.thumbnail((400, 400))
                             qim = QImage(img.tobytes("raw", "RGB"), img.width, img.height, img.width * 3, QImage.Format.Format_RGB888).copy()
+                    finally:
+                        doc.close()
                 elif ext == '.cbz':
                     with zipfile.ZipFile(p, 'r') as z:
                         names = sorted([n for n in z.namelist() if n.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))])

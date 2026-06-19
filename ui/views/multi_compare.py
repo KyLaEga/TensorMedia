@@ -542,7 +542,7 @@ class MultiCompareWidget(QWidget):
         ещё держал источник; deleteLater уводит C++ деструкцию в чистый проход
         event-loop, где GUI-поток уже не удерживает GIL."""
         for card in cards:
-            # Закрываем провайдера дискретной карточки — освобождаем fitz/zip/PIL
+            # Закрываем провайдера дискретной карточки — освобождаем pypdfium2/zip/PIL
             # хэндлы и RAM-кэш кадров (паритет с _teardown одиночного просмотра).
             prov = getattr(card, 'provider', None)
             if prov is not None:
