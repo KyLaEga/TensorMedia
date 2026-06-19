@@ -127,7 +127,7 @@ _app_icon = "assets/icons/app.icns" if os.path.exists("assets/icons/app.icns") e
 # The winner is stripped of a leading 'v' and MUST be a dotted number
 # (CFBundleVersion rejects anything else, e.g. a branch name from a manual run),
 # otherwise we fall through to the next candidate.
-def _app_version(_fallback="1.2.6"):
+def _app_version(_fallback="1.2.7"):
     import re
     import subprocess
     candidates = [os.environ.get("TENSORMEDIA_VERSION", "")]

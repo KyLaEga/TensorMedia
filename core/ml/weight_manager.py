@@ -59,6 +59,10 @@ class WeightFetchThread(QThread):
             snapshot_download(
                 repo_id="google/siglip-base-patch16-224",
                 local_dir=str(siglip_dir),
+                # Только safetensors: дублирующий pytorch_model.bin (~775 МБ) и
+                # TF/Flax/ONNX-веса не нужны (инференс читает model.safetensors).
+                # Это и приводит размер первой загрузки к заявленным ~370 МБ.
+                ignore_patterns=["*.bin", "*.h5", "*.msgpack", "*.onnx", "*.pth"],
             )
 
             self.progress.emit("Downloading FaceNet VGGFace2 (~110 MB)...")

@@ -44,7 +44,13 @@ def download_offline_models():
             local_dir=str(siglip_dir),
             local_dir_use_symlinks=False,
             resume_download=not force,
-            force_download=force
+            force_download=force,
+            # Грузим ТОЛЬКО safetensors-веса. Репозиторий SigLIP содержит и
+            # дублирующий pytorch_model.bin (~775 МБ), и форматы TF/Flax/ONNX —
+            # всё это балласт: SiglipVisionModel.from_pretrained читает
+            # model.safetensors (см. cluster_engine), а валидация ниже проверяет
+            # именно его. Фильтр срезает ~775 МБ из бандла без потери функционала.
+            ignore_patterns=["*.bin", "*.h5", "*.msgpack", "*.onnx", "*.pth"],
         )
         
     print("\n[1/2] Валидация SigLIP (google/siglip-base-patch16-224)...")
