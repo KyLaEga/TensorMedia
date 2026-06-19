@@ -62,39 +62,58 @@ class SelectionController(QObject):
         proxy_indexes = [idx for idx in self.view.tree.selectionModel().selectedRows(0) if idx.isValid()]
         indexes = [self.view.proxy_model.mapToSource(idx) for idx in proxy_indexes]
         if not indexes: return
-        
-        valid_items = []
-        valid_indexes = []
-        
+
+        # Space переключает галочку удаления у выделенных строк. РАНЬШЕ в расчёт
+        # шли только файлы (дети) — выделенный кластер пробел игнорировал. Теперь
+        # делим выделение на кластеры (группы) и файлы: для кластера пробел метит
+        # сразу всю группу (все её не-эталонные файлы), для файлов — как прежде.
+        cluster_items = []        # выделенные группы целиком
+        file_items = []           # (item, source_index) выбранных пофайлово
         for idx in indexes:
-            if idx.parent().isValid():
-                item = self.view.model.itemFromIndex(idx.siblingAtColumn(0))
-                if not item.raw_dict.get('is_ref', False):
-                    valid_items.append(item)
-                    valid_indexes.append(idx.siblingAtColumn(0))
+            item = self.view.model.itemFromIndex(idx.siblingAtColumn(0))
+            if item is None:
+                continue
+            if item.is_cluster:
+                cluster_items.append(item)
+            elif not item.raw_dict.get('is_ref', False):
+                file_items.append((item, idx.siblingAtColumn(0)))
 
-        if not valid_items: return
+        if not cluster_items and not file_items:
+            return
 
-        new_state = Qt.CheckState.Checked if valid_items[0].checkState() == Qt.CheckState.Unchecked else Qt.CheckState.Unchecked
-        
+        # Единое целевое состояние на весь пакет: инвертируем «ведущий» элемент
+        # (приоритет у кластера, иначе первый файл), чтобы один пробел не
+        # «расходился» по разным состояниям внутри смешанного выделения.
+        lead = cluster_items[0] if cluster_items else file_items[0][0]
+        new_state = (Qt.CheckState.Checked
+                     if lead.checkState() == Qt.CheckState.Unchecked
+                     else Qt.CheckState.Unchecked)
+
         self.view.model.blockSignals(True)
-        min_row = float('inf')
-        max_row = -1
-        parent_idx = valid_indexes[0].parent()
-
-        for child, idx in zip(valid_items, valid_indexes): 
+        for cluster in cluster_items:
+            cluster.check_state = new_state
+            for i in range(cluster.childCount()):
+                child = cluster.child(i)
+                if not child.raw_dict.get('is_ref', False):
+                    child.check_state = new_state
+        for child, _ in file_items:
             child.check_state = new_state
-            r = idx.row()
-            if r < min_row: min_row = r
-            if r > max_row: max_row = r
-
         self.view.model.blockSignals(False)
-        
-        if min_row != float('inf'):
-            first_idx = self.view.model.index(min_row, 0, parent_idx)
-            last_idx = self.view.model.index(max_row, 5, parent_idx)
-            self.view.model.dataChanged.emit(first_idx, last_idx, [Qt.ItemDataRole.CheckStateRole, Qt.ItemDataRole.DisplayRole])
-            self.view.model.itemChanged.emit(valid_items[0], valid_indexes[0])
+
+        # Пакет мог затронуть несколько групп (несколько кластеров и/или файлы из
+        # разных кластеров) — перерисовываем дерево целиком одним сигналом (тот же
+        # приём, что в clear_selection/_apply_computed_selection; QTreeView
+        # перерисует лишь видимую область).
+        self.view.model.dataChanged.emit(
+            self.view.model.index(0, 0, QModelIndex()),
+            self.view.model.index(self.view.model.rowCount() - 1, 5, QModelIndex()),
+            [Qt.ItemDataRole.CheckStateRole, Qt.ItemDataRole.DisplayRole]
+        )
+
+        # Доводим tristate родителей у файлов, выбранных пофайлово (у кластеров
+        # состояние уже согласовано — все дети равны самому кластеру).
+        for child, idx in file_items:
+            self.on_item_changed(child, idx)
 
         self.view.tree.viewport().update()
         self.main_controller._update_savings()

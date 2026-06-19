@@ -45,6 +45,16 @@ class MainController(QObject):
         # engine_ready), поэтому скан и смена движка тоже держат кэш свежим.
         self._last_applied_threshold = None
 
+        # Сигнатура директорий (и режима single/dual), по которой реально
+        # отработал последний скан и под которую векторизован engine.current_file_data.
+        # Нужна как «доп. проверка на папку»: тюнинг порога ползунком работает
+        # поверх этого набора, поэтому если с момента скана сменили целевую папку,
+        # рекластеризация относилась бы к СТАРОЙ папке. _trigger_recluster сверяет
+        # текущий выбор с этой сигнатурой и при расхождении гонит полный скан новой
+        # папки вместо холостой пересборки. None — скана ещё не было. Пишется
+        # только в _start_scan (после прохождения всех валидаций).
+        self._scanned_signature = None
+
         # Балансировка override-курсора рекластеризации. _trigger_recluster ставит
         # WaitCursor, но оркестратор может ОТБРОСИТЬ команду (воркер ещё занят) или
         # упасть по OOM (эмитит evt_scan_error вместо evt_clustering_completed) —
@@ -198,8 +208,9 @@ class MainController(QObject):
         self.sc_f1.activated.connect(self._show_help_dialog)
         
         # BLOCK 4 (эргономика навигации). Space И двойной клик ПЕРЕКЛЮЧАЮТ чекбокс
-        # удаления (пакетно по всему выделению — manual_check_selected), а Enter
-        # ОТКРЫВАЕТ сравнение (наравне с Cmd+P / кнопкой / контекстным меню).
+        # удаления (пакетно по всему выделению — manual_check_selected; выделенный
+        # кластер метится целиком), а Enter ОТКРЫВАЕТ сравнение (наравне с Cmd+P /
+        # кнопкой / контекстным меню).
         self.sc_space = QShortcut(QKeySequence(Qt.Key.Key_Space), self.view, context=Qt.ShortcutContext.ApplicationShortcut)
         self.sc_space.activated.connect(self.selection_controller.manual_check_selected)
 
@@ -298,6 +309,10 @@ class MainController(QObject):
             path = os.path.normpath(os.path.abspath(path))
             self.target_dir_a = path
             self.view.lbl_path_a.setText(str(path))
+            # Цель сменилась — снимаем idempotency-кэш порога, иначе повторный
+            # пин того же % после смены папки был бы отброшен как «холостой» и
+            # не дошёл бы до folder-divergence guard в _trigger_recluster.
+            self._last_applied_threshold = None
             self._check_ready()
             if self.view.btn_scan.isEnabled():
                 self._start_scan()
@@ -344,11 +359,15 @@ class MainController(QObject):
             self.view.dir_b_widget.hide()
             self.target_dir_b = None
             self.view.lbl_path_b.setText(translator.tr("lbl_not_selected"))
+        # Смена режима single/dual меняет набор сканируемых директорий — сбрасываем
+        # кэш порога, чтобы следующий тюнинг гарантированно дошёл до folder-divergence
+        # guard и пересканировал актуальную конфигурацию.
+        self._last_applied_threshold = None
         self._check_ready()
 
     def _select_directory(self, mode):
         folder = QFileDialog.getExistingDirectory(self.view, translator.tr("dialog_select_dir"))
-        if folder: 
+        if folder:
             folder = os.path.normpath(os.path.abspath(folder))
             if mode == 'a':
                 self.target_dir_a = folder
@@ -356,6 +375,10 @@ class MainController(QObject):
             else:
                 self.target_dir_b = folder
                 self.view.lbl_path_b.setText(str(folder))
+            # Выбрали другую папку — сбрасываем idempotency-кэш порога (тот же %
+            # после смены папки обязан дойти до folder-divergence guard, иначе
+            # пересборка осталась бы на старом наборе).
+            self._last_applied_threshold = None
             self._check_ready()
 
     def _check_ready(self):
@@ -569,8 +592,38 @@ class MainController(QObject):
             QApplication.restoreOverrideCursor()
             self._recluster_cursor_active = False
 
+    def _current_target_signature(self):
+        """Сигнатура текущего выбора директорий (+ режим single/dual). По форме
+        совпадает с тем, что пишет _start_scan в _scanned_signature, чтобы их
+        можно было сравнивать напрямую."""
+        is_dual = self.view.rb_dual.isChecked()
+        dirs = [self.target_dir_a]
+        if is_dual:
+            dirs.append(self.target_dir_b)
+        return (tuple(dirs), is_dual)
+
+    def _scan_target_changed(self):
+        """True, если целевая папка/режим разошлись с тем, что реально
+        просканировано. До первого скана сверять не с чем — возвращаем False
+        (холостой recluster отработает как раньше, полный анализ запускает «Скан»)."""
+        if self._scanned_signature is None:
+            return False
+        return self._current_target_signature() != self._scanned_signature
+
     def _trigger_recluster(self):
         if not self.engine_ready: return
+
+        # FOLDER DIVERGENCE GUARD. Рекластеризация идёт по уже векторизованному
+        # набору последнего скана (engine.current_file_data). Если после скана
+        # сменили целевую папку (или режим single/dual), а затем дёрнули порог —
+        # пересборка кластеров относилась бы к СТАРОЙ папке (это и был баг:
+        # «настраиваешь сходство, а проверяется нынешняя папка, а не нужная»).
+        # Тогда вместо холостой пересборки запускаем полный скан НОВОЙ папки;
+        # выбранный порог применится по его завершении (_on_scan_finished →
+        # _trigger_recluster, где сигнатуры уже совпадут и сработает обычный путь).
+        if self._scan_target_changed():
+            self._start_scan()
+            return
 
         self._set_status("status_reclustering")
         self._set_recluster_cursor()
@@ -702,7 +755,13 @@ class MainController(QObject):
             return
             
         selected_mode = "visual" if self.view.combo_engine.currentIndex() == 0 else "faces"
-        
+
+        # Фиксируем, под какой набор директорий/режим стартует скан. Дальнейший
+        # тюнинг порога сверяется с этой сигнатурой (folder-divergence guard в
+        # _trigger_recluster): пока папка та же — лёгкая пересборка, сменилась —
+        # автоматический полный скан новой папки.
+        self._scanned_signature = (tuple(dirs_to_scan), is_dual)
+
         auditor.info(f"UI Triggered Scan Pipeline: Dirs={dirs_to_scan}, Extensions={len(final_exts)}")
         
         self.view.btn_scan.hide()
