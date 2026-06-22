@@ -103,12 +103,6 @@ class VideoSinkWidget(QWidget):
         self._broken = False   # пришёл валидный растр — снимаем гард «битый файл»
         self.update()
 
-    def clear_preview(self):
-        self._preview_image = None
-        self._current_frame = None
-        self._broken = False
-        self.update()
-
     def mark_corrupted(self):
         """Пометить контур как «битый файл»: гасит кадр/превью и просит перерисовку,
         чтобы paintEvent нарисовал заглушку «⚠️ Битый файл / Corrupted» вместо
@@ -132,15 +126,23 @@ class VideoSinkWidget(QWidget):
         colors = ThemeManager.colors()
         return QColor(colors.get(self._bg_role, colors["surface"]))
 
-    def _draw_image(self, painter, rect, image):
-        """Вписывает QImage в rect с сохранением пропорций и центрированием (Retina-aware)."""
+    def _draw_image(self, painter, rect, image, smooth=True):
+        """Вписывает QImage в rect с сохранением пропорций и центрированием (Retina-aware).
+
+        smooth=False (живые кадры воспроизведения) → FastTransformation: для 4К
+        SmoothTransformation масштабировал 8.3 млн пикселей на КАЖДОМ кадре в
+        UI-потоке (видимые лаги/«дёрганье» при 4К). Билинейный фаст-даунскейл до
+        размера превью визуально неотличим в движении, но кратно дешевле. Статичный
+        cv2-превью (smooth=True) оставляем сглаженным — он рисуется один раз."""
         if image is None or image.isNull():
             return
         dpr = self.devicePixelRatioF()
+        mode = (Qt.TransformationMode.SmoothTransformation if smooth
+                else Qt.TransformationMode.FastTransformation)
         scaled = image.scaled(
             rect.size() * dpr,
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+            mode,
         )
         scaled.setDevicePixelRatio(dpr)
         w = scaled.width() / dpr
@@ -161,9 +163,10 @@ class VideoSinkWidget(QWidget):
         #    просмотре). Так при выборе видео сразу виден кадр, а не пустота.
         frame = self._current_frame
         if frame is not None and frame.isValid():
-            self._draw_image(painter, rect, frame.toImage())
+            # Живой кадр — быстрый даунскейл (см. _draw_image): критично для 4К.
+            self._draw_image(painter, rect, frame.toImage(), smooth=False)
         elif self._preview_image is not None:
-            self._draw_image(painter, rect, self._preview_image)
+            self._draw_image(painter, rect, self._preview_image, smooth=True)
         elif self._broken:
             # 3) Нет ни живого кадра, ни превью, и контур помечен битым — рисуем
             #    заглушку вместо слепого квадрата заливки (Corrupted File UX).
@@ -376,23 +379,49 @@ class BuiltInVideoPlayer(QWidget):
 
         abs_path = os.path.abspath(path)
         self._current_path = abs_path
-        # ПРЕВЬЮ-КАДР: тащим через cv2 (CompareVideoWorker) ровно как в
-        # множественном просмотре — мгновенно и без чёрного экрана. Результат
-        # прилетит в _on_thumb_ready и нарисуется как статичный кадр.
-        self._thumb_worker.request_frames([abs_path], 25)
 
-        # ОТЛОЖЕННОЕ ПЕРЕСОЗДАНИЕ КОНТЕКСТА: старый QMediaPlayer уходит в
-        # deleteLater (его C++ деструктор, а с ним снос рендер-графа предыдущего
-        # видео, отработает в чистом C++-проходе event-loop — вне GIL-кванта,
-        # поэтому ~QAudioOutputWrapper не встаёт в дедлок). self.player при этом
-        # сразу становится ЧИСТЫМ пустым инстансом: старые живые кадры/звук гаснут
-        # немедленно, а на экране остаётся cv2-превью (запрошено выше).
+        # 1) МГНОВЕННЫЙ кадр из дискового кэша СИНХРОННО (чтение ~15-30 КБ JPEG —
+        #    миллисекунды). Превью появляется СРАЗУ, не дожидаясь ни воркера, ни
+        #    тяжёлого пересоздания плеера (шаг 3). Это и есть лечение «долго грузится»:
+        #    на уже просканированной библиотеке миниатюры есть у всех файлов.
+        shown = self._show_cached_thumb(abs_path)
+        # 2) Кэш-промах (файл не сканировали) → добываем кадр воркером, он же
+        #    сохранит миниатюру на будущее (cache=True).
+        if not shown:
+            self._thumb_worker.request_frames([abs_path], 25, cache=True)
+
+        # 3) Пересоздание QMediaPlayer + setSource ДОРОГО и идёт СИНХРОННО на
+        #    GUI-потоке (на macOS — заметная пауза на КАЖДЫЙ выбор: это и был тормоз).
+        #    Откладываем в event-loop: кадр (шаг 1/2) рисуется первым, плеер
+        #    готовится сразу после, не блокируя отрисовку. Старый контекст уходит в
+        #    deleteLater (C++ деструкция вне GIL-кванта → нет дедлока ~QAudioOutputWrapper).
+        QTimer.singleShot(0, lambda ap=abs_path: self._prepare_player_source(ap))
+
+    def _show_cached_thumb(self, abs_path: str) -> bool:
+        """Синхронно показать кадр из дискового кэша миниатюр, если он есть.
+        Возвращает True, если кадр показан. Чтение маленького JPEG — миллисекунды,
+        безопасно в GUI-потоке (в отличие от открытия видеоконтейнера)."""
+        try:
+            from utils.thumb_cache import thumb_path_for
+            tp = thumb_path_for(abs_path)
+            if tp is None or not tp.exists():
+                return False
+            from PySide6.QtGui import QImageReader
+            img = QImageReader(str(tp)).read()
+            if img.isNull():
+                return False
+            self.video_widget.set_preview_image(img)
+            return True
+        except Exception:
+            return False
+
+    def _prepare_player_source(self, abs_path: str):
+        """Отложенная (вне горячего пути выбора) подготовка источника плеера.
+        Guard: пользователь мог выбрать другое видео, пока ждали тик event-loop."""
+        if abs_path != self._current_path:
+            return
         self.change_source_safe(QUrl())
-
-        # ОТВЯЗКА ОТ UI-ПОТОКА: даже на ПУСТОМ свежем плеере setSource синхронно
-        # парсит контейнер. Откладываем, чтобы цикл событий UI успел отрисоваться.
-        # Сам плеер НЕ запускаем — стартует только по кнопке Play (поверх превью).
-        QTimer.singleShot(100, lambda: self._apply_source(abs_path))
+        self._apply_source(abs_path)
 
     def _on_thumb_ready(self, path, qimg):
         # Отбрасываем запоздавший кадр от ранее выбранного видео.
@@ -524,41 +553,6 @@ class BuiltInVideoPlayer(QWidget):
         self._is_playing_intent = False
         self._sync_play_icon()
         QTimer.singleShot(0, self._do_pause)
-
-    def release_source(self):
-        """Полностью отдаёт аппаратный медиа-контекст (AVFoundation/ffmpeg):
-        останавливает воспроизведение И обнуляет источник QMediaPlayer, чтобы
-        нативный декодер освободил GPU/Space-контекст. Превью гасим: оно вернётся
-        при следующем выборе файла (PreviewController снова вызовет load_video).
-
-        BLOCK 1 (Asynchronous Teardown). Сам снос нативного контекста (stop +
-        setSource(QUrl())) выполняет _cleanup_players ВНЕ текущего кванта —
-        через QTimer.singleShot(0). На macOS setSource синхронно ждёт QThread
-        рендера Qt Multimedia, а тот для финализации Shiboken-оберток тянется за
-        GIL, удерживаемым этим же GUI-потоком → встречный GIL-дедлок. Откладывая
-        очистку на следующий тик, мы даём GUI-потоку отпустить GIL раньше, чем
-        поток мультимедиа попытается его захватить."""
-        self._pending_seek = False
-        self._current_path = None
-        QTimer.singleShot(0, self._cleanup_players)
-
-    def _cleanup_players(self):
-        """Изолированная гильотина медиа-контекста (BLOCK 1). Вызывается ТОЛЬКО
-        отложенно (через QTimer.singleShot из release_source), уже вне кванта,
-        инициировавшего закрытие.
-
-        Перед остановкой ЖЁСТКО глушим сигналы плеера (blockSignals(True)): иначе
-        stop()/setSource(QUrl()) эмитят positionChanged/mediaStatusChanged, чьи
-        слоты в этот момент тронули бы уже сносимый sink-виджет. Затем рвём
-        источник — нативный AVFoundation/ffmpeg-декодер освобождается без гонки
-        с GUI-потоком."""
-        self.player.blockSignals(True)
-        try:
-            self.player.stop()
-            self.player.setSource(QUrl())
-        finally:
-            self.player.blockSignals(False)
-        self.video_widget.clear_preview()
 
     def shutdown(self):
         """Синхронная остановка фонового cv2-воркера превью при закрытии окна.

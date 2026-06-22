@@ -35,7 +35,7 @@ def build():
         app_path = Path('dist/TensorMedia.app')
         zip_path = Path('dist/TensorMedia_macOS.zip')
         
-        print(f"Creating ZIP archive for GitHub release...")
+        print("Creating ZIP archive for GitHub release...")
         if zip_path.exists():
             os.remove(zip_path)
             

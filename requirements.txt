@@ -15,7 +15,17 @@ faiss-cpu>=1.8.0
 # extensions emit "compiled using NumPy 1.x cannot be run in NumPy 2.x ... may
 # crash" at import. Keep both bounds so pip resolves a single ABI plane.
 numpy>=1.26.4,<2
-Pillow>=10.2.0
+# Capped <10.3: facenet-pytorch pins Pillow<10.3.0, and pillow-heif's newer
+# (1.x) wheels force Pillow 12 — which both breaks that pin and crosses the
+# numpy-1.x ABI plane. Keep Pillow on the 10.2 line so pip resolves one set.
+Pillow>=10.2.0,<10.3.0
+# HEIC/HEIF decoder for PIL. iPhone photos are HEIC by default; without this
+# Image.open(".heic") raises UnidentifiedImageError and the file is silently
+# skipped during the scan. Registered in core/ml/cluster_engine (module level,
+# so spawn workers get it too) and bundled via TensorMedia.spec. Pinned to the
+# 0.16 line: it supports Pillow 10.x, whereas pillow-heif >=0.18/1.x demands a
+# newer Pillow that violates the facenet-pytorch <10.3.0 cap above.
+pillow-heif>=0.16.0,<0.17
 # Capped <4.10: opencv-python 4.10+ wheels require numpy>=2, which clashes with
 # the numpy<2 pin above (PySide6/shiboken ABI). 4.9.0.80 is the last numpy-1.x
 # build. Lift both this cap and the numpy cap together if PySide6 is upgraded

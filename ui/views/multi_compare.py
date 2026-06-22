@@ -955,8 +955,21 @@ class MultiCompareWidget(QWidget):
             elif ext not in self.video_exts:
                 reader = QImageReader(p)
                 img = reader.read()
-                if not img.isNull():
-                    card.lbl_img.setPixmap(QPixmap.fromImage(img))
+                pm = QPixmap.fromImage(img) if not img.isNull() else None
+                if pm is None:
+                    # Qt не декодирует формат (типично для HEIC: сборки PySide6 не
+                    # всегда несут плагин qheif) — откат на PIL + pillow-heif,
+                    # паритет с одиночным превью (image_label) и delete-диалогом.
+                    try:
+                        from PIL import Image
+                        from utils.image_io import register_heif, pil_to_qimage
+                        register_heif()
+                        with Image.open(p) as im:
+                            pm = QPixmap.fromImage(pil_to_qimage(im, max_side=1600))
+                    except Exception:
+                        pm = None
+                if pm is not None and not pm.isNull():
+                    card.lbl_img.setPixmap(pm)
         if v_paths:
             # Мгновенный статичный кадр в каждое видео ДО прогрева QMediaPlayer —
             # тот же приём, что в одиночном просмотре: cv2 отдаёт превью, плеер

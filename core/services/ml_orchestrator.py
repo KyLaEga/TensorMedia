@@ -217,6 +217,20 @@ class MLOrchestrator(QObject):
         _soft_stop_qthread(self.warmup_worker, "EngineWarmupWorker")
         _soft_stop_qthread(self.maintenance_worker, "MaintenanceWorker")
 
+        # ФЛАШ КЭША ВЕКТОРОВ ДО os._exit. VectorCache держит фоновый writer-поток,
+        # а его flush повешен ТОЛЬКО на atexit (VectorCache.__init__) — но выход
+        # идёт через os._exit(0) (main_window.closeEvent), который atexit
+        # ПРОПУСКАЕТ. Без явного флаша последние поставленные в очередь, но ещё не
+        # закоммиченные векторы терялись → эти файлы повторно векторизуются при
+        # следующем скане (потеря полезной работы кэша). Делаем это ПОСЛЕ остановки
+        # ScannerBridge (выше): больше никто в очередь не пишет. close_all шлёт
+        # FLUSH_AND_EXIT и join'ит writer'ов (ограниченный таймаут внутри).
+        try:
+            from utils.batch_operations import DBConnectionPool
+            DBConnectionPool.close_all()
+        except Exception as e:
+            auditor.error(f"VectorCache flush on shutdown failed: {e}", exc_info=True)
+
         # GRACEFUL TEARDOWN ПУЛА multiprocessing — СИНХРОННО, до выхода процесса.
         # К этому моменту ScannerBridge уже остановлен (его wait() выше дал
         # extract_features() отработать свой finally и закрыть собственный пул),

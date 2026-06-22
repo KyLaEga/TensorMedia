@@ -16,6 +16,15 @@ from multiprocessing import Pool, Value, shared_memory
 
 cv2.setNumThreads(0)
 
+# HEIC/HEIF: регистрируем PIL-опенер pillow-heif на уровне МОДУЛЯ — его исполняют
+# и главный процесс (warmup), и spawn-воркеры пула (process_single_file_io зовёт
+# Image.open в дочернем процессе). Без него Image.open(".heic") бросает
+# UnidentifiedImageError, и дефолтный iPhone-формат тихо выпадал из индекса.
+# Логика вынесена в utils.image_io (общая с GUI-превью); её импорт Qt-чист, т.е.
+# безопасен в spawn-воркере. Зеркало в requirements.txt и TensorMedia.spec.
+from utils.image_io import register_heif as _register_heif
+_register_heif()
+
 # Глушим C++-логгер OpenCV. Декодер AVFoundation (macOS) не читает VP8/VP9 .webm
 # и печатает "Couldn't read video stream" напрямую в stderr В ОБХОД Python — это
 # не ловится try/except. Нечитаемые файлы и так пропускаются по isOpened()==False
@@ -44,7 +53,6 @@ def _scan_pool_init(cancel_flag):
     _worker_cancel_flag = cancel_flag
 
 def _scan_io_cancelled() -> bool:
-    global _worker_cancel_flag
     if _worker_cancel_flag is None:
         return False
     try:
@@ -57,8 +65,42 @@ def _cancelled_io_result(file_path: Path, size, mtime, file_hash, vector) -> dic
     return {
         "path": str(file_path), "size": size, "mtime": mtime, "phash": file_hash,
         "vector": vector, "shm_blocks": [], "res": "",
-        "dur": 0.0, "codec": "", "sharpness": 0.0, "fps": 0.0,
+        "dur": 0.0, "codec": "", "sharpness": 0.0, "fps": 0.0, "watermark": 0.0,
     }
+
+
+def estimate_watermark_score(gray_frames) -> float:
+    """Оценка «вотермарочности» по нескольким кадрам одного файла, 0..~0.05.
+
+    Идея: вотермарка/burned-in лого/текст СТАТИЧНА (живёт в одних пикселях по
+    кадрам), тогда как сам контент меняется. Берём пиксели, которые ОДНОВРЕМЕННО
+    (а) почти не меняются между кадрами относительно общего движения и (б) несут
+    сильные контуры (логотип/текст). Доля таких пикселей = score.
+
+    Гейты против ложных срабатываний:
+      • нужно ≥3 кадра одинакового размера (приводим к фикс-сетке 160×90 серого);
+      • если ВЕСЬ клип почти статичен (motion < порога) — отличить вотермарку от
+        статичной сцены нельзя → 0.0 (не штрафуем);
+      • чёрные полосы (flat) контуров не дают → не считаются.
+    Чистый Qt-free numpy/cv2, безопасно в spawn-воркере."""
+    try:
+        if gray_frames is None or len(gray_frames) < 3:
+            return 0.0
+        st = np.stack(gray_frames).astype(np.float32)        # (T,H,W)
+        tstd = st.std(axis=0)
+        motion = float(tstd.mean())
+        if motion < 8.0:
+            return 0.0
+        mean = st.mean(axis=0)
+        gx = np.abs(np.diff(mean, axis=1)); gy = np.abs(np.diff(mean, axis=0))
+        edge = np.zeros_like(mean)
+        edge[:, :-1] += gx; edge[:-1, :] += gy
+        static = tstd < (0.35 * motion)                      # статичные ОТНОСИТЕЛЬНО движения
+        overlay = static & (edge > 18.0)
+        return float(overlay.mean())
+    except Exception as e:
+        auditor.debug(f"Watermark estimate failed: {e}", exc_info=True)
+        return 0.0
 
 def _unlink_shm_blocks(blocks) -> None:
     """Unlink every POSIX shared-memory segment referenced by `blocks`.
@@ -145,10 +187,26 @@ def process_single_file_io(task_data: tuple) -> dict:
     if file_hash is None:
         file_hash = _compute_fast_hash_io(file_path)
     res, dur, codec, sharpness, fps_val = "", 0.0, "", 0.0, 0.0
-    shm_blocks = [] 
+    watermark = 0.0          # доля «вотермарочного» оверлея (видео); 0 для картинок
+    shm_blocks = []
     ext = file_path.suffix.lower()
+    # Кэш статической миниатюры предпросмотра: один раз на файл (первый
+    # репрезентативный кадр, что уходит в модель). Делает превью видео мгновенным —
+    # см. utils.thumb_cache. Best-effort: любой сбой не должен ронять векторизацию.
+    _thumb_saved = [False]
+
+    def _save_preview_thumb(img_obj):
+        if _thumb_saved[0]:
+            return
+        _thumb_saved[0] = True
+        try:
+            from utils.thumb_cache import thumb_path_for, save_thumb_pil
+            save_thumb_pil(thumb_path_for(file_path, size, mtime), img_obj)
+        except Exception as e:
+            auditor.debug(f"Preview thumb save failed for {file_path}: {e}", exc_info=True)
 
     def _allocate_shm(img_obj):
+        _save_preview_thumb(img_obj)
         arr = np.array(img_obj)
         # WINDOWS (NT): именованная shared memory — это file-mapping без
         # персистентности: сегмент живёт, ПОКА открыт хотя бы один хэндл.
@@ -196,6 +254,26 @@ def process_single_file_io(task_data: tuple) -> dict:
                 "is_shm": False
             })
 
+    dhashes = []
+
+    def _add_dhash(img_obj):
+        try:
+            arr = np.array(img_obj.convert('L'))
+            small = cv2.resize(arr, (9, 8), interpolation=cv2.INTER_AREA)
+            diff = small[:, 1:] > small[:, :-1]
+            dhashes.append(np.packbits(diff.flatten()))
+        except Exception:
+            pass
+
+    def _add_dhash_cv(frame):
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            small = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA)
+            diff = small[:, 1:] > small[:, :-1]
+            dhashes.append(np.packbits(diff.flatten()))
+        except Exception:
+            pass
+
     try:
         if ext in {'.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v'}:
             if _scan_io_cancelled():
@@ -213,23 +291,38 @@ def process_single_file_io(task_data: tuple) -> dict:
                     fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
                     codec = "".join([chr((fourcc >> 8 * i) & 0xFF) for i in range(4)]).strip().lower()
                     
-                    check_points = [0.20, 0.40, 0.60, 0.80]
+                    # КРИТИЧЕСКИЙ ПАТЧ: Ускорение + Надежность
+                    # Берем 5 независимых кадров (Временная Сетка) для кросс-матчинга
+                    check_points = [0.15, 0.30, 0.50, 0.70, 0.85]
                     max_sharp = 0.0
+                    wm_frames = []          # фикс-сетка серых кадров для watermark-оценки
+                    t_start = time.monotonic()
                     for cp in check_points:
-                        if _scan_io_cancelled():
+                        if _scan_io_cancelled() or (time.monotonic() - t_start) > 10.0:
                             break
                         target = int(total_frames * cp) if total_frames > 0 else 0
                         cap.set(cv2.CAP_PROP_POS_FRAMES, target)
                         ret, frame = cap.read()
-                        if ret and frame.mean() > 15.0:
-                            if vector is None:
-                                img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                                # КРИТИЧЕСКИЙ ПАТЧ ПРОПОРЦИЙ
-                                if scan_mode == "faces":
-                                    img_pil.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
-                                else:
-                                    img_pil = img_pil.resize((224, 224), Image.Resampling.BICUBIC)
-                                _allocate_shm(img_pil)
+
+                        # Строгая проверка: кадр не должен быть монотонным/черным (средняя яркость > 20)
+                        if ret and frame.mean() > 20.0:
+                            try:
+                                wm_frames.append(cv2.resize(
+                                    cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (160, 90),
+                                    interpolation=cv2.INTER_AREA))
+                            except Exception:
+                                pass
+                            _add_dhash_cv(frame)
+                            img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                            # КРИТИЧЕСКИЙ ПАТЧ ПРОПОРЦИЙ
+                            if scan_mode == "faces":
+                                img_pil.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
+                            elif scan_mode == "visual":
+                                img_pil.thumbnail((512, 512), Image.Resampling.BICUBIC)
+                            # Для exact (dHash) миниатюра не нужна, но сделаем для единообразия
+                            else:
+                                img_pil.thumbnail((256, 256), Image.Resampling.BICUBIC)
+                            _allocate_shm(img_pil)
 
                             h, w = frame.shape[:2]
                             if max(w, h) > 256:
@@ -239,6 +332,7 @@ def process_single_file_io(task_data: tuple) -> dict:
                             sharp = calculate_optical_sharpness(cv2.cvtColor(frame_sm, cv2.COLOR_BGR2GRAY))
                             if sharp > max_sharp: max_sharp = sharp
                     sharpness = float(max_sharp)
+                    watermark = estimate_watermark_score(wm_frames)
                 finally:
                     cap.release()
             else:
@@ -255,14 +349,14 @@ def process_single_file_io(task_data: tuple) -> dict:
                 return _cancelled_io_result(file_path, size, mtime, file_hash, vector)
             with Image.open(file_path) as img: 
                 res = f"{img.width}x{img.height}"
-                if vector is None: 
-                    img_rgb = img.convert("RGB")
-                    # КРИТИЧЕСКИЙ ПАТЧ ПРОПОРЦИЙ: MTCNN не видит лица на сплюснутых квадратах
-                    if scan_mode == "faces":
-                        img_rgb.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
-                        _allocate_shm(img_rgb)
-                    else:
-                        _allocate_shm(img_rgb.resize((224, 224), Image.Resampling.BICUBIC))
+                _add_dhash(img)
+                img_rgb = img.convert("RGB")
+                # КРИТИЧЕСКИЙ ПАТЧ ПРОПОРЦИЙ: MTCNN не видит лица на сплюснутых квадратах
+                if scan_mode == "faces":
+                    img_rgb.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
+                else:
+                    img_rgb.thumbnail((512, 512), Image.Resampling.BICUBIC)
+                _allocate_shm(img_rgb)
                 
                 img.thumbnail((256, 256))
                 sharpness = calculate_optical_sharpness(np.array(img.convert('L')))
@@ -282,13 +376,13 @@ def process_single_file_io(task_data: tuple) -> dict:
                             target_frame = min(max(0, int(tot_frames * cp)), tot_frames - 1)
                             img.seek(target_frame)
                             frame_pil = img.convert("RGB")
+                            _add_dhash(frame_pil)
                             if not res: res = f"{frame_pil.width}x{frame_pil.height}"
-                            if vector is None: 
-                                if scan_mode == "faces":
-                                    frame_pil.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
-                                    _allocate_shm(frame_pil)
-                                else:
-                                    _allocate_shm(frame_pil.resize((224, 224), Image.Resampling.BICUBIC))
+                            if scan_mode == "faces":
+                                frame_pil.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
+                            else:
+                                frame_pil.thumbnail((512, 512), Image.Resampling.BICUBIC)
+                            _allocate_shm(frame_pil)
                                     
                             frame_pil.thumbnail((256, 256))
                             sharp = calculate_optical_sharpness(np.array(frame_pil.convert('L')))
@@ -296,13 +390,13 @@ def process_single_file_io(task_data: tuple) -> dict:
                         sharpness = float(max_sharp)
                     else:
                         frame_pil = img.convert("RGB")
+                        _add_dhash(frame_pil)
                         res = f"{frame_pil.width}x{frame_pil.height}"
-                        if vector is None: 
-                            if scan_mode == "faces":
-                                frame_pil.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
-                                _allocate_shm(frame_pil)
-                            else:
-                                _allocate_shm(frame_pil.resize((224, 224), Image.Resampling.BICUBIC))
+                        if scan_mode == "faces":
+                            frame_pil.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
+                        else:
+                            frame_pil.thumbnail((512, 512), Image.Resampling.BICUBIC)
+                        _allocate_shm(frame_pil)
                         frame_pil.thumbnail((256, 256))
                         sharpness = calculate_optical_sharpness(np.array(frame_pil.convert('L')))
             except Exception as e: 
@@ -329,6 +423,7 @@ def process_single_file_io(task_data: tuple) -> dict:
                         with z.open(names[idx]) as f:
                             with Image.open(f) as img:
                                 img_rgb = img.convert("RGB")
+                                _add_dhash(img_rgb)
                                 if not res: res = f"{img_rgb.width}x{img_rgb.height}"
                                 img_thumb = img_rgb.copy()
                                 img_thumb.thumbnail((256, 256))
@@ -337,11 +432,11 @@ def process_single_file_io(task_data: tuple) -> dict:
                                     max_sharp = sharp
                                     if scan_mode == "faces":
                                         img_rgb.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
-                                        best_img_for_model = img_rgb
                                     else:
-                                        best_img_for_model = img_rgb.resize((224, 224), Image.Resampling.BICUBIC)
+                                        img_rgb.thumbnail((512, 512), Image.Resampling.BICUBIC)
+                                    best_img_for_model = img_rgb
                     
-                    if best_img_for_model and vector is None:
+                    if best_img_for_model:
                         _allocate_shm(best_img_for_model)
                     sharpness = float(max_sharp)
 
@@ -366,6 +461,7 @@ def process_single_file_io(task_data: tuple) -> dict:
                         page_num = int(total_pages * cp)
                         if page_num >= total_pages: page_num = total_pages - 1
                         with render_page(doc, page_num, 0.5) as img:
+                            _add_dhash(img)
                             if not res: res = f"{img.width}x{img.height}"
                             img_thumb = img.copy()
                             img_thumb.thumbnail((256, 256))
@@ -374,11 +470,11 @@ def process_single_file_io(task_data: tuple) -> dict:
                                 max_sharp = sharp
                                 if scan_mode == "faces":
                                     img.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
-                                    best_img_for_model = img
                                 else:
-                                    best_img_for_model = img.resize((224, 224), Image.Resampling.BICUBIC)
+                                    img.thumbnail((512, 512), Image.Resampling.BICUBIC)
+                                best_img_for_model = img
 
-                    if best_img_for_model and vector is None:
+                    if best_img_for_model:
                         _allocate_shm(best_img_for_model)
                     sharpness = float(max_sharp)
                 finally:
@@ -386,9 +482,9 @@ def process_single_file_io(task_data: tuple) -> dict:
             except Exception as e:
                 auditor.warning(f"Worker PDF error {file_path}: {e}")
                 return {
-                    "path": str(file_path), "size": size, "mtime": mtime, "phash": file_hash, 
-                    "vector": None, "shm_blocks": [], "res": "", 
-                    "dur": 0.0, "codec": "", "sharpness": 0.0, "fps": 0.0
+                    "path": str(file_path), "size": size, "mtime": mtime, "phash": file_hash,
+                    "vector": None, "shm_blocks": [], "res": "",
+                    "dur": 0.0, "codec": "", "sharpness": 0.0, "fps": 0.0, "watermark": 0.0
                 }
 
     except (UnidentifiedImageError, OSError) as e:
@@ -414,10 +510,13 @@ def process_single_file_io(task_data: tuple) -> dict:
                     auditor.debug(f"Failed to unlink SHM during I/O cleanup: {e}", exc_info=True)
         shm_blocks.clear()
 
+    dhash_arr = np.stack(dhashes) if dhashes else None
+
     return {
-        "path": str(file_path), "size": size, "mtime": mtime, "phash": file_hash, 
-        "vector": vector, "shm_blocks": shm_blocks, "res": res, 
-        "dur": dur, "codec": codec, "sharpness": sharpness, "fps": fps_val
+        "path": str(file_path), "size": size, "mtime": mtime, "phash": file_hash,
+        "vector": vector, "dhash": dhash_arr, "shm_blocks": shm_blocks, "res": res,
+        "dur": dur, "codec": codec, "sharpness": sharpness, "fps": fps_val,
+        "watermark": watermark
     }
 
 class SmartClusterEngine:
@@ -434,8 +533,6 @@ class SmartClusterEngine:
         self._io_pool = None
         self._scan_cancel_flag = None
         self.faiss_manager = FaissManager(scan_mode="visual")
-        # Кэш 64-битных dHash для Stage 3 (попиксельное подтверждение пар).
-        self._dhash_cache = {}
 
     def request_scan_abort(self):
         # Called from the GUI/orchestrator thread. Only flip cooperative flags
@@ -490,18 +587,20 @@ class SmartClusterEngine:
                 auditor.warning(f"I/O pool hard shutdown failed: {e}", exc_info=True)
 
     def unload_models(self):
-        if self.processor is not None: del self.processor
-        if self.model is not None: del self.model
-        if self.mtcnn is not None: del self.mtcnn
-        if self.resnet is not None: del self.resnet
-        
         self.processor = None
         self.model = None
         self.mtcnn = None
         self.resnet = None
-        self.scan_mode = None
-        
-        HardwareProfiler.enforce_garbage_collection(threshold_mb=0.0, force=True) 
+        # ВНИМАНИЕ: self.scan_mode здесь НЕ обнуляем. unload_models вызывается и
+        # idle-таймером (выгрузка весов через 5 мин простоя), а current_file_data
+        # при этом СОХРАНЯЕТСЯ. Обнуление scan_mode ломало последующий recluster
+        # по ползунку: _filter_dead_entries уходил в meta_v2_visual.db вместо
+        # faces (scan_mode or 'visual') и вычищал ВСЕ записи лиц → пустой результат,
+        # а early-return для faces (build_clusters) не срабатывал → к лицевым
+        # векторам ошибочно применялись геометрия/dHash. load_models всё равно
+        # переустанавливает режим (двойной self.scan_mode = mode как guard).
+
+        HardwareProfiler.enforce_garbage_collection(threshold_mb=0.0, force=True)
         auditor.info(f"Models unloaded. Device ({self.device.type}) resources released.")
 
     def load_models(self, mode="visual"):
@@ -527,6 +626,10 @@ class SmartClusterEngine:
                 "Rebuild with copy_metadata('torch') (TensorMedia.spec) or run the "
                 "published v1.2.1 build, which bundles it."
             )
+        import torch
+        if hasattr(torch, "compiler") and not hasattr(torch.compiler, "is_compiling"):
+            torch.compiler.is_compiling = lambda: False
+            
         from transformers import AutoProcessor, SiglipVisionModel
 
         self.scan_mode = mode
@@ -538,7 +641,11 @@ class SmartClusterEngine:
 
         if mode == "visual":
             siglip_local_path = str(get_models_dir() / "siglip-base-patch16-224")
-            self.processor = AutoProcessor.from_pretrained(siglip_local_path, local_files_only=True)
+            self.processor = AutoProcessor.from_pretrained(
+                siglip_local_path,
+                local_files_only=True,
+                use_fast=True
+            )
             target_dtype = torch.float16 if self.device.type in ("cuda", "mps") else torch.float32
             
             # low_cpu_mem_usage=True: модель инициализируется на meta-устройстве,
@@ -552,7 +659,7 @@ class SmartClusterEngine:
                     local_files_only=True,
                     torch_dtype=target_dtype,
                     low_cpu_mem_usage=True
-                ).to(self.device)
+                ).eval().to(self.device)
             except Exception as e:
                 auditor.error(f"Failed to load to {self.device.type} with {target_dtype}: {e}. Falling back to CPU.")
                 self.device = torch.device("cpu")
@@ -561,8 +668,7 @@ class SmartClusterEngine:
                     local_files_only=True,
                     torch_dtype=torch.float32,
                     low_cpu_mem_usage=True
-                ).to(self.device)
-            self.model.eval()
+                ).eval().to(self.device)
                 
         elif mode == "faces":
             os.environ["TORCH_HOME"] = str(get_models_dir() / "torch")
@@ -579,16 +685,15 @@ class SmartClusterEngine:
                     
                     mtcnn_module.os.path.dirname = lambda x: str(base_dir / "facenet_pytorch" / "data")
                 
-                self.mtcnn = MTCNN(keep_all=False, device='cpu')
+                # КРИТИЧЕСКИЙ ПАТЧ: MTCNN падает на MPS с ошибкой 'Adaptive pool MPS: input sizes must be divisible by output sizes'
+                # Переводим инициализацию MTCNN принудительно на CPU. Это легкая сеть, скорость не пострадает.
+                self.mtcnn = MTCNN(keep_all=False, margin=32, thresholds=[0.5, 0.6, 0.6], device=torch.device("cpu"))
                 self.resnet = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
             except ImportError:
                 auditor.critical("Module facenet-pytorch missing.")
                 self.scan_mode = "error"
 
-    def _compute_fast_hash(self, file_path: Path) -> str:
-        # Делегирует module-level реализации (та же логика), которую дополнительно
-        # вызывают воркеры пула. Метод сохранён для обратной совместимости вызовов.
-        return _compute_fast_hash_io(file_path)
+
 
     def _compute_vector_batch(self, images: list) -> list:
         if not images: return []
@@ -601,10 +706,11 @@ class SmartClusterEngine:
                 for i, img in enumerate(images):
                     if self.is_stopped: break
                     try:
-                        face = self.mtcnn(img)
-                        if face is not None:
-                            with torch.no_grad():
-                                emb = self.resnet(face.unsqueeze(0).to(self.device))
+                        # Включаем возврат вероятности для отсечения ложных срабатываний
+                        face_tensor, prob = self.mtcnn(img, return_prob=True)
+                        if face_tensor is not None and prob is not None and prob > 0.95:
+                            with torch.inference_mode():
+                                emb = self.resnet(face_tensor.unsqueeze(0).to(self.device))
                                 emb_norm = torch.nn.functional.normalize(emb, p=2, dim=-1)
                                 results[i] = emb_norm.cpu().numpy().astype(np.float32)[0]
                     except Exception as e:
@@ -634,7 +740,7 @@ class SmartClusterEngine:
                         else:
                             pixel_values = pixel_values.to(dev, dtype=target_dtype)
                 
-                        with torch.no_grad():
+                        with torch.inference_mode():
                             outputs = self.model(pixel_values=pixel_values)
                             f = outputs.pooler_output
                             f_norm = torch.nn.functional.normalize(f, p=2, dim=-1)
@@ -667,7 +773,6 @@ class SmartClusterEngine:
         self.is_paused = False
         self.is_stopped = False
         self.current_file_data = []
-        self._dhash_cache.clear()
 
         if self._scan_cancel_flag is not None:
             self._scan_cancel_flag.value = 0
@@ -743,13 +848,17 @@ class SmartClusterEngine:
         # ОДНА батч-выборка векторов для всех кэш-хитов (вместо N поштучных).
         cached_vectors = cache_db.get_vectors_for_paths(list(hit_meta.keys())) if hit_meta else {}
         for file_str, (size, mtime, c_m) in hit_meta.items():
-            vec = cached_vectors.get(file_str)
-            if vec is not None:
-                all_results.append({
-                    "path": file_str, "size": size, "mtime": mtime, "phash": c_m['phash'],
-                    "vector": vec, "shm_blocks": [], "res": c_m.get('res', ''),
-                    "dur": c_m.get('dur', 0.0), "codec": c_m.get('codec', ''),
-                    "sharpness": c_m.get('sharpness', 0.0), "fps": c_m.get('fps', 0.0)
+            vec_dict = cached_vectors.get(file_str)
+            if vec_dict is not None and isinstance(vec_dict, dict):
+                v_data = vec_dict.get("vector")
+                dh_data = vec_dict.get("dhash")
+                if v_data is not None:
+                    all_results.append({
+                        "path": file_str, "size": size, "mtime": mtime, "phash": c_m['phash'],
+                        "vector": v_data, "dhash": dh_data, "shm_blocks": [], "res": c_m.get('res', ''),
+                        "dur": c_m.get('dur', 0.0), "codec": c_m.get('codec', ''),
+                    "sharpness": c_m.get('sharpness', 0.0), "fps": c_m.get('fps', 0.0),
+                    "watermark": c_m.get('watermark', 0.0)
                 })
             else:
                 # Метаданные в кэше есть, а вектор отсутствует — переотправляем
@@ -883,12 +992,9 @@ class SmartClusterEngine:
                             idx += count
                             valid_vecs = [v for v in file_vecs if v is not None]
                             if valid_vecs:
-                                avg_vec = np.mean(valid_vecs, axis=0)
-                                norm = np.linalg.norm(avg_vec)
-                                if norm > 1e-8:
-                                    b['vector'] = avg_vec / norm
-                                else:
-                                    b['vector'] = None
+                                # КРИТИЧЕСКИЙ ПАТЧ: ОТКАЗ ОТ УСРЕДНЕНИЯ
+                                # Сохраняем все валидные векторы (до 5 шт) как единый 2D-массив
+                                b['vector'] = np.stack(valid_vecs)
                             else:
                                 b['vector'] = None
 
@@ -904,7 +1010,8 @@ class SmartClusterEngine:
                         insert_batch.append((
                             str(r['path']), int(r['size']), float(r['mtime']), str(r['phash']),
                             str(r['res']), float(r['dur']), str(r['codec']), float(r['sharpness']),
-                            float(r['fps']), r['vector']
+                            float(r['fps']), r['vector'], r.get('dhash'),
+                            float(r.get('watermark', 0.0) or 0.0)
                         ))
                 if insert_batch:
                     cache_db.save_batch(insert_batch)
@@ -938,9 +1045,10 @@ class SmartClusterEngine:
         for r in all_results:
             if r['vector'] is not None:
                 self.current_file_data.append({
-                    "path": r['path'], "phash": r['phash'], "vector": r['vector'],
-                    "size": r['size'], "resolution": r['res'], "duration": r['dur'], 
-                    "codec": r['codec'], "sharpness": r['sharpness'], "fps": r['fps'], "mtime": r['mtime'] 
+                    "path": r['path'], "phash": r['phash'], "vector": r['vector'], "dhash": r.get('dhash'),
+                    "size": r['size'], "resolution": r['res'], "duration": r['dur'],
+                    "codec": r['codec'], "sharpness": r['sharpness'], "fps": r['fps'], "mtime": r['mtime'],
+                    "watermark": r.get('watermark', 0.0)
                 })
 
         return self.current_file_data
@@ -966,43 +1074,16 @@ class SmartClusterEngine:
     #   Это отсекает ложные срабатывания эмбеддингов, инвариантных к мелким
     #   деталям (однородные текстуры, схожая композиция разных кадров).
     # ------------------------------------------------------------------
-    BORDERLINE_BAND = 0.05    # зона similarity над порогом, требующая dHash-подтверждения
-    DHASH_MAX_DISTANCE = 16   # Хэмминг-порог (из 64 бит): выше — пара отклоняется
     ASPECT_TOLERANCE = 0.03   # относительный допуск соотношения сторон (Stage 2)
-    _DHASH_CACHE_MAX = 4096   # потолок кэша dHash (защита RAM на больших библиотеках)
 
-    _VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v'}
-    _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.heic', '.gif'}
 
     def _filter_dead_entries(self) -> list:
         """Stage 0: выбрасывает из current_file_data записи удалённых файлов."""
-        data = self.current_file_data
-        if not data:
-            return []
-
-        alive = [it for it in data if os.path.exists(it["path"])]
-
-        # Перекрёстная проверка по SQLite: путь, удалённый из кэша (момент
-        # удаления в UI), считается деактивированным, даже если на диске
-        # успел появиться одноимённый файл другого содержания.
-        if alive:
-            try:
-                db_name = f"meta_v2_{self.scan_mode or 'visual'}.db"
-                cache_db = DBConnectionPool.get_connection(db_name)
-                known = cache_db.get_metadata_for_paths([it["path"] for it in alive])
-                alive = [it for it in alive if it["path"] in known]
-            except Exception as e:
-                auditor.warning(f"Stage 0: SQLite liveness check skipped: {e}")
-
-        if len(alive) != len(data):
-            auditor.info(
-                f"Stage 0: filtered {len(data) - len(alive)} dead entr(ies) "
-                f"before FAISS re-clustering"
-            )
-            # In-place обновление: меняется и подпись состояния FAISS-кэша,
-            # поэтому устаревшая kNN-матрица с дисковым .npy не переиспользуется.
-            self.current_file_data = alive
-        return alive
+        # ОПТИМИЗАЦИЯ: Полное удаление блокирующего O(N) os.path.exists и 
+        # SQL-запроса из UI-потока. Это устраняет фризы при перетаскивании ползунка 
+        # на больших библиотеках. Файлы уже валидны на момент сканирования,
+        # а инвалидацию при удалении отрабатывает watchdog и fs_service.
+        return self.current_file_data
 
     @staticmethod
     def _parse_resolution(res_str):
@@ -1012,53 +1093,6 @@ class SmartClusterEngine:
             return (w, h) if w > 0 and h > 0 else None
         except (ValueError, AttributeError):
             return None
-
-    def _load_gray_small(self, path: str):
-        """Серый кадр-миниатюра для dHash. Видео — средний кадр; изображения —
-        через PIL (unicode-безопасно на NTFS, в отличие от cv2.imread)."""
-        ext = Path(path).suffix.lower()
-        try:
-            if ext in self._VIDEO_EXTS:
-                cap = cv2.VideoCapture(str(path))
-                try:
-                    if not cap.isOpened():
-                        return None
-                    total = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                    if total > 0:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * 0.5))
-                    ret, frame = cap.read()
-                    if not ret or frame is None:
-                        return None
-                    return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                finally:
-                    cap.release()
-            if ext in self._IMAGE_EXTS:
-                with Image.open(path) as img:
-                    img.thumbnail((128, 128))
-                    return np.array(img.convert("L"))
-        except Exception as e:
-            auditor.debug(f"Stage 3: dHash source load failed for {path}: {e}")
-        # .pdf/.cbz и прочие контейнеры: попиксельное подтверждение неприменимо.
-        return None
-
-    def _dhash64(self, path: str):
-        """64-битный градиентный dHash (9x8, сравнение соседних пикселей)."""
-        cached = self._dhash_cache.get(path)
-        if cached is not None:
-            return None if cached == -1 else cached
-
-        gray = self._load_gray_small(path)
-        if gray is None or gray.size == 0:
-            value = -1
-        else:
-            small = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA)
-            bits = (small[:, 1:] > small[:, :-1]).flatten()
-            value = int.from_bytes(np.packbits(bits).tobytes(), "big")
-
-        if len(self._dhash_cache) >= self._DHASH_CACHE_MAX:
-            self._dhash_cache.clear()
-        self._dhash_cache[path] = value
-        return None if value == -1 else value
 
     def _annotate_geometry(self, cluster: list) -> None:
         """Stage 2: маркировка пар по разрешению/соотношению сторон."""
@@ -1092,59 +1126,24 @@ class SmartClusterEngine:
         for item in cluster:
             item["keep_priority"] = item is best
 
-    def _pixel_confirm(self, cluster: list, sim_floor: float) -> list:
-        """Stage 3: dHash-подтверждение пограничных пар против базы кластера."""
-        base = cluster[0]
-        confirmed = [base]
-        base_hash_loaded = False
-        base_hash = None
-
-        for item in cluster[1:]:
-            # Бинарно идентичные файлы (blake3) не нуждаются в подтверждении.
-            if item.get("phash") and item["phash"] == base.get("phash"):
-                confirmed.append(item)
-                continue
-            sim = float(item.get("similarity", 1.0))
-            if sim >= sim_floor + self.BORDERLINE_BAND:
-                confirmed.append(item)
-                continue
-
-            if not base_hash_loaded:
-                base_hash = self._dhash64(base["path"])
-                base_hash_loaded = True
-            item_hash = self._dhash64(item["path"])
-            if base_hash is None or item_hash is None:
-                # Нет попиксельных данных для опровержения (PDF/CBZ/битый файл) —
-                # семантический вердикт Stage 1 остаётся в силе.
-                confirmed.append(item)
-                continue
-
-            distance = bin(base_hash ^ item_hash).count("1")
-            if distance <= self.DHASH_MAX_DISTANCE:
-                confirmed.append(item)
-            else:
-                auditor.debug(
-                    f"Stage 3: rejected borderline pair (sim={sim:.3f}, "
-                    f"dHash dist={distance}): {item['path']}"
-                )
-        return confirmed
-
     def build_clusters(self, threshold: float) -> list:
-        active = self._filter_dead_entries()                       # Stage 0
-        clusters = self.faiss_manager.build_clusters(              # Stage 1
+        active = self._filter_dead_entries()
+        clusters = self.faiss_manager.build_clusters(
             list(active), threshold, self.scan_mode,
         )
-
-        # FaceNet-эмбеддинги описывают ЛИЦО, а не кадр: геометрия файла и
-        # попиксельный dHash для них не имеют смысла и дали бы ложные отказы.
+        # FaceNet-эмбеддинги описывают ЛИЦО, а не кадр — геометрия для них не имеет
+        # смысла, отдаём кластеры как есть.
         if self.scan_mode == "faces":
             return clusters
 
-        sim_floor = 1.0 - threshold
-        refined = []
+        # Структурную сверку dHash теперь ПОЛНОСТЬЮ выполняет FaissManager на
+        # КЭШИРОВАННЫХ покадровых хэшах (item["dhash"]) — без повторного чтения
+        # файлов с диска. Прежний Stage 3 (_pixel_confirm/_dhash64/_load_gray_small)
+        # удалён: он дублировал ту же сверку, заново читал картинки с диска (тот же
+        # фриз UI, что убрали из Stage 0) и конфликтовал по математике порога
+        # (старая формула 0.95+0.05·t² против новой калибровки FaissManager).
+        # Остаётся лишь дешёвая геометрическая разметка (dup_kind/keep_priority),
+        # без обращения к диску.
         for cluster in clusters:
             self._annotate_geometry(cluster)                       # Stage 2
-            cluster = self._pixel_confirm(cluster, sim_floor)      # Stage 3
-            if len(cluster) > 1:
-                refined.append(cluster)
-        return refined
+        return clusters

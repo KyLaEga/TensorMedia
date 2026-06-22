@@ -160,10 +160,6 @@ class ThemeManager:
             return exe_dir
         return Path(__file__).resolve().parent.parent
 
-    @classmethod
-    def asset_path(cls, relative: str) -> str:
-        """Absolute path to a bundled asset (works in dev and frozen builds)."""
-        return str(cls._resource_root() / relative)
 
     @classmethod
     def icon_path(cls, filename: str) -> str:

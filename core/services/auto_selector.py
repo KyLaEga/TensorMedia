@@ -48,9 +48,81 @@ def _resolution_area(item_data):
     return 0
 
 
+from functools import lru_cache
+
+
+@lru_cache(maxsize=8192)
+def _ratio_from_thumb(thumb_str):
+    """Доля кадра БЕЗ чёрных рамок по конкретной миниатюре. Кэш по ПУТИ миниатюры
+    (он содержит size|mtime → при изменении файла ключ другой, устаревания нет)."""
+    try:
+        import cv2
+        img = cv2.imread(thumb_str, cv2.IMREAD_GRAYSCALE)
+        if img is None or img.size == 0:
+            return 1.0
+        h, w = img.shape
+        # Колонка/строка «контентная», если её СРЕДНЯЯ яркость заметно выше нуля
+        # (чистая чёрная рамка ≈ 0). mean устойчивее max к одиночному пикселю
+        # субтитра на полосе.
+        cw = int((img.mean(axis=0) > 8.0).sum())
+        ch = int((img.mean(axis=1) > 8.0).sum())
+        if cw == 0 or ch == 0:
+            return 1.0
+        ratio = (cw / w) * (ch / h)
+        # Подозрительно маленький контент → вероятно просто тёмный кадр, а не
+        # рамки: не доверяем оценке, не штрафуем файл.
+        return ratio if ratio >= 0.40 else 1.0
+    except Exception:
+        return 1.0
+
+
+def _content_ratio(item_data):
+    """Доля кадра БЕЗ чёрных рамок (letterbox/pillarbox), 0..1; 1.0 — рамок нет
+    или оценить нельзя. Берём из дискового кэша миниатюр (utils.thumb_cache):
+    миниатюра — реальный кадр файла, значит несёт те же рамки, что и видео.
+
+    Зачем: каскад выбора оригинала ранжирует по ПЛОЩАДИ пикселей, и файл 1280×840,
+    где реально 850 пикселей контента + чёрные полосы по бокам, ложно обыгрывал
+    честные 850×640. Эффективная площадь (area·ratio) сравнивает по КОНТЕНТУ."""
+    try:
+        from utils.thumb_cache import thumb_path_for
+        tp = thumb_path_for(item_data.get('path', ''))
+        if tp is None or not tp.exists():
+            return 1.0
+        return _ratio_from_thumb(str(tp))
+    except Exception:
+        return 1.0
+
+
+# Вотермарка: score 0..~0.05 (cluster_engine.estimate_watermark_score). Мёртвая
+# зона отсекает шумовой пол (чистые файлы не штрафуем и не «дёргаем» на нём ничьи),
+# выше — штраф к эффективной площади (брендированный re-upload крадёт чистый контент,
+# как и чёрные полосы). CAP 0.30 не даёт вотермарке в одиночку перебить целый тир
+# разрешения (4K с лого всё ещё > чистого 1080p), но РЕШАЕТ при равном разрешении —
+# ровно жалоба «выбирает где вотермарка больше».
+WATERMARK_DEADZONE = 0.012
+WATERMARK_GAIN = 12.0
+WATERMARK_PENALTY_CAP = 0.30
+
+
+def _watermark_penalty(item_data):
+    wm = item_data.get('watermark', 0.0) or 0.0
+    if wm <= WATERMARK_DEADZONE:
+        return 0.0
+    return min(WATERMARK_PENALTY_CAP, (wm - WATERMARK_DEADZONE) * WATERMARK_GAIN)
+
+
+def _effective_area(item_data):
+    """Площадь РЕАЛЬНОГО ЧИСТОГО контента: пиксели матрицы за вычетом чёрных полос
+    и со штрафом за вотермарку."""
+    return (_resolution_area(item_data)
+            * _content_ratio(item_data)
+            * (1.0 - _watermark_penalty(item_data)))
+
+
 def calculate_quality_score(item_data):
-    """Оценка визуального качества: разрешение с поправкой на резкость."""
-    return _resolution_area(item_data) + item_data.get('sharpness', 0.0)
+    """Оценка визуального качества: эффективное разрешение (без рамок) + резкость."""
+    return _effective_area(item_data) + item_data.get('sharpness', 0.0)
 
 
 # ── Каскадная матрица приоритетов (Pareto-cascade) ──────────────────────────
@@ -106,18 +178,37 @@ def _path_in(item_data, needles):
     return any(n in p for n in needles)
 
 
+# Допуск равенства разрешений: эффективные площади в пределах ±RES_TOLERANCE
+# считаем РАВНЫМИ (через лог-бакетизацию), и тогда решает битрейт (size). Без него
+# 1280×840-с-полосами (контент ~850×640) обыгрывал честные 850×640 «на волосок»,
+# хотя у второго лучше качество — ровно жалоба пользователя. 0.12 ≈ один тир.
+RES_TOLERANCE = 0.12
+
+
+def _area_bucket(item_data):
+    """Лог-бакет эффективной площади: соседние бакеты отличаются на ~RES_TOLERANCE,
+    значит близкие разрешения попадают в один бакет и сравниваются как равные."""
+    import math
+    a = _effective_area(item_data)
+    if a <= 1:
+        return 0
+    return int(round(math.log(a) / math.log(1.0 + RES_TOLERANCE)))
+
+
 def _cascade_sort_key(item_data, keep_newer=KEEP_NEWER):
     """Кортеж-ключ Pareto-каскада для max(). Больше == «оставить вероятнее».
 
-    1) Resolution Priority — площадь матрицы (пиксели).
-    2) Bitrate/Size Priority — размер как маркер меньшей компрессии.
+    1) Resolution Priority — БАКЕТ эффективной площади (без чёрных полос/вотермарки),
+       с допуском ±RES_TOLERANCE: близкие разрешения равны.
+    2) Bitrate/Size Priority — размер как маркер меньшей компрессии (решает при
+       равном разрешении: «меньше пикселей, но лучше качество» теперь побеждает).
     3) Chronological Priority — mtime; знак задаёт keep_newer.
 
     keep_newer пробрасывается из пользовательских QSettings (AutoSelectWorker);
     дефолт = константа KEEP_NEWER для прямых/тестовых вызовов."""
     mtime = item_data.get('mtime', 0.0) or 0.0
     chrono = mtime if keep_newer else -mtime
-    return (_resolution_area(item_data), item_data.get('size', 0), chrono)
+    return (_area_bucket(item_data), item_data.get('size', 0), chrono)
 
 
 def _cascade_keeper(keep_newer):

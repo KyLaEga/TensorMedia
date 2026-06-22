@@ -155,6 +155,14 @@ class MainController(QObject):
         v.search_input.textChanged.connect(lambda: self.search_debounce_timer.start())
         v.combo_view_filter.currentIndexChanged.connect(self._apply_view_filter)
         
+        self.recluster_debounce_timer = QTimer(self)
+        self.recluster_debounce_timer.setSingleShot(True)
+        # 1.5 с задержки: тяжёлый FAISS-пересчёт стартует только когда пользователь
+        # «успокоил» ползунок (каждое движение перезапускает таймер). Снимает
+        # лишние пересчёты при подкрутке и серию событий sliderReleased от JumpSlider.
+        self.recluster_debounce_timer.setInterval(1500)
+        self.recluster_debounce_timer.timeout.connect(self._trigger_recluster)
+        
         v.btn_auto_select.clicked.connect(self.selection_controller.apply_auto_selection)
         v.btn_clear_select.clicked.connect(self.selection_controller.clear_selection)
         # Cmd+D / Ctrl+D больше не привязан к этой кнопке: шорткат живёт в
@@ -522,9 +530,14 @@ class MainController(QObject):
             
         self._update_statistics_panel()
 
-    # Пресеты порога: id радиокнопки -> значение %. Единый источник истины для
-    # обеих сторон синхронизации (радио → пин/ползунок и ввод числа → радио).
-    THRESHOLD_PRESETS = {0: 96, 1: 88, 2: 81}
+    # Пресеты порога: id радиокнопки -> позиция ползунка %. Значения подобраны
+    # под НОВУЮ калибровку (FLOOR/SPAN в FaissManager): один и тот же % осмысленно
+    # мапится в обоих режимах (visual и faces), т.к. у каждого своя полоса.
+    #   strict   92% → visual 0.71 / faces 0.70 — почти идентичные / тот же человек строго
+    #   balanced 65% → visual 0.59 / faces 0.62 — дубли+близкие (ДЕФОЛТ)
+    #   semantic 35% → visual 0.46 / faces 0.53 — широкий поиск похожих
+    # Единый источник истины для обеих сторон синхронизации (радио ↔ ползунок/ввод).
+    THRESHOLD_PRESETS = {0: 92, 1: 65, 2: 35}
 
     def _sync_radio_to_slider(self, idx):
         mapping = self.THRESHOLD_PRESETS
@@ -533,7 +546,7 @@ class MainController(QObject):
             self.view.slider_threshold.setValue(mapping[idx])
             self.view.slider_threshold.blockSignals(False)
             self.view.lbl_threshold.set_value(mapping[idx])
-            self._trigger_recluster()
+            self.recluster_debounce_timer.start()
 
     def _sync_presets_to_value(self, value: int):
         """Ввод числа руками: совпало с пресетом — включаем его радиокнопку,
@@ -550,12 +563,11 @@ class MainController(QObject):
         group.blockSignals(False)
 
     def _on_slider_released(self, *args):
-        """Финализация мышью. Если пин не сдвинулся (клик по дорожке без
-        перетаскивания, повторное отпускание на том же значении) — ползунок
-        уже стоит на _last_applied_threshold, и тяжёлый пересчёт пропускается."""
+        """Финализация мышью. Ждём 1.5 с через debounce, чтобы избежать спама
+        от JumpSlider, который кидает sliderReleased прямо во время mousePress."""
         if self.view.slider_threshold.value() == self._last_applied_threshold:
             return
-        self._trigger_recluster()
+        self.recluster_debounce_timer.start()
 
     def _on_threshold_committed(self, value: int):
         self.view.slider_threshold.blockSignals(True)
@@ -567,7 +579,7 @@ class MainController(QObject):
         # значение в тех же единицах (%), что и слайдер.
         if value == self._last_applied_threshold:
             return
-        self._trigger_recluster()
+        self.recluster_debounce_timer.start()
 
     def _on_slider_change(self, v):
         # Текст пина обновляет сам view (valueChanged → lbl_threshold.set_value).
@@ -629,11 +641,11 @@ class MainController(QObject):
         self._set_recluster_cursor()
 
         pct = self.view.slider_threshold.value()
-        # Единственная точка обновления кэша: фиксируем фактически отправленный
-        # в FAISS порог. Скан и смена движка проходят сюда напрямую (минуя
-        # guard-слоты), поэтому кэш остаётся согласован со всеми путями.
         self._last_applied_threshold = pct
-        threshold = 1.0 - (pct / 100.0)
+        # Движок ожидает порог от 0.0 до 1.0. НЕ ИНВЕРТИРУЕМ его!
+        # 96% -> 0.96 (очень жесткий фильтр, мало кластеров)
+        # 0% -> 0.0 (очень мягкий фильтр, много кластеров)
+        threshold = pct / 100.0
         bus.cmd_recluster.emit(threshold)
 
     def _on_clustering_finished(self, clusters):

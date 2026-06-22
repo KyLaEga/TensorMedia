@@ -67,6 +67,16 @@ class ThumbnailWorker(QThread):
                                 qim = QImage(img.tobytes("raw", "RGB"), img.width, img.height, img.width * 3, QImage.Format.Format_RGB888).copy()
                 else:
                     temp_img = QImage(p)
+                    if temp_img.isNull():
+                        # Qt не декодирует формат (типично для HEIC) — откат на
+                        # PIL + pillow-heif (паритет с превью image_label/сравнения).
+                        try:
+                            from utils.image_io import register_heif, pil_to_qimage
+                            register_heif()
+                            with Image.open(p) as im:
+                                temp_img = pil_to_qimage(im, max_side=400)
+                        except Exception:
+                            temp_img = QImage()
                     if not temp_img.isNull():
                         qim = temp_img.scaled(400, 400, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             except Exception as e:

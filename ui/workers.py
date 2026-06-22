@@ -19,7 +19,7 @@ cv2.setNumThreads(0)
 # AVFoundation is macOS-only; on Windows/Linux it does not exist and forcing it
 # makes every VideoCapture fail to open. Pick the platform-native backend and
 # let OpenCV auto-select (CAP_ANY) everywhere else.
-_VIDEO_BACKEND = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
+_VIDEO_BACKEND = getattr(cv2, 'CAP_AVFOUNDATION', cv2.CAP_ANY) if sys.platform == "darwin" else cv2.CAP_ANY
 
 from core.ml.cluster_engine import SmartClusterEngine
 from utils.i18n import translator
@@ -254,13 +254,19 @@ class CompareVideoWorker(QThread):
         super().__init__()
         self.requests = {}
         self.caps = OrderedDict()
-        self.max_caps = 12
+        # Одиночное превью/скраб работает с ОДНИМ видео за раз → держать пул из 12
+        # открытых декодеров незачем (это и раздувало RAM до ~1.1 ГБ + плодило
+        # AVFoundation/FFmpeg decode-потоки, см. лог нагрузки). 2 хватает: текущий
+        # файл + один «прошлый» на случай быстрого переключения туда-обратно.
+        self.max_caps = 2
         self.is_running = True
         self.cond = Condition()
 
-    def request_frames(self, paths, pct):
+    def request_frames(self, paths, pct, cache=False):
+        # cache=True (load_video, фикс. pct=25) разрешает дисковый кэш миниатюр;
+        # скраб одиночного плеера шлёт cache=False (позиция произвольная → не кэшируем).
         with self.cond:
-            for p in paths: self.requests[p] = pct
+            for p in paths: self.requests[p] = (pct, cache)
             # Re-arm under the lock (see MultiVideoWorker.request_frames).
             self.is_running = True
             self.cond.notify_all()
@@ -312,8 +318,25 @@ class CompareVideoWorker(QThread):
                 for p in paths_to_process:
                     if not self.is_running: break
 
-                    with self.cond: pct = self.requests.pop(p, None)
-                    if pct is None: continue
+                    with self.cond: req = self.requests.pop(p, None)
+                    if req is None: continue
+                    pct, want_cache = req
+
+                    # КЭШ МИНИАТЮРЫ (только cache=True): JPEG уже на диске → отдаём
+                    # мгновенно, без открытия контейнера. Главный буст «долго грузится».
+                    if want_cache:
+                        try:
+                            from utils.thumb_cache import thumb_path_for
+                            tp = thumb_path_for(p)
+                            if tp is not None and tp.exists():
+                                cached = cv2.imread(str(tp))
+                                if cached is not None and cached.size:
+                                    cached = np.ascontiguousarray(cv2.cvtColor(cached, cv2.COLOR_BGR2RGB))
+                                    hh, ww, cc = cached.shape
+                                    self.frame_ready.emit(p, QImage(cached.data, ww, hh, cc * ww, QImage.Format.Format_RGB888).copy())
+                                    continue
+                        except Exception as e:
+                            auditor.debug(f"Thumb cache read failed for {p}: {e}")
 
                     cap = None
                     t0 = time.monotonic()   # старт отсчёта бюджета пробы
@@ -352,23 +375,49 @@ class CompareVideoWorker(QThread):
                                 auditor.warning(f"Compare probe budget exceeded on seek: {p}")
                                 self.frame_ready.emit(p, QImage())
                                 continue
-                            ret, frame = cap.read()
-                            if ret:
-                                h, w = frame.shape[:2]
-                                scale = min(640.0 / w, 360.0 / h)
-                                if scale < 1.0:
-                                    nw, nh = int(w * scale), int(h * scale)
-                                    frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+                        # tot<=0: FRAME_COUNT неизвестен (типично для AVFoundation/macOS
+                        # и части контейнеров) → seek по POS_FRAMES невозможен. РАНЬШЕ
+                        # эта ветка не эмитила НИЧЕГО → одиночное превью «иногда не
+                        # грузилось». Теперь без seek читаем первый декодируемый кадр:
+                        # для статичного превью этого достаточно, и заявка не виснет.
+                        ret, frame = cap.read()
+                        if ret:
+                            h, w = frame.shape[:2]
+                            scale = min(640.0 / w, 360.0 / h)
+                            if scale < 1.0:
+                                nw, nh = int(w * scale), int(h * scale)
+                                frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
 
-                                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                                frame = np.ascontiguousarray(frame)
-                                h_new, w_new, ch = frame.shape
-                                qimg = QImage(frame.data, w_new, h_new, ch * w_new, QImage.Format.Format_RGB888).copy()
-                                self.frame_ready.emit(p, qimg)
-                            else:
-                                # Кадр не прочитался (в т.ч. по READ_TIMEOUT) —
-                                # пустой кадр, чтобы заявка не «висела» в очереди.
-                                self.frame_ready.emit(p, QImage())
+                            # Заполняем дисковый кэш миниатюр (BGR до конверсии) —
+                            # следующий показ этого видео будет мгновенным.
+                            if want_cache:
+                                try:
+                                    from utils.thumb_cache import thumb_path_for, save_thumb_bgr
+                                    save_thumb_bgr(thumb_path_for(p), frame)
+                                except Exception as e:
+                                    auditor.debug(f"Thumb cache write failed for {p}: {e}")
+
+                            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            frame = np.ascontiguousarray(frame)
+                            h_new, w_new, ch = frame.shape
+                            qimg = QImage(frame.data, w_new, h_new, ch * w_new, QImage.Format.Format_RGB888).copy()
+                            self.frame_ready.emit(p, qimg)
+                        else:
+                            # Кадр не прочитался (в т.ч. по READ_TIMEOUT) —
+                            # пустой кадр, чтобы заявка не «висела» в очереди.
+                            self.frame_ready.emit(p, QImage())
+
+                        # ОДНОКРАТНЫЙ ПОКАЗ (cache=True): кадр уже на диске —
+                        # держать открытый AVFoundation/FFmpeg-декодер незачем. Он
+                        # жрёт RAM и плодит decode-потоки (см. лог нагрузки: пул
+                        # открытых VideoCapture доминировал в footprint). Закрываем
+                        # сразу; следующий показ пойдёт из дискового кэша. Скраб
+                        # (cache=False) декодер сохраняет — там нужен быстрый re-seek.
+                        if want_cache:
+                            c = self.caps.pop(p, None)
+                            if c is not None:
+                                try: c.release()
+                                except Exception: pass
                     except Exception as e:
                         auditor.warning(f"Failed to process video {p} in CompareVideoWorker: {e}")
                         if cap is not None: cap.release()

@@ -1,4 +1,5 @@
 import sqlite3
+import io
 import numpy as np
 import threading
 import queue
@@ -60,9 +61,25 @@ class VectorCache:
                             fps REAL,
                             vector BLOB,
                             faces BLOB,
+                            dhash BLOB,
+                            watermark REAL,
                             last_scan REAL
                         )
                     ''')
+
+                    # Migration: Add dhash column to existing databases
+                    try:
+                        conn.execute("ALTER TABLE metadata ADD COLUMN dhash BLOB")
+                    except sqlite3.OperationalError:
+                        pass # Column already exists or other error, ignore
+
+                    # Migration: watermark-score (доля кадра с устойчивым edge-оверлеем,
+                    # 0..~0.05; выше = заметнее вотермарка). Используется автовыбором.
+                    try:
+                        conn.execute("ALTER TABLE metadata ADD COLUMN watermark REAL")
+                    except sqlite3.OperationalError:
+                        pass
+                        
                     conn.commit()
             except Exception as e:
                 auditor.error(f"Failed to initialize database: {e}")
@@ -104,7 +121,7 @@ class VectorCache:
 
                     # Barrier handshake for sync(): flush everything enqueued
                     # before this marker and commit, then release the waiter.
-                    # Records are 12-tuples, so a 2-tuple ('__BARRIER__', event)
+                    # Records are 13-tuples, so a 2-tuple ('__BARRIER__', event)
                     # is unambiguous.
                     if isinstance(item, tuple) and len(item) == 2 and item[0] == "__BARRIER__":
                         if batch:
@@ -118,7 +135,12 @@ class VectorCache:
                         continue
 
                     batch.append(item)
-                    if len(batch) >= 10 or self.write_queue.empty():
+                    # Флашим бОльшими пачками (было 10): каждый commit — это fsync
+                    # WAL, и при плотном потоке векторов скана сотни мелких коммитов
+                    # доминировали в I/O. Порог 200 режет число коммитов ~в 20 раз.
+                    # Латентность НЕ страдает: ветка write_queue.empty() по-прежнему
+                    # сбрасывает «хвост» немедленно, как только поток затих.
+                    if len(batch) >= 200 or self.write_queue.empty():
                         self._execute_batch(conn, batch)
                         transaction_counter += len(batch)
                         batch.clear()
@@ -159,9 +181,9 @@ class VectorCache:
             try:
                 cursor = conn.cursor()
                 cursor.executemany('''
-                    INSERT OR REPLACE INTO metadata 
-                    (path, size, mtime, phash, resolution, duration, codec, sharpness, fps, vector, faces, last_scan)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO metadata
+                    (path, size, mtime, phash, resolution, duration, codec, sharpness, fps, vector, faces, dhash, watermark, last_scan)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', batch)
                 conn.commit()
             except sqlite3.Error as e:
@@ -194,14 +216,44 @@ class VectorCache:
         self.write_queue.put("PURGE_SIGNAL")
         self.sync()
 
+    _NPY_MAGIC = b"\x93NUMPY"
+
+    @staticmethod
+    def _vec_to_blob(arr) -> bytes:
+        """Сериализует вектор с ЯВНОЙ формой/типом (формат .npy). Прежний путь
+        (сырой tobytes) терял форму, и при чтении размерность УГАДЫВАЛАСЬ по длине
+        блоба (3072→768 / 2048→512), мисс-интерпретируя любой иной dim как dhash."""
+        buf = io.BytesIO()
+        np.save(buf, np.asarray(arr, dtype=np.float32), allow_pickle=False)
+        return buf.getvalue()
+
+    @staticmethod
+    def _blob_to_vec(raw):
+        """Восстанавливает вектор. Новый формат (.npy) несёт форму сам; СТАРЫЕ
+        записи (сырой tobytes без заголовка) читаем обратносовместимо по длине."""
+        if not raw:
+            return None
+        try:
+            if bytes(raw[:6]) == VectorCache._NPY_MAGIC:
+                return np.load(io.BytesIO(raw), allow_pickle=False)
+            blen = len(raw)
+            if blen % 3072 == 0:
+                return np.frombuffer(raw, dtype=np.float32).reshape(-1, 768)
+            if blen % 2048 == 0:
+                return np.frombuffer(raw, dtype=np.float32).reshape(-1, 512)
+            return None
+        except Exception:
+            return None
+
     def save_batch(self, batch_tuples: list):
         if not batch_tuples: return
         for t in batch_tuples:
-            path, size, mtime, phash, res, dur, codec, sharpness, fps, vector = t
+            path, size, mtime, phash, res, dur, codec, sharpness, fps, vector, dhash, watermark = t
             self.store({
                 "path": path, "size": size, "mtime": mtime, "phash": phash,
                 "res": res, "dur": dur, "codec": codec, "sharpness": sharpness,
-                "fps": fps, "vector": vector, "faces": None
+                "fps": fps, "vector": vector, "faces": None, "dhash": dhash,
+                "watermark": watermark
             })
             
     def store(self, file_data: dict):
@@ -209,17 +261,22 @@ class VectorCache:
             
         vector_blob = file_data.get("vector")
         if isinstance(vector_blob, np.ndarray):
-            vector_blob = vector_blob.astype(np.float32).tobytes()
+            vector_blob = self._vec_to_blob(vector_blob)
             
         faces_blob = file_data.get("faces")
         if isinstance(faces_blob, np.ndarray):
             faces_blob = faces_blob.astype(np.float32).tobytes()
             
+        dhash_blob = file_data.get("dhash")
+        if isinstance(dhash_blob, np.ndarray):
+            dhash_blob = dhash_blob.tobytes()
+            
         record = (
             file_data.get("path"), file_data.get("size"), file_data.get("mtime"),
             file_data.get("phash"), file_data.get("res"), file_data.get("dur"),
             file_data.get("codec"), file_data.get("sharpness", 0.0), file_data.get("fps"),
-            vector_blob, faces_blob, time.time()
+            vector_blob, faces_blob, dhash_blob, float(file_data.get("watermark", 0.0) or 0.0),
+            time.time()
         )
         
         try:
@@ -239,12 +296,13 @@ class VectorCache:
                     for i in range(0, len(paths), chunk_size):
                         chunk = paths[i:i+chunk_size]
                         placeholders = ','.join(['?'] * len(chunk))
-                        cursor.execute(f"SELECT path, size, mtime, phash, resolution, duration, codec, sharpness, fps FROM metadata WHERE path IN ({placeholders})", chunk)
+                        cursor.execute(f"SELECT path, size, mtime, phash, resolution, duration, codec, sharpness, fps, watermark FROM metadata WHERE path IN ({placeholders})", chunk)
                         for row in cursor.fetchall():
                             meta[row[0]] = {
                                 "size": row[1], "mtime": row[2], "phash": row[3],
                                 "res": row[4], "dur": row[5], "codec": row[6],
-                                "sharpness": row[7], "fps": row[8]
+                                "sharpness": row[7], "fps": row[8],
+                                "watermark": row[9] if row[9] is not None else 0.0
                             }
             except Exception as e:
                 auditor.error(f"Failed to read metadata from cache: {e}")
@@ -268,12 +326,21 @@ class VectorCache:
                         chunk = paths[i:i+chunk_size]
                         placeholders = ','.join(['?'] * len(chunk))
                         cursor.execute(
-                            f"SELECT path, vector FROM metadata WHERE vector IS NOT NULL AND path IN ({placeholders})",
+                            f"SELECT path, vector, dhash FROM metadata WHERE path IN ({placeholders})",
                             chunk,
                         )
                         for row in cursor.fetchall():
-                            if row[1]:
-                                vectors[row[0]] = np.frombuffer(row[1], dtype=np.float32)
+                            path = row[0]
+                            v_raw = row[1]
+                            dh_raw = row[2]
+                            
+                            v = self._blob_to_vec(v_raw)
+
+                            dh = None
+                            if dh_raw:
+                                dh = np.frombuffer(dh_raw, dtype=np.uint8).reshape(-1, 8)
+                                
+                            vectors[path] = {"vector": v, "dhash": dh}
             except Exception as e:
                 auditor.error(f"Failed to batch-read vectors from cache: {e}", exc_info=True)
         return vectors
@@ -287,7 +354,7 @@ class VectorCache:
                     cursor.execute("SELECT vector FROM metadata WHERE path = ? AND vector IS NOT NULL", (path,))
                     row = cursor.fetchone()
                     if row and row[0]:
-                        return np.frombuffer(row[0], dtype=np.float32)
+                        return self._blob_to_vec(row[0])
             except Exception as e:
                 auditor.error(f"Critical failure in get_vector for {path}: {e}", exc_info=True)
         return None

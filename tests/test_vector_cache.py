@@ -66,16 +66,18 @@ class TestVectorCache(unittest.TestCase):
         self.assertEqual(meta[test_path]["res"], "1920x1080")
 
     def test_vector_storage(self):
+        # Векторы теперь МНОГОКАДРОВЫЕ 2D (кадры × 768 для visual). На диске формат
+        # бесшапочный (flat float32); форму get_vector восстанавливает по длине
+        # блоба (кратно 3072 байт → reshape(-1, 768)). Тестируем реальный формат,
+        # а не произвольную размерность.
         test_path = "/test/path/vec.jpg"
-        vec = np.random.rand(128).astype(np.float32)
-        data = {
-            "path": test_path,
-            "vector": vec
-        }
-        self.cache.store(data)
+        vec = np.random.rand(3, 768).astype(np.float32)   # 3-кадровый визуальный вектор
+        self.cache.store({"path": test_path, "vector": vec})
         self.cache.sync()
-        
+
         stored_vec = self.cache.get_vector(test_path)
+        self.assertIsNotNone(stored_vec)
+        self.assertEqual(stored_vec.shape, (3, 768))
         np.testing.assert_array_almost_equal(vec, stored_vec)
 
     def test_delete_paths(self):

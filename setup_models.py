@@ -76,7 +76,9 @@ def download_offline_models():
     
     def fetch_facenet():
         from facenet_pytorch import MTCNN, InceptionResnetV1
-        MTCNN(keep_all=False, device='cpu')
+        import torch
+        dev = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+        MTCNN(keep_all=False, device=dev)
         InceptionResnetV1(pretrained='vggface2').eval()
         
     try:

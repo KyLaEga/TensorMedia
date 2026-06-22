@@ -1,5 +1,4 @@
 import unittest
-import math
 from core.services.auto_selector import calculate_smart_score
 
 class TestSmartScore(unittest.TestCase):

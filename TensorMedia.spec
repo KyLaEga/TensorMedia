@@ -69,6 +69,21 @@ _pp_datas, _pp_binaries, _pp_hidden = collect_all("pypdfium2_raw")
 datas += _pp_datas
 extra_binaries += _pp_binaries
 
+# --- pillow-heif: bundle the native libheif decoder --------------------------
+# PIL has no built-in HEIF codec; pillow_heif registers one (see
+# core/ml/cluster_engine, module-level register_heif_opener) so .heic/.heif
+# (default iPhone photo format) get indexed instead of silently skipped. The
+# wheel ships a compiled _pillow_heif extension + vendored libheif/libde265/
+# libx265 dylibs that PyInstaller's static graph can't see — collect_all pulls
+# them explicitly. Guarded: a build env without pillow_heif still produces a
+# (HEIC-less) bundle rather than failing the whole build.
+try:
+    _ph_datas, _ph_binaries, _ph_hidden = collect_all("pillow_heif")
+    datas += _ph_datas
+    extra_binaries += _ph_binaries
+except Exception:
+    _ph_hidden = []
+
 # dist-info для всех пакетов, чьи версии transformers/huggingface_hub опрашивают
 # в рантайме через importlib.metadata (отсутствие любого -> ложный "not found").
 for _pkg in (
@@ -105,13 +120,39 @@ hiddenimports = [
     "certifi",
     "pypdfium2",
     "pypdfium2_raw",
-] + _tf_hidden + _fa_hidden + _pp_hidden
+    "pillow_heif",
+] + _tf_hidden + _fa_hidden + _pp_hidden + _ph_hidden
 
 excludes = [
+    # Non-Qt heavyweight stacks the app never imports.
     "tkinter",
     "matplotlib",
     "notebook",
     "jupyter",
+    # --- Unused PySide6 modules (bundle-size guard) --------------------------
+    # The app imports ONLY QtCore/QtGui/QtWidgets/QtMultimedia (verified by
+    # grep over the source) plus the QtSvg image plugin & QtMultimediaWidgets
+    # via hiddenimports. Every module below is provably never imported AND is
+    # NOT a dependency of those, so excluding them cannot affect runtime — it
+    # only stops PyInstaller from ever pulling these (very large) frameworks
+    # into the bundle. QtWebEngine alone is hundreds of MB.
+    # Deliberately NOT excluded (possible transitive deps of our stack):
+    #   QtNetwork, QtOpenGL(+Widgets), QtDBus, QtPrintSupport, QtSvg(+Widgets),
+    #   QtConcurrent, QtXml.
+    "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets",
+    "PySide6.QtWebEngineQuick", "PySide6.QtWebChannel", "PySide6.QtWebSockets",
+    "PySide6.QtQuick", "PySide6.QtQml", "PySide6.QtQuick3D",
+    "PySide6.QtQuickWidgets", "PySide6.QtQuickControls2",
+    "PySide6.Qt3DCore", "PySide6.Qt3DRender", "PySide6.Qt3DInput",
+    "PySide6.Qt3DLogic", "PySide6.Qt3DAnimation", "PySide6.Qt3DExtras",
+    "PySide6.QtCharts", "PySide6.QtDataVisualization", "PySide6.QtGraphs",
+    "PySide6.QtDesigner", "PySide6.QtUiTools",
+    "PySide6.QtBluetooth", "PySide6.QtNfc", "PySide6.QtSensors",
+    "PySide6.QtSerialPort", "PySide6.QtSerialBus", "PySide6.QtPositioning",
+    "PySide6.QtLocation", "PySide6.QtRemoteObjects", "PySide6.QtScxml",
+    "PySide6.QtTest", "PySide6.QtSql", "PySide6.QtHelp",
+    "PySide6.QtPdf", "PySide6.QtPdfWidgets", "PySide6.QtSpatialAudio",
+    "PySide6.QtTextToSpeech",
 ]
 
 # UPX портит подписанные dylib/Qt6-библиотеки → отключаем повсеместно.
@@ -137,7 +178,7 @@ _app_icon = "assets/icons/app.icns" if os.path.exists("assets/icons/app.icns") e
 # The winner is stripped of a leading 'v' and MUST be a dotted number
 # (CFBundleVersion rejects anything else, e.g. a branch name from a manual run),
 # otherwise we fall through to the next candidate.
-def _app_version(_fallback="1.2.8"):
+def _app_version(_fallback="1.2.9"):
     import re
     import subprocess
     candidates = [os.environ.get("TENSORMEDIA_VERSION", "")]

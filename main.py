@@ -3,6 +3,10 @@
 # ============================================================
 import sys
 import os
+
+os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
+os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
+
 import warnings
 
 if sys.stdout is None: sys.stdout = open(os.devnull, 'w')
@@ -42,7 +46,7 @@ import traceback
 # 'if __name__ == "__main__"' (см. низ файла), где он пропускается воркерами.
 
 from utils.env_config import setup_offline_env
-from utils.batch_operations import BatchOperations
+
 from utils.logger import auditor
 
 class ApplicationBootstrap:
@@ -56,12 +60,22 @@ class ApplicationBootstrap:
             # уводит пользователя на другой рабочий стол ("Spaces Jump"). Sheet,
             # привязанный к активному окну, остаётся внутри текущего Space.
             from PySide6.QtCore import Qt
+            from PySide6.QtWidgets import QApplication, QMessageBox
+            # Локализуем через translator с безопасным фолбэком: это обработчик
+            # ФАТАЛЬНЫХ ошибок, он обязан показать диалог даже если i18n сломан.
+            try:
+                from utils.i18n import translator
+                crit_title = translator.tr("critical_title")
+                crit_body = translator.tr("critical_body").format(exc_value)
+            except Exception:
+                crit_title = "Критический сбой"
+                crit_body = f"Произошла фатальная ошибка:\n\n{exc_value}"
             parent = QApplication.activeWindow()
             msg_box = QMessageBox(parent)
             msg_box.setWindowModality(Qt.WindowModality.WindowModal)
             msg_box.setIcon(QMessageBox.Icon.Critical)
-            msg_box.setWindowTitle("Критический сбой")
-            msg_box.setText(f"Произошла фатальная ошибка:\n\n{exc_value}")
+            msg_box.setWindowTitle(crit_title)
+            msg_box.setText(crit_body)
             msg_box.setDetailedText(error_msg)
             msg_box.exec()
         except Exception as gui_exc:
@@ -76,6 +90,7 @@ class ApplicationBootstrap:
         error_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
         auditor.critical(f"CRITICAL RUNTIME ERROR:\n{error_msg}")
         
+        from PySide6.QtWidgets import QApplication
         app = QApplication.instance()
         if app and not app.closingDown():
             from PySide6.QtCore import QTimer
@@ -97,7 +112,7 @@ class ApplicationBootstrap:
         auditor.info("TensorMedia Application Bootstrapping Started.")
         
         setup_offline_env()
-        BatchOperations.check_and_recover_pending_transactions()
+
         
         QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
         app = QApplication(sys.argv)
@@ -157,7 +172,7 @@ class ApplicationBootstrap:
             
             cls.orchestrator = MLOrchestrator()
             window = MainWindow()
-            controller = MainController(window)
+            MainController(window)
 
             # Cmd/Ctrl+D регистрируется системно через нативный QMenuBar
             # ("Правка" → "Снять выделение") в MainWindow и привязан к
@@ -211,7 +226,7 @@ if __name__ == "__main__":
     # Связывание происходит в глобальном пространстве имён модуля, поэтому методы
     # ApplicationBootstrap (определённые выше) корректно резолвят эти имена в
     # момент вызова execute(), уже после их импорта здесь.
-    from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
+    from PySide6.QtWidgets import QApplication, QDialog
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QFont
     from core.ml.weight_manager import LocalWeightValidator

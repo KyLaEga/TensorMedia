@@ -96,7 +96,7 @@ jobs:
       shell: pwsh
       run: |
         $v = "${{ github.ref_name }}" -replace '^v', ''
-        if ($v -notmatch '^\d+(\.\d+){0,3}$') { $v = '1.2.8' }
+        if ($v -notmatch '^\d+(\.\d+){0,3}$') { $v = '1.2.9' }
         iscc /DMyAppVersion=$v setup.iss
 
     - name: Build macOS Image (.dmg)

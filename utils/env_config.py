@@ -54,8 +54,6 @@ def get_logs_dir() -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
 
-def get_cache_dir() -> Path:
-    return get_data_dir()
 
 def setup_offline_env():
     models_dir = get_models_dir()
@@ -65,10 +63,3 @@ def setup_offline_env():
     os.environ["HF_DATASETS_OFFLINE"] = "1"
     
     os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
-
-def resource_path(relative_path: str) -> str:
-    try:
-        base_path = sys._MEIPASS
-    except AttributeError:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)

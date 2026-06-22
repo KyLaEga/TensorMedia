@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 from PySide6.QtWidgets import QTreeView, QAbstractItemView
-from PySide6.QtCore import Qt, QUrl, QMimeData, QModelIndex, QTimer, QAbstractItemModel, Signal, QSortFilterProxyModel
+from PySide6.QtCore import Qt, QUrl, QMimeData, QModelIndex, QTimer, QAbstractItemModel, Signal
 from PySide6.QtGui import QDrag, QColor
 
 from utils.i18n import translator
@@ -124,7 +124,11 @@ class LazyClusterModel(QAbstractItemModel):
     def set_clusters(self, clusters):
         self.beginResetModel()
         self.rootItem.childItems.clear()
-        
+
+        # Константа на весь вызов — считаем ОДИН раз, а не на каждый кластер
+        # (раньше normpath(abspath()) гонялся внутри цикла по всем кластерам).
+        ref_path = os.path.normpath(os.path.abspath(self.target_dir_a)) if self.target_dir_a else None
+
         valid_cluster_idx = 1
         for cluster in clusters:
             total_size = sum(it.get('size', 0) for it in cluster)
@@ -140,8 +144,7 @@ class LazyClusterModel(QAbstractItemModel):
             
             parent_data = [parent_name, fmt_str, avg_sim_str, sz_str, "", ""]
             parent_item = TreeItem(parent_data, parent=self.rootItem, is_cluster=True, raw_dict={'cluster_id': valid_cluster_idx})
-            
-            ref_path = os.path.normpath(os.path.abspath(self.target_dir_a)) if self.target_dir_a else None
+
             for it in cluster:
                 p = it['path']
                 try:
@@ -289,51 +292,6 @@ class LazyClusterModel(QAbstractItemModel):
         return None
 
 
-class MediaProxyModel(QSortFilterProxyModel):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._filter_mode = 0
-        self._filter_text = ""
-
-    def set_filters(self, mode: int, text: str):
-        self._filter_mode = mode
-        self._filter_text = text.lower()
-        self.invalidateFilter()
-
-    def filterAcceptsRow(self, source_row, source_parent):
-        if not source_parent.isValid():
-            if self._matches_filter(source_row, source_parent):
-                return True
-                
-            source_model = self.sourceModel()
-            idx = source_model.index(source_row, 0, source_parent)
-            for i in range(source_model.rowCount(idx)):
-                if self._matches_filter(i, idx):
-                    return True
-            return False
-        else:
-            return self._matches_filter(source_row, source_parent)
-
-    def _matches_filter(self, source_row, source_parent):
-        source_model = self.sourceModel()
-        idx = source_model.index(source_row, 0, source_parent)
-        item = source_model.itemFromIndex(idx)
-        
-        if not item: return False
-
-        if self._filter_text:
-            text = str(item.data(0)).lower()
-            if self._filter_text not in text:
-                return False
-
-        if self._filter_mode == 1: 
-            return item.checkState() == Qt.CheckState.Checked
-        elif self._filter_mode == 2: 
-            return item.checkState() == Qt.CheckState.Unchecked
-
-        return True
-
-
 class MediaTreeView(QTreeView):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -381,7 +339,7 @@ class MediaTreeView(QTreeView):
         super().resizeEvent(event)
         self._trigger_stretch()
 
-    def _on_section_resized(self, logicalIndex, oldSize, newSize):
+    def _on_section_resized(self, logicalIndex, _oldSize, _newSize):
         if not self._is_stretching and logicalIndex != 0:
             self._trigger_stretch()
 

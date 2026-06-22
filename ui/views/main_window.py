@@ -681,11 +681,13 @@ class MainWindow(QMainWindow):
         # Полный диапазон [0-100] — синхронно со строгим QIntValidator пина:
         # клавиатурный ввод и ползунок обязаны принимать одно и то же множество.
         self.slider_threshold.setRange(0, 100)
-        self.slider_threshold.setValue(88)
+        # Дефолт = пресет «balanced» (см. MainController.THRESHOLD_PRESETS): 65% по
+        # новой калибровке = центр. косинус ≈0.59 (дубли+близкие), а не прежние 0.88.
+        self.slider_threshold.setValue(65)
         # ИНТЕРАКТИВНЫЙ ПИН (TASK 2): QLineEdit-мимикрия под метку. Точное
         # значение (например, ровно 96%) вводится с клавиатуры; применение —
         # по Enter/потере фокуса (editingFinished), без кнопки «Применить».
-        self.lbl_threshold = ThresholdEdit(88)
+        self.lbl_threshold = ThresholdEdit(65)
         # СТАТИЧНЫЙ ОТСТУП. Ширину пина жёстко фиксируем по самому широкому
         # значению ("100%"), а НЕ по живому тексту. Иначе при 88% ↔ 100% (и при
         # смене локали, меняющей метрики шрифта) ширина пина плавала, и правый
@@ -994,18 +996,21 @@ class MainWindow(QMainWindow):
         big_btn_qss = "QPushButton { font-weight: bold; padding: 12px 22px; }"
 
         self.btn_scan = QPushButton()
+        self.btn_scan.setAutoDefault(False)
         self.btn_scan.setObjectName("primary")
         self.btn_scan.setMinimumHeight(ThemeManager.BUTTON_HEIGHT_PRIMARY)
         self.btn_scan.setStyleSheet(big_btn_qss)
         self.btn_scan.setEnabled(False)
 
         self.btn_pause = QPushButton()
+        self.btn_pause.setAutoDefault(False)
         self.btn_pause.setObjectName("secondary")
         self.btn_pause.setMinimumHeight(ThemeManager.BUTTON_HEIGHT_PRIMARY)
         self.btn_pause.setStyleSheet(big_btn_qss)
         self.btn_pause.hide()
 
         self.btn_stop = QPushButton()
+        self.btn_stop.setAutoDefault(False)
         self.btn_stop.setObjectName("secondary")
         self.btn_stop.setMinimumHeight(ThemeManager.BUTTON_HEIGHT_PRIMARY)
         self.btn_stop.setStyleSheet(
@@ -1179,10 +1184,12 @@ class MainWindow(QMainWindow):
         bb_layout.setSpacing(10)
         
         self.btn_grid = QPushButton()
+        self.btn_grid.setAutoDefault(False)
         self.btn_grid.setMinimumHeight(ThemeManager.BUTTON_HEIGHT_PRIMARY)
         self.btn_grid.setObjectName("secondary")
 
         self.btn_move = QPushButton()
+        self.btn_move.setAutoDefault(False)
         self.btn_move.setMinimumHeight(ThemeManager.BUTTON_HEIGHT_PRIMARY)
         self.btn_move.setObjectName("action")
 
@@ -1190,6 +1197,7 @@ class MainWindow(QMainWindow):
         # Идеальный квадрат BUTTON_HEIGHT_ICON × BUTTON_HEIGHT_ICON: выравнивается
         # по горизонтальной оси с Compare/Move и не растягивается.
         self.btn_delete = QPushButton("🗑")
+        self.btn_delete.setAutoDefault(False)
         self.btn_delete.setFixedSize(
             ThemeManager.BUTTON_HEIGHT_ICON, ThemeManager.BUTTON_HEIGHT_ICON
         )
@@ -1575,26 +1583,3 @@ class MainWindow(QMainWindow):
             "База данных сброшена" if is_ru else "Database purged"
         )
         auditor.info("UI: Full data purge completed.")
-
-    def update_telemetry_hud(self, elapsed_seconds: float, ram_mb: float):
-        try:
-            m, s = divmod(int(elapsed_seconds), 60)
-            h, m = divmod(m, 60)
-            sub_s = int((elapsed_seconds - int(elapsed_seconds)) * 10)
-            time_str = f"{h:02d}:{m:02d}:{s:02d}.{sub_s}"
-            self.lbl_telemetry.setText(f"[ {time_str} | {ram_mb:.1f} MB ]")
-        except Exception as e:
-            auditor.warning(f"HUD format error: {e}")
-
-    def update_analytics_dashboard(self, elapsed_seconds: float, files: int, dups: int, selected: int, saved_mb: float):
-        try:
-            m, s = divmod(int(elapsed_seconds), 60)
-            h, m = divmod(m, 60)
-            sub_s = int((elapsed_seconds - int(elapsed_seconds)) * 10)
-            self.lbl_stat_time.setText(f"{h:02d}:{m:02d}:{s:02d}.{sub_s}")
-            self.lbl_stat_files.setText(str(files))
-            self.lbl_stat_dups.setText(str(dups))
-            self.lbl_stat_selected.setText(str(selected))
-            self.lbl_stat_saved.setText(f"{saved_mb:.1f} MB")
-        except Exception as e:
-            auditor.warning(f"Analytics format error: {e}")

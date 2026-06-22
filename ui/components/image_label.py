@@ -40,7 +40,24 @@ class ImageLoaderWorker(QRunnable):
             
             if self.token.cancelled: return
             qim = reader.read()
-            
+
+            if qim.isNull() and not self.token.cancelled:
+                # У Qt нет декодера для этого формата (типично для HEIC: сборки
+                # PySide6 не всегда несут imageformats-плагин qheif). Откатываемся
+                # на PIL + pillow-heif, который HEIF/HEIC декодирует. EXIF-поворот
+                # и даунскейл до 1280px накладывает pil_to_qimage — паритет с
+                # веткой QImageReader выше. Срабатывает ТОЛЬКО на null-результате,
+                # поэтому обычные jpg/png (Qt их читает) PIL не трогает.
+                try:
+                    from PIL import Image
+                    from utils.image_io import register_heif, pil_to_qimage
+                    register_heif()
+                    with Image.open(self.path) as im:
+                        qim = pil_to_qimage(im, max_side=1280)
+                except Exception as e:
+                    from utils.logger import auditor
+                    auditor.debug(f"[ImageLoader] PIL fallback failed for {self.path}: {e}")
+
             if not self.token.cancelled:
                 self.signals.finished.emit(self.path, qim)
         except Exception as e:

@@ -294,13 +294,13 @@ class SelectionController(QObject):
                 
                 if isinstance(res, dict) and res.get("error") == "send2trash_missing":
                     QMessageBox.critical(
-                        self.view, 
+                        self.view,
                         translator.tr("dialog_del_report_title"),
-                        "Ошибка: Модуль 'send2trash' не найден. Удаление в корзину невозможно. Пожалуйста, установите зависимости или используйте безвозвратное удаление."
+                        translator.tr("err_send2trash_missing")
                     )
                 elif res.get("failed", 0) > 0:
                     report = translator.tr("dialog_del_report_msg").format(deleted=res['deleted'], failed=res['failed'])
-                    msg = f"{report}\n\nВнимание: Некоторые файлы не удалось переместить в корзину. Это часто случается на внешних дисках (флешках) из-за ограничений прав доступа macOS к папке .Trashes. Попробуйте использовать безвозвратное удаление (Shift+Del)."
+                    msg = f"{report}\n\n{translator.tr('warn_trash_external')}"
                     QMessageBox.warning(self.view, translator.tr("dialog_del_report_title"), msg)
                 else:
                     report = translator.tr("dialog_del_report_msg").format(deleted=res['deleted'], failed=res['failed'])
